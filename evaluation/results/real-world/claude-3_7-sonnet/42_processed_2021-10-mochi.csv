@@ -1,0 +1,3366 @@
+nameid,code,tokens,loc,issue,vulnumber,code_snippet,processtokens,high_severity_count,medium_severity_count,Findings,Comparison,Correct Matches,Partially Correct,Missed,LLM-generated,matchList,MAP,Score,execution_time,total_tokens,total_steps
+MochiVault.sol,"// SPDX-License-Identifier: (c) Mochi.Fi, 2021
+
+pragma solidity ^0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@mochifi/library/contracts/CheapERC20.sol"";
+import ""../interfaces/IERC3156FlashLender.sol"";
+import ""../interfaces/IMochiVault.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/IUSDM.sol"";
+
+contract MochiVault is Initializable, IMochiVault, IERC3156FlashLender {
+    using Float for uint256;
+    using CheapERC20 for IERC20;
+
+    bytes32 public constant CALLBACK_SUCCESS =
+        keccak256(""ERC3156FlashBorrower.onFlashLoan"");
+
+    /// immutable variables
+    IMochiEngine public immutable engine;
+    IERC20 public override asset;
+
+    /// for accruing debt
+    uint256 public debtIndex;
+    uint256 public lastAccrued;
+
+    /// storage variables
+    uint256 public override deposits;
+    uint256 public override debts;
+    int256 public override claimable;
+
+    ///Mochi waits until the stability fees hit 1% and then starts calculating debt after that.
+    ///E.g. If the stability fees are 10% for a year
+    ///Mochi will wait 36.5 days (the time period required for the pre-minted 1%)
+
+    /// result
+    uint256 public liquidated;
+
+    mapping(uint256 => Detail) public override details;
+    mapping(uint256 => uint256) public lastDeposit;
+
+    modifier updateDebt(uint256 _id) {
+        accrueDebt(_id);
+        _;
+    }
+
+    modifier wait(uint256 _id) {
+        require(
+            lastDeposit[_id] + engine.mochiProfile().delay() <= block.timestamp,
+            ""!wait""
+        );
+        accrueDebt(_id);
+        _;
+    }
+
+    constructor(address _engine) {
+        engine = IMochiEngine(_engine);
+    }
+
+    function initialize(address _asset) external override initializer {
+        asset = IERC20(_asset);
+        debtIndex = 1e18;
+        lastAccrued = block.timestamp;
+    }
+
+    function liveDebtIndex() public view override returns (uint256 index) {
+        return
+            engine.mochiProfile().calculateFeeIndex(
+                address(asset),
+                debtIndex,
+                lastAccrued
+            );
+    }
+
+    function status(uint256 _id) public view override returns (Status) {
+        return details[_id].status;
+    }
+
+    function currentDebt(uint256 _id) public view override returns (uint256) {
+        require(details[_id].status != Status.Invalid, ""invalid"");
+        uint256 newIndex = liveDebtIndex();
+        return (details[_id].debt * newIndex) / details[_id].debtIndex;
+    }
+
+    function accrueDebt(uint256 _id) public {
+        // global debt for vault
+        // first, increase gloabal debt;
+        uint256 currentIndex = liveDebtIndex();
+        uint256 increased = (debts * currentIndex) / debtIndex - debts;
+        debts += increased;
+        claimable += int256(increased);
+        // update global debtIndex
+        debtIndex = currentIndex;
+        lastAccrued = block.timestamp;
+        // individual debt
+        if (_id != type(uint256).max && details[_id].debtIndex < debtIndex) {
+            require(details[_id].status != Status.Invalid, ""invalid"");
+            if (details[_id].debt != 0) {
+                uint256 increasedDebt = (details[_id].debt * debtIndex) /
+                    details[_id].debtIndex -
+                    details[_id].debt;
+                uint256 discountedDebt = increasedDebt.multiply(
+                    engine.discountProfile().discount(engine.nft().ownerOf(_id))
+                );
+                debts -= discountedDebt;
+                claimable -= int256(discountedDebt);
+                details[_id].debt += (increasedDebt - discountedDebt);
+            }
+            details[_id].debtIndex = debtIndex;
+        }
+    }
+
+    function increase(
+        uint256 _id,
+        uint256 _deposits,
+        uint256 _borrows,
+        address _referrer,
+        bytes memory _data
+    ) external {
+        if (_id == type(uint256).max) {
+            // mint if _id is -1
+            _id = mint(msg.sender, _referrer);
+        }
+        if (_deposits > 0) {
+            deposit(_id, _deposits);
+        }
+        if (_borrows > 0) {
+            borrow(_id, _borrows, _data);
+        }
+    }
+
+    function decrease(
+        uint256 _id,
+        uint256 _withdraws,
+        uint256 _repays,
+        bytes memory _data
+    ) external {
+        if (_repays > 0) {
+            repay(_id, _repays);
+        }
+        if (_withdraws > 0) {
+            withdraw(_id, _withdraws, _data);
+        }
+    }
+
+    function mint(address _recipient, address _referrer)
+        public
+        returns (uint256 id)
+    {
+        id = engine.nft().mint(address(asset), _recipient);
+        details[id].debtIndex = liveDebtIndex();
+        details[id].status = Status.Idle;
+        details[id].referrer = _referrer;
+    }
+
+    /// anyone can deposit collateral to given id
+    /// it will even allow depositing to liquidated vault so becareful when depositing
+    function deposit(uint256 _id, uint256 _amount)
+        public
+        override
+        updateDebt(_id)
+    {
+        // should it be able to deposit if invalid?
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        require(
+            details[_id].status == Status.Idle ||
+                details[_id].status == Status.Collaterized ||
+                details[_id].status == Status.Active,
+            ""!depositable""
+        );
+        lastDeposit[_id] = block.timestamp;
+        deposits += _amount;
+        details[_id].collateral += _amount;
+        if (details[_id].status == Status.Idle) {
+            details[_id].status = Status.Collaterized;
+        }
+        asset.cheapTransferFrom(msg.sender, address(this), _amount);
+    }
+
+    /// should only be able to withdraw if status is not liquidatable
+    function withdraw(
+        uint256 _id,
+        uint256 _amount,
+        bytes memory _data
+    ) public override wait(_id) {
+        require(engine.nft().ownerOf(_id) == msg.sender, ""!approved"");
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        // update prior to interaction
+        float memory price = engine.cssr().update(address(asset), _data);
+        require(
+            !_liquidatable(
+                details[_id].collateral - _amount,
+                price,
+                details[_id].debt
+            ),
+            ""!healthy""
+        );
+        float memory cf = engine.mochiProfile().maxCollateralFactor(
+            address(asset)
+        );
+        uint256 maxMinted = (details[_id].collateral - _amount)
+            .multiply(cf)
+            .multiply(price);
+        require(details[_id].debt <= maxMinted, "">cf"");
+        deposits -= _amount;
+        details[_id].collateral -= _amount;
+        if (details[_id].collateral == 0) {
+            details[_id].status = Status.Idle;
+        }
+        asset.cheapTransfer(engine.nft().ownerOf(_id), _amount);
+    }
+
+    function borrow(
+        uint256 _id,
+        uint256 _amount,
+        bytes memory _data
+    ) public override updateDebt(_id) {
+        // update prior to interaction
+        float memory price = engine.cssr().update(address(asset), _data);
+        float memory cf = engine.mochiProfile().maxCollateralFactor(
+            address(asset)
+        );
+        uint256 maxMinted = details[_id].collateral.multiply(cf).multiply(
+            price
+        );
+        require(engine.nft().ownerOf(_id) == msg.sender, ""!approved"");
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        if(details[_id].debt + _amount > maxMinted) {
+            _amount = maxMinted - details[_id].debt;
+        }
+        if(engine.mochiProfile().creditCap(address(asset)) < debts + _amount) {
+            _amount = engine.mochiProfile().creditCap(address(asset)) - debts;
+        }
+        uint256 increasingDebt = (_amount * 1005) / 1000;
+        uint256 totalDebt = details[_id].debt + increasingDebt;
+        require(details[_id].debt + _amount >= engine.mochiProfile().minimumDebt(), ""<minimum"");
+        require(
+            !_liquidatable(details[_id].collateral, price, totalDebt),
+            ""!healthy""
+        );
+        mintFeeToPool(increasingDebt - _amount, details[_id].referrer);
+        // this will ensure debtIndex will not increase on further `updateDebt` triggers
+        details[_id].debtIndex =
+            (details[_id].debtIndex * (totalDebt)) /
+            (details[_id].debt + _amount);
+        details[_id].debt = totalDebt;
+        details[_id].status = Status.Active;
+        debts += _amount;
+        engine.minter().mint(msg.sender, _amount);
+    }
+
+    /// someone sends usdm to this address and repays the debt
+    /// will payback the leftover usdm
+    function repay(uint256 _id, uint256 _amount)
+        public
+        override
+        updateDebt(_id)
+    {
+        if (_amount > details[_id].debt) {
+            _amount = details[_id].debt;
+        }
+        require(_amount > 0, ""zero"");
+        if (debts < _amount) {
+            // safe gaurd to some underflows
+            debts = 0;
+        } else {
+            debts -= _amount;
+        }
+        details[_id].debt -= _amount;
+        if (details[_id].debt == 0) {
+            details[_id].status = Status.Collaterized;
+        }
+        engine.usdm().transferFrom(msg.sender, address(this), _amount);
+        engine.usdm().burn(_amount);
+    }
+
+    function liquidate(
+        uint256 _id,
+        uint256 _collateral,
+        uint256 _usdm
+    ) external override updateDebt(_id) {
+        require(msg.sender == address(engine.liquidator()), ""!liquidator"");
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        float memory price = engine.cssr().getPrice(address(asset));
+        require(
+            _liquidatable(details[_id].collateral, price, currentDebt(_id)),
+            ""healthy""
+        );
+
+        debts -= _usdm;
+
+        details[_id].collateral -= _collateral;
+        details[_id].debt -= _usdm;
+
+        asset.cheapTransfer(msg.sender, _collateral);
+    }
+
+    /// @dev returns if status is liquidatable with given `_collateral` amount and `_debt` amount
+    /// @notice should return false if _collateral * liquidationLimit < _debt
+    function _liquidatable(
+        uint256 _collateral,
+        float memory _price,
+        uint256 _debt
+    ) internal view returns (bool) {
+        float memory lf = engine.mochiProfile().liquidationFactor(
+            address(asset)
+        );
+        // when debt is lower than liquidation value, it can be liquidated
+        return _collateral.multiply(lf) < _debt.divide(_price);
+    }
+
+    function liquidatable(uint256 _id) external view returns (bool) {
+        float memory price = engine.cssr().getPrice(address(asset));
+        return _liquidatable(details[_id].collateral, price, currentDebt(_id));
+    }
+
+    function claim() external updateDebt(type(uint256).max) {
+        require(claimable > 0, ""!claimable"");
+        // reserving 25% to prevent potential risks
+        uint256 toClaim = (uint256(claimable) * 75) / 100;
+        mintFeeToPool(toClaim, address(0));
+    }
+
+    function mintFeeToPool(uint256 _amount, address _referrer) internal {
+        claimable -= int256(_amount);
+        if (address(0) != _referrer) {
+            engine.minter().mint(address(engine.referralFeePool()), _amount);
+            engine.referralFeePool().addReward(_referrer);
+        } else {
+            engine.minter().mint(address(engine.treasury()), _amount);
+        }
+    }
+
+    // Flash Loan
+    function maxFlashLoan(address _token)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        require(_token == address(asset), ""!supported"");
+        return asset.balanceOf(address(this));
+    }
+
+    function flashFee(address _token, uint256 _amount)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        //should return 0.1337% * _amount;
+        require(_token == address(asset), ""!supported"");
+        return (_amount * 1337) / 1000000;
+    }
+
+    function flashLoan(
+        IERC3156FlashBorrower _receiver,
+        address _token,
+        uint256 _amount,
+        bytes calldata _data
+    ) external override returns (bool) {
+        require(_token == address(asset), ""!supported"");
+        uint256 fee = flashFee(_token, _amount);
+        asset.cheapTransfer(address(_receiver), _amount);
+        require(
+            _receiver.onFlashLoan(msg.sender, _token, _amount, fee, _data) ==
+                CALLBACK_SUCCESS,
+            ""!callback""
+        );
+        asset.cheapTransferFrom(address(_receiver), address(this), _amount);
+        asset.cheapTransferFrom(address(_receiver), engine.treasury(), fee);
+        return true;
+    }
+}",3028.0,374.0,"[H-01] Vault fails to track debt correctly that leads to bad debt
+Arithmetic issue in function `borrow`
+It's similar to the issue ""misuse amount as increasing debt in the vault contract"". Similar issue in a different place that leads to different exploit patterns and severity.
+When users borrow usdm from a vault, the debt increases by the `amount * 1.005`.
+    “uint256 increasingDebt = (_amount * 1005) / 1000;”
+However, when the contract records the total debt it uses _amount instead of increasingDebt.
+
+[H-05] debts calculation is not accurate
+The value of the global variable `debts` in the contract MochiVault.sol is calculated in an inconsistent way.
+In the function `borrow()` the variable `debts` is increased with a value excluding the fee. However in `repay()` and `liquidate()` it is decreased with the same value as `details[_id].debt` is decreased, which is including the fee.
+This would mean that `debts` will end up in a negative value when all debts are repay-ed. Luckily the function repay() prevents this from happening.
+In the meantime the value of debts isn't accurate. This value is used directly or indirectly in:
+- `liveDebtIndex()`, `accrueDebt()`, currentDebt() of MochiVault.solThis means the entire debt and claimable calculations are slightly off.
+
+[H-08] Anyone can extend withdraw wait period by depositing zero collateral
+In MochiVault.sol, the `deposit` function allows anyone to deposit collateral into any position. A malicious user can call this function with amount = 0, which would reset the amount of time the owner has to wait before they can withdraw their collateral from their position. This is especially troublesome with longer delays, as a malicious user would only have to spend a little gas to lock out all other users from being able to withdraw from their positions, compromising the functionality of the contract altogether.
+
+[M-04] Unchecked ERC20 transfer calls
+ERC20 `transfer` and `transferFrom` calls normally return `true` on a succesful transfer. In DutchAuctionLiquidator the call `asset.transfer(msg.sender, _collateral);` is made. `asset` refers to whichever ERC20 asset is used for the vault of that auction. If asset is an ERC20 token which does not comply with the EIP-20 standard it might return false on a failed transaction rather than revert. In this case it would count as a valid transaction even though it is not. If a vault would be making use of USDT the transfer call would always revert as USDT returns void on transfers.
+There are a few more transfer(From) calls which are unchecked, these are however all on a predetermined asset (mochi, usdM and crv) and unlikely to cause problems.
+
+[M-10] griefing attack to block withdraws
+Every time you deposit some assets in the vault (via `deposit()` of MochiVault.sol) then ""lastDeposit[_id]"" is set to `block.timestamp`. The modifier wait() checks this value and makes sure you cannot withdraw for ""delay()"" blocks. The default value for delay() is 3 minutes.
+Knowing this delay you can do a griefing attack: On chains with low gas fees: every 3 minutes deposit a tiny amount for a specific NFT-id (which has a large amount of assets). On chains with high gas fees: monitor the mempool for a `withdraw()` transaction and frontrun it with a `deposit()`",5.0,"pragma solidity ^0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@mochifi/library/contracts/CheapERC20.sol"";
+import ""../interfaces/IERC3156FlashLender.sol"";
+import ""../interfaces/IMochiVault.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/IUSDM.sol"";
+
+contract MochiVault is Initializable, IMochiVault, IERC3156FlashLender {
+    using Float for uint256;
+    using CheapERC20 for IERC20;
+
+    bytes32 public constant CALLBACK_SUCCESS =
+        keccak256(""ERC3156FlashBorrower.onFlashLoan"");
+
+    
+    IMochiEngine public immutable engine;
+    IERC20 public override asset;
+
+    
+    uint256 public debtIndex;
+    uint256 public lastAccrued;
+
+    
+    uint256 public override deposits;
+    uint256 public override debts;
+    int256 public override claimable;
+
+    
+    
+    
+
+    
+    uint256 public liquidated;
+
+    mapping(uint256 => Detail) public override details;
+    mapping(uint256 => uint256) public lastDeposit;
+
+    modifier updateDebt(uint256 _id) {
+        accrueDebt(_id);
+        _;
+    }
+
+    modifier wait(uint256 _id) {
+        require(
+            lastDeposit[_id] + engine.mochiProfile().delay() <= block.timestamp,
+            ""!wait""
+        );
+        accrueDebt(_id);
+        _;
+    }
+
+    constructor(address _engine) {
+        engine = IMochiEngine(_engine);
+    }
+
+    function initialize(address _asset) external override initializer {
+        asset = IERC20(_asset);
+        debtIndex = 1e18;
+        lastAccrued = block.timestamp;
+    }
+
+    function liveDebtIndex() public view override returns (uint256 index) {
+        return
+            engine.mochiProfile().calculateFeeIndex(
+                address(asset),
+                debtIndex,
+                lastAccrued
+            );
+    }
+
+    function status(uint256 _id) public view override returns (Status) {
+        return details[_id].status;
+    }
+
+    function currentDebt(uint256 _id) public view override returns (uint256) {
+        require(details[_id].status != Status.Invalid, ""invalid"");
+        uint256 newIndex = liveDebtIndex();
+        return (details[_id].debt * newIndex) / details[_id].debtIndex;
+    }
+
+    function accrueDebt(uint256 _id) public {
+        
+        
+        uint256 currentIndex = liveDebtIndex();
+        uint256 increased = (debts * currentIndex) / debtIndex - debts;
+        debts += increased;
+        claimable += int256(increased);
+        
+        debtIndex = currentIndex;
+        lastAccrued = block.timestamp;
+        
+        if (_id != type(uint256).max && details[_id].debtIndex < debtIndex) {
+            require(details[_id].status != Status.Invalid, ""invalid"");
+            if (details[_id].debt != 0) {
+                uint256 increasedDebt = (details[_id].debt * debtIndex) /
+                    details[_id].debtIndex -
+                    details[_id].debt;
+                uint256 discountedDebt = increasedDebt.multiply(
+                    engine.discountProfile().discount(engine.nft().ownerOf(_id))
+                );
+                debts -= discountedDebt;
+                claimable -= int256(discountedDebt);
+                details[_id].debt += (increasedDebt - discountedDebt);
+            }
+            details[_id].debtIndex = debtIndex;
+        }
+    }
+
+    function increase(
+        uint256 _id,
+        uint256 _deposits,
+        uint256 _borrows,
+        address _referrer,
+        bytes memory _data
+    ) external {
+        if (_id == type(uint256).max) {
+            
+            _id = mint(msg.sender, _referrer);
+        }
+        if (_deposits > 0) {
+            deposit(_id, _deposits);
+        }
+        if (_borrows > 0) {
+            borrow(_id, _borrows, _data);
+        }
+    }
+
+    function decrease(
+        uint256 _id,
+        uint256 _withdraws,
+        uint256 _repays,
+        bytes memory _data
+    ) external {
+        if (_repays > 0) {
+            repay(_id, _repays);
+        }
+        if (_withdraws > 0) {
+            withdraw(_id, _withdraws, _data);
+        }
+    }
+
+    function mint(address _recipient, address _referrer)
+        public
+        returns (uint256 id)
+    {
+        id = engine.nft().mint(address(asset), _recipient);
+        details[id].debtIndex = liveDebtIndex();
+        details[id].status = Status.Idle;
+        details[id].referrer = _referrer;
+    }
+
+    
+    
+    function deposit(uint256 _id, uint256 _amount)
+        public
+        override
+        updateDebt(_id)
+    {
+        
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        require(
+            details[_id].status == Status.Idle ||
+                details[_id].status == Status.Collaterized ||
+                details[_id].status == Status.Active,
+            ""!depositable""
+        );
+        lastDeposit[_id] = block.timestamp;
+        deposits += _amount;
+        details[_id].collateral += _amount;
+        if (details[_id].status == Status.Idle) {
+            details[_id].status = Status.Collaterized;
+        }
+        asset.cheapTransferFrom(msg.sender, address(this), _amount);
+    }
+
+    
+    function withdraw(
+        uint256 _id,
+        uint256 _amount,
+        bytes memory _data
+    ) public override wait(_id) {
+        require(engine.nft().ownerOf(_id) == msg.sender, ""!approved"");
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        
+        float memory price = engine.cssr().update(address(asset), _data);
+        require(
+            !_liquidatable(
+                details[_id].collateral - _amount,
+                price,
+                details[_id].debt
+            ),
+            ""!healthy""
+        );
+        float memory cf = engine.mochiProfile().maxCollateralFactor(
+            address(asset)
+        );
+        uint256 maxMinted = (details[_id].collateral - _amount)
+            .multiply(cf)
+            .multiply(price);
+        require(details[_id].debt <= maxMinted, "">cf"");
+        deposits -= _amount;
+        details[_id].collateral -= _amount;
+        if (details[_id].collateral == 0) {
+            details[_id].status = Status.Idle;
+        }
+        asset.cheapTransfer(engine.nft().ownerOf(_id), _amount);
+    }
+
+    function borrow(
+        uint256 _id,
+        uint256 _amount,
+        bytes memory _data
+    ) public override updateDebt(_id) {
+        
+        float memory price = engine.cssr().update(address(asset), _data);
+        float memory cf = engine.mochiProfile().maxCollateralFactor(
+            address(asset)
+        );
+        uint256 maxMinted = details[_id].collateral.multiply(cf).multiply(
+            price
+        );
+        require(engine.nft().ownerOf(_id) == msg.sender, ""!approved"");
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        if(details[_id].debt + _amount > maxMinted) {
+            _amount = maxMinted - details[_id].debt;
+        }
+        if(engine.mochiProfile().creditCap(address(asset)) < debts + _amount) {
+            _amount = engine.mochiProfile().creditCap(address(asset)) - debts;
+        }
+        uint256 increasingDebt = (_amount * 1005) / 1000;
+        uint256 totalDebt = details[_id].debt + increasingDebt;
+        require(details[_id].debt + _amount >= engine.mochiProfile().minimumDebt(), ""<minimum"");
+        require(
+            !_liquidatable(details[_id].collateral, price, totalDebt),
+            ""!healthy""
+        );
+        mintFeeToPool(increasingDebt - _amount, details[_id].referrer);
+        
+        details[_id].debtIndex =
+            (details[_id].debtIndex * (totalDebt)) /
+            (details[_id].debt + _amount);
+        details[_id].debt = totalDebt;
+        details[_id].status = Status.Active;
+        debts += _amount;
+        engine.minter().mint(msg.sender, _amount);
+    }
+
+    
+    
+    function repay(uint256 _id, uint256 _amount)
+        public
+        override
+        updateDebt(_id)
+    {
+        if (_amount > details[_id].debt) {
+            _amount = details[_id].debt;
+        }
+        require(_amount > 0, ""zero"");
+        if (debts < _amount) {
+            
+            debts = 0;
+        } else {
+            debts -= _amount;
+        }
+        details[_id].debt -= _amount;
+        if (details[_id].debt == 0) {
+            details[_id].status = Status.Collaterized;
+        }
+        engine.usdm().transferFrom(msg.sender, address(this), _amount);
+        engine.usdm().burn(_amount);
+    }
+
+    function liquidate(
+        uint256 _id,
+        uint256 _collateral,
+        uint256 _usdm
+    ) external override updateDebt(_id) {
+        require(msg.sender == address(engine.liquidator()), ""!liquidator"");
+        require(engine.nft().asset(_id) == address(asset), ""!asset"");
+        float memory price = engine.cssr().getPrice(address(asset));
+        require(
+            _liquidatable(details[_id].collateral, price, currentDebt(_id)),
+            ""healthy""
+        );
+
+        debts -= _usdm;
+
+        details[_id].collateral -= _collateral;
+        details[_id].debt -= _usdm;
+
+        asset.cheapTransfer(msg.sender, _collateral);
+    }
+
+    
+    
+    function _liquidatable(
+        uint256 _collateral,
+        float memory _price,
+        uint256 _debt
+    ) internal view returns (bool) {
+        float memory lf = engine.mochiProfile().liquidationFactor(
+            address(asset)
+        );
+        
+        return _collateral.multiply(lf) < _debt.divide(_price);
+    }
+
+    function liquidatable(uint256 _id) external view returns (bool) {
+        float memory price = engine.cssr().getPrice(address(asset));
+        return _liquidatable(details[_id].collateral, price, currentDebt(_id));
+    }
+
+    function claim() external updateDebt(type(uint256).max) {
+        require(claimable > 0, ""!claimable"");
+        
+        uint256 toClaim = (uint256(claimable) * 75) / 100;
+        mintFeeToPool(toClaim, address(0));
+    }
+
+    function mintFeeToPool(uint256 _amount, address _referrer) internal {
+        claimable -= int256(_amount);
+        if (address(0) != _referrer) {
+            engine.minter().mint(address(engine.referralFeePool()), _amount);
+            engine.referralFeePool().addReward(_referrer);
+        } else {
+            engine.minter().mint(address(engine.treasury()), _amount);
+        }
+    }
+
+    
+    function maxFlashLoan(address _token)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        require(_token == address(asset), ""!supported"");
+        return asset.balanceOf(address(this));
+    }
+
+    function flashFee(address _token, uint256 _amount)
+        public
+        view
+        override
+        returns (uint256)
+    {
+        
+        require(_token == address(asset), ""!supported"");
+        return (_amount * 1337) / 1000000;
+    }
+
+    function flashLoan(
+        IERC3156FlashBorrower _receiver,
+        address _token,
+        uint256 _amount,
+        bytes calldata _data
+    ) external override returns (bool) {
+        require(_token == address(asset), ""!supported"");
+        uint256 fee = flashFee(_token, _amount);
+        asset.cheapTransfer(address(_receiver), _amount);
+        require(
+            _receiver.onFlashLoan(msg.sender, _token, _amount, fee, _data) ==
+                CALLBACK_SUCCESS,
+            ""!callback""
+        );
+        asset.cheapTransferFrom(address(_receiver), address(this), _amount);
+        asset.cheapTransferFrom(address(_receiver), engine.treasury(), fee);
+        return true;
+    }
+}",2692.0,3,2,"<think>
+Let me analyze this smart contract for potential vulnerabilities. I'll go through the code systematically looking for common issues like:
+
+1. Reentrancy vulnerabilities
+2. Integer overflow/underflow (though this is less likely with Solidity 0.8.0+ due to built-in checks)
+3. Access control issues
+4. Logic errors
+5. Missing validation
+6. Flash loan attacks
+7. Front-running vulnerabilities
+8. Business logic flaws
+
+Key observations:
+
+1. This is a vault contract that seems to handle deposits, loans, and other financial operations.
+2. It uses OpenZeppelin's upgradeable contracts pattern.
+3. It has flash loan functionality implemented.
+4. It keeps track of debt positions for different IDs.
+
+Let me go through the specific potential vulnerabilities:
+</think># Vulnerabilities in MochiVault Contract
+
+After analyzing the smart contract, I've identified several vulnerabilities and security issues:
+
+## 1. Reentrancy Risk in Flash Loan Implementation
+
+The `flashLoan` function transfers tokens to the receiver before ensuring proper callback execution. This pattern could potentially enable reentrancy attacks. Despite the callback verification, a malicious contract could exploit this execution flow.
+
+solidity
+function flashLoan(...) {
+    // Transfers before ensuring callback success
+    asset.cheapTransfer(address(_receiver), _amount);
+    require(_receiver.onFlashLoan(...) == CALLBACK_SUCCESS, ""!callback"");
+    // Transfer back happens after the callback
+}
+
+## 2. Missing Input Validation
+
+Several functions lack proper input validation, such as:
+- No zero-amount validation in `deposit()`
+- No proper input validation in `borrow()` when calculating `increasingDebt`
+
+## 3. Logical Error in `borrow()` Function
+
+The `borrow()` function has a potential logical flaw:
+solidity
+if(details[_id].debt + _amount > maxMinted) {
+    _amount = maxMinted - details[_id].debt;
+}
+// Later checks:
+require(details[_id].debt + _amount >= engine.mochiProfile().minimumDebt(), ""<minimum"");
+This could lead to a situation where after adjusting `_amount`, it no longer meets the minimum debt requirement.
+
+## 4. Inconsistent Debt Tracking
+
+In the `repay()` function:
+solidity
+if (debts < _amount) {
+    // Sets debts to 0
+    debts = 0;
+} else {
+    debts -= _amount;
+}
+This inconsistent accounting could lead to a discrepancy between individual debt records and the total debt.
+
+## 5. Precision Loss in Debt Index Calculations
+
+The contract uses division in multiple places without ensuring precision is maintained:
+solidity
+details[_id].debtIndex = (details[_id].debtIndex * (totalDebt)) / (details[_id].debt + _amount);
+
+## 6. Unchecked External Calls
+
+The contract makes external calls without proper checks:
+solidity
+engine.minter().mint(msg.sender, _amount);
+If the external contract fails silently, it could lead to inconsistent state.
+
+## 7. Front-Running Vulnerability in Price-Sensitive Operations
+
+Functions like `withdraw()` and `borrow()` rely on price data that could be manipulated through front-running:
+solidity
+float memory price = engine.cssr().update(address(asset), _data);
+
+## 8. Missing Event Emissions
+
+The contract lacks events for critical operations like deposits, withdrawals, borrows, and repayments, limiting transparency and monitoring capabilities.
+
+## 9. Centralization Risk
+
+Multiple functions depend on external contracts like `engine.mochiProfile()` and `engine.cssr()`. If these contracts are controlled by a centralized entity, they present a central point of failure.
+
+## 10. Potential DoS in `mintFeeToPool()`
+
+If the referral fee pool or treasury rejects the minted tokens, the entire transaction would revert, potentially blocking critical functionality.
+
+These vulnerabilities pose significant risks to the security and proper functioning of the MochiVault contract and should be addressed before deployment.","### **[H-01] Vault fails to track debt correctly that leads to bad debt**
+
+**Report Description**:
+In the `borrow` function, the debt increases by `amount * 1.005`, but the total debt is recorded using `_amount` instead of `increasingDebt`. This inconsistency leads to incorrect debt tracking, which could result in bad debt accumulation. The issue is similar to the misuse of `amount` as increasing debt in the vault contract, but it occurs in a different place, leading to different exploit patterns and severity.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of incorrect debt tracking in the `borrow` function. While the response mentions ""Inconsistent Debt Tracking"" in point 4, it focuses on the `repay` function and does not cover the arithmetic issue in `borrow` that leads to bad debt.
+
+---
+
+### **[H-05] Debts calculation is not accurate**
+
+**Report Description**:
+The global variable `debts` in `MochiVault.sol` is calculated inconsistently. In `borrow()`, `debts` is increased excluding the fee, while in `repay()` and `liquidate()`, it is decreased including the fee. This inconsistency could lead to `debts` becoming negative when all debts are repaid. Although `repay()` prevents this, the value of `debts` remains inaccurate, affecting functions like `liveDebtIndex()`, `accrueDebt()`, and `currentDebt()`.
+
+**Match in Response List**:
+Matches with the issue titled **""Inconsistent Debt Tracking""** in point 4.
+
+**Validation**:
+**Partially Correct**. The response identifies the inconsistency in debt tracking but focuses on the `repay` function and does not fully address the broader impact on functions like `liveDebtIndex()`, `accrueDebt()`, and `currentDebt()`. The response also misses the specific issue of `debts` potentially becoming negative.
+
+---
+
+### **[H-08] Anyone can extend withdraw wait period by depositing zero collateral**
+
+**Report Description**:
+In `MochiVault.sol`, the `deposit` function allows anyone to deposit collateral into any position, even with `amount = 0`. This resets the `lastDeposit[_id]` timestamp, extending the wait period for withdrawals. A malicious user could exploit this to lock out other users from withdrawing their collateral, especially in contracts with longer delays.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of zero-collateral deposits resetting the withdrawal wait period. While the response mentions ""Missing Input Validation"" in point 2, it does not specifically cover this exploit.
+
+---
+
+### **[M-04] Unchecked ERC20 transfer calls**
+
+**Report Description**:
+In `DutchAuctionLiquidator`, the `asset.transfer(msg.sender, _collateral)` call is unchecked. If `asset` is an ERC20 token that does not comply with the EIP-20 standard (e.g., USDT), it might return `false` on failure instead of reverting. This could lead to valid transactions being counted even if the transfer fails. Other unchecked `transfer(From)` calls exist but are less likely to cause issues as they involve predetermined assets.
+
+**Match in Response List**:
+Matches with the issue titled **""Unchecked External Calls""** in point 6.
+
+**Validation**:
+**Correct**. The response accurately identifies the issue of unchecked external calls, including ERC20 transfers. It correctly explains the risks associated with not validating return values from external calls, which aligns with the issue described in the report.
+
+---
+
+### **[M-10] Griefing attack to block withdraws**
+
+**Report Description**:
+In `MochiVault.sol`, the `deposit()` function sets `lastDeposit[_id]` to `block.timestamp`. The `wait()` modifier ensures users cannot withdraw for `delay()` blocks. A malicious user could exploit this by depositing a tiny amount every `delay()` period to block withdrawals for specific NFT IDs. On chains with high gas fees, the attacker could monitor the mempool and frontrun `withdraw()` transactions with `deposit()` calls.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the griefing attack described in the issue. While the response mentions ""Front-Running Vulnerability"" in point 7, it focuses on price-sensitive operations and does not cover the specific exploit of blocking withdrawals via repeated deposits.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- **[M-04] Unchecked ERC20 transfer calls**
+
+**Partially Correct Matches**:
+- **[H-05] Debts calculation is not accurate**
+
+**Missed Issues from Issue Report**:
+- **[H-01] Vault fails to track debt correctly that leads to bad debt**
+- **[H-08] Anyone can extend withdraw wait period by depositing zero collateral**
+- **[M-10] Griefing attack to block withdraws**
+
+---
+
+The response list covers some vulnerabilities but misses critical issues like incorrect debt tracking, zero-collateral deposit exploits, and griefing attacks. It also partially addresses the inconsistency in debt calculations but does not fully capture the impact on related functions.",1,1,3,10,"```
+1. Unchecked ERC20 transfer calls
+```","To calculate the **Average Precision (AP)** for the given query, we follow these steps:
+
+1. **Identify the ranks of true positives in the ranked list of predictions**:
+   - The true positive is ""Unchecked ERC20 transfer calls.""
+   - This appears in the ranked list of predictions at rank **6** (in the section ""6. Unchecked External Calls"").
+
+2. **Calculate the precision at rank 6**:
+   - Precision at rank \( k \) (\( P@k \)) is the number of true positives up to rank \( k \) divided by \( k \).
+   - Up to rank 6, there is **1 true positive**.
+   - \( P@6 = \frac{1}{6} \approx 0.1667 \).
+
+3. **Compute the Average Precision (AP)**:
+   - Since there is only **1 true positive**, the AP is simply the precision at its rank.
+   - \( AP = P@6 \approx 0.1667 \).
+
+**Output**:
+```
+0.1667
+```",0.1667,24.96388292312620,4442.0,3.0
+FeePoolV0.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol"";
+import ""../interfaces/IFeePool.sol"";
+import ""../interfaces/IUSDM.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+
+contract FeePoolV0 is IFeePool {
+    IMochiEngine public immutable engine;
+
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    address public crvVoterRewardPool;
+
+    uint256 public treasuryRatio;
+
+    uint256 public vMochiRatio;
+
+    uint256 public mochiShare;
+
+    uint256 public treasuryShare;
+
+    constructor(address _engine, address _uniswap) {
+        engine = IMochiEngine(_engine);
+        uniswapRouter = IUniswapV2Router02(_uniswap);
+        treasuryRatio = 20e16;
+        vMochiRatio = 80e16;
+    }
+
+    function updateReserve() external override {
+        uint256 newReserve = engine.usdm().balanceOf(address(this)) -
+            mochiShare -
+            treasuryShare;
+        treasuryShare += (newReserve * treasuryRatio) / 1e18;
+        mochiShare = engine.usdm().balanceOf(address(this)) - treasuryShare;
+    }
+
+    function changecrvVoterRewardPool(address _pool) external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        crvVoterRewardPool = _pool;
+    }
+
+    function changeTreasuryRatio(uint256 _ratio) external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        treasuryRatio = _ratio;
+    }
+
+    function changevMochiRatio(uint256 _ratio) external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        vMochiRatio = _ratio;
+    }
+
+    // this will open up arb oppertunity for Mochi
+    // so we will not reward the caller, caller can benefit from flashbot
+    // should decide which market we should use UniV2?V3? BalancerV2?
+    function distributeMochi() external {
+        // buy Mochi with mochiShare
+        _buyMochi();
+        _shareMochi();
+    }
+
+    function _buyMochi() internal {
+        IUSDM usdm = engine.usdm();
+        address[] memory path = new address[](2);
+        path[0] = address(usdm);
+        path[1] = address(engine.mochi());
+        usdm.approve(address(uniswapRouter), mochiShare);
+        uniswapRouter.swapExactTokensForTokens(
+            mochiShare,
+            1,
+            path,
+            address(this),
+            type(uint256).max
+        );
+    }
+
+    function _shareMochi() internal {
+        IMochi mochi = engine.mochi();
+        uint256 mochiBalance = mochi.balanceOf(address(this));
+        // send Mochi to vMochi Vault
+        mochi.transfer(
+            address(engine.vMochi()),
+            (mochiBalance * vMochiRatio) / 1e18
+        );
+        // send Mochi to veCRV Holders
+        mochi.transfer(
+            crvVoterRewardPool,
+            (mochiBalance * (1e18 - vMochiRatio)) / 1e18
+        );
+        // flush mochiShare
+        mochiShare = 0;
+        treasuryShare = 0;
+    }
+
+    function sendToTreasury() external {
+        engine.usdm().transfer(engine.treasury(), treasuryShare);
+        treasuryShare = 0;
+    }
+}",789.0,101.0,"[H-02] `FeePoolV0.sol#distributeMochi()` will unexpectedly flush treasuryShare, causing the protocol fee cannot be properly accounted for and collected
+`distributeMochi()` will call `_buyMochi()` to convert `mochiShare` to Mochi token and call `_shareMochi()` to send Mochi to vMochi Vault and veCRV Holders. It wont touch the `treasuryShare`.
+However, in the current implementation, `treasuryShare` will be reset to 0. This is unexpected and will cause the protocol fee can not be properly accounted for and collected.
+
+[H-11] treasuryShare is Overwritten in FeePoolV0._shareMochi()
+Function `_shareMochi()`  overwritten `treasuryShare`
+The FeePoolV0.sol contract accrues fees upon the liquidation of undercollaterised positions. These fees are split between treasury and vMochi contracts. However, when `distributeMochi()` is called to distribute mochi tokens to veCRV holders, both mochiShare and treasuryShare is flushed from the contract when there are still usdm tokens in the contract.
+
+[H-12] feePool is vulnerable to sandwich attack.
+There's a permissionless function `distributeMochi` in FeePoolV0.sol L55-L62. Since everyone can trigger this function, an attacker can launch a sandwich attack with flashloan to steal the funds.
+The devs have mentioned this concern in the comment. An attacker can steal the funds with a flash loan attack.
+Attackers can steal all the funds in the pool. I consider this is a high-risk issue.",3.0,"pragma solidity ^0.8.0;
+
+import ""@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol"";
+import ""../interfaces/IFeePool.sol"";
+import ""../interfaces/IUSDM.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+
+contract FeePoolV0 is IFeePool {
+    IMochiEngine public immutable engine;
+
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    address public crvVoterRewardPool;
+
+    uint256 public treasuryRatio;
+
+    uint256 public vMochiRatio;
+
+    uint256 public mochiShare;
+
+    uint256 public treasuryShare;
+
+    constructor(address _engine, address _uniswap) {
+        engine = IMochiEngine(_engine);
+        uniswapRouter = IUniswapV2Router02(_uniswap);
+        treasuryRatio = 20e16;
+        vMochiRatio = 80e16;
+    }
+
+    function updateReserve() external override {
+        uint256 newReserve = engine.usdm().balanceOf(address(this)) -
+            mochiShare -
+            treasuryShare;
+        treasuryShare += (newReserve * treasuryRatio) / 1e18;
+        mochiShare = engine.usdm().balanceOf(address(this)) - treasuryShare;
+    }
+
+    function changecrvVoterRewardPool(address _pool) external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        crvVoterRewardPool = _pool;
+    }
+
+    function changeTreasuryRatio(uint256 _ratio) external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        treasuryRatio = _ratio;
+    }
+
+    function changevMochiRatio(uint256 _ratio) external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        vMochiRatio = _ratio;
+    }
+
+    
+    
+    
+    function distributeMochi() external {
+        
+        _buyMochi();
+        _shareMochi();
+    }
+
+    function _buyMochi() internal {
+        IUSDM usdm = engine.usdm();
+        address[] memory path = new address[](2);
+        path[0] = address(usdm);
+        path[1] = address(engine.mochi());
+        usdm.approve(address(uniswapRouter), mochiShare);
+        uniswapRouter.swapExactTokensForTokens(
+            mochiShare,
+            1,
+            path,
+            address(this),
+            type(uint256).max
+        );
+    }
+
+    function _shareMochi() internal {
+        IMochi mochi = engine.mochi();
+        uint256 mochiBalance = mochi.balanceOf(address(this));
+        
+        mochi.transfer(
+            address(engine.vMochi()),
+            (mochiBalance * vMochiRatio) / 1e18
+        );
+        
+        mochi.transfer(
+            crvVoterRewardPool,
+            (mochiBalance * (1e18 - vMochiRatio)) / 1e18
+        );
+        
+        mochiShare = 0;
+        treasuryShare = 0;
+    }
+
+    function sendToTreasury() external {
+        engine.usdm().transfer(engine.treasury(), treasuryShare);
+        treasuryShare = 0;
+    }
+}",685.0,3,0,"<think>
+Let's analyze this contract to identify potential vulnerabilities:
+
+1. Re-entrancy vulnerabilities:
+   - The `updateReserve` function calculates new values and updates state variables, but it does not follow the checks-effects-interactions pattern concerning external calls. However, it doesn't make any external calls that could be re-entrant.
+   - In `_buyMochi()`, there's an approve followed by a swap, which follows a good pattern.
+
+2. Front-running vulnerabilities:
+   - The functions `changecrvVoterRewardPool`, `changeTreasuryRatio`, and `changevMochiRatio` could be front-run, but they only affect configuration and require governance authority.
+
+3. Integer overflow/underflow issues:
+   - The contract is using Solidity 0.8.0+, which has built-in overflow/underflow protection.
+
+4. Missing input validation:
+   - `changevMochiRatio` and `changeTreasuryRatio` don't validate if the new ratios make sense (e.g., ensuring they don't exceed 100%).
+   - There's no check to ensure that crvVoterRewardPool is not address(0) in changecrvVoterRewardPool.
+
+5. Balance calculation issues:
+   - The `updateReserve` function assumes `engine.usdm().balanceOf(address(this)) >= mochiShare + treasuryShare`. If this is not true, it could revert due to underflow.
+
+6. Missing event emissions:
+   - No events are emitted for important state changes, making it harder to track changes.
+
+7. Centralization risks:
+   - Several functions are controlled solely by governance, creating centralization.
+
+8. Logic issues:
+   - In `distributeMochi`, `_buyMochi()` is called before `_shareMochi()`, which assumes the swap will always succeed with a useful amount.
+   - The uniswapRouter.swapExactTokensForTokens has a minimum output of just 1 token, which could lead to significant slippage without warning.
+   - The deadline for swap is set to max uint256, which means the transaction remains valid indefinitely and could be executed at unfavorable times.
+
+9. No safeguards for edge cases:
+   - If crvVoterRewardPool is not set or is set to address(0), `_shareMochi()` would send tokens to address(0).
+   - No checks for zero values that could waste gas on unnecessary operations.
+
+10. Security concerns with external contracts:
+    - The contract interacts with Uniswap and other external contracts, but doesn't have fallbacks if these fail.
+
+11. Missing access control in sensitive functions:
+    - `updateReserve`, `distributeMochi`, and `sendToTreasury` can be called by anyone, potentially leading to unexpected behavior.
+
+Let me check if there are other issues...
+</think># Vulnerabilities in FeePoolV0 Contract
+
+## 1. Missing Access Control
+- `updateReserve()`, `distributeMochi()`, and `sendToTreasury()` functions lack access controls, allowing anyone to call them, which could disrupt the protocol's operations or timing.
+
+## 2. Minimal Slippage Protection
+- In `_buyMochi()`, the `swapExactTokensForTokens` function uses a minimum output amount of just 1 token (`1`), making the swap vulnerable to sandwich attacks and extreme slippage without any mechanism to revert the transaction.
+
+## 3. Unlimited Swap Deadline
+- The deadline parameter in `swapExactTokensForTokens` is set to `type(uint256).max`, meaning the transaction can remain in the mempool indefinitely and could be executed at highly unfavorable times.
+
+## 4. Incomplete Input Validation
+- `changeTreasuryRatio` and `changevMochiRatio` don't validate that ratios are within reasonable bounds (e.g., that they don't exceed 100%).
+- `changecrvVoterRewardPool` lacks a check for address(0).
+
+## 5. Potential Arithmetic Underflow
+- In `updateReserve()`, the calculation `engine.usdm().balanceOf(address(this)) - mochiShare - treasuryShare` assumes sufficient balance, which could fail if the actual balance is less than the sum of shares.
+
+## 6. Missing Events
+- No events are emitted for important state changes like ratio updates, making it difficult to track changes and monitor the contract's activity.
+
+## 7. Centralization Risk
+- Critical parameters are controlled solely by governance with no time-lock or multi-signature protections.
+
+## 8. No Null Address Validation for crvVoterRewardPool
+- If `crvVoterRewardPool` is set to address(0) or not set at all, `_shareMochi()` would send tokens to the zero address, effectively burning them.
+
+## 9. No Handling for Failed Swaps
+- The contract assumes swaps will always succeed but doesn't have mechanisms to handle failures or ensure the obtained swap rate is reasonable.
+
+## 10. Treasury/Mochi Calculations May Not Sum Correctly
+- The distribution calculations in `_shareMochi()` could leave dust amounts due to rounding if vMochiRatio is not perfectly complementary.
+
+These vulnerabilities vary in severity, with the slippage protection and access control issues being particularly concerning for the financial operations of this contract.","### **Output**
+
+---
+
+**[H-02] `FeePoolV0.sol#distributeMochi()` will unexpectedly flush `treasuryShare`, causing the protocol fee cannot be properly accounted for and collected**
+
+**Report Description**:
+The `distributeMochi()` function in `FeePoolV0.sol` is designed to convert `mochiShare` to Mochi tokens and distribute them to vMochi Vault and veCRV holders. However, it unexpectedly resets `treasuryShare` to 0, even though it should not touch this value. This behavior prevents the protocol fee from being properly accounted for and collected, leading to potential financial discrepancies.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of `treasuryShare` being unexpectedly reset in `distributeMochi()`. This is a critical oversight, as it directly impacts the protocol's ability to collect fees. The response list focuses on other vulnerabilities but misses this specific logic flaw.
+
+---
+
+**[H-11] `treasuryShare` is Overwritten in `FeePoolV0._shareMochi()`**
+
+**Report Description**:
+The `_shareMochi()` function in `FeePoolV0.sol` overwrites `treasuryShare` when distributing Mochi tokens. This occurs even when there are still `usdm` tokens in the contract, leading to an unintended flush of `treasuryShare`. This behavior disrupts the protocol's fee collection mechanism, as the treasury's share is not properly preserved.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not mention the issue of `treasuryShare` being overwritten in `_shareMochi()`. This is a significant logic error that affects the protocol's financial operations. The response list fails to identify this specific vulnerability.
+
+---
+
+**[H-12] `FeePoolV0.sol` is vulnerable to sandwich attack**
+
+**Report Description**:
+The `distributeMochi()` function in `FeePoolV0.sol` is permissionless, allowing anyone to trigger it. This makes the contract vulnerable to sandwich attacks, where an attacker can use flash loans to manipulate the price of Mochi tokens and steal funds from the pool. The developers have acknowledged this concern in the comments, but no safeguards have been implemented to prevent such attacks.
+
+**Match in Response List**:
+Matches with the issue titled **""Minimal Slippage Protection""**.
+
+**Validation**:
+**Partially Correct**. The response list correctly identifies the lack of slippage protection in `_buyMochi()`, which is related to the sandwich attack vulnerability. However, it does not explicitly mention the permissionless nature of `distributeMochi()` or the broader implications of a sandwich attack. The response partially addresses the issue but misses critical details.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- **[H-12] `FeePoolV0.sol` is vulnerable to sandwich attack**
+
+**Missed Issues from Issue Report**:
+- **[H-02] `FeePoolV0.sol#distributeMochi()` will unexpectedly flush `treasuryShare`, causing the protocol fee cannot be properly accounted for and collected**
+- **[H-11] `treasuryShare` is Overwritten in `FeePoolV0._shareMochi()`**
+
+---
+
+### **Conclusion**
+The response list partially addresses one issue ([H-12]) but misses two critical vulnerabilities ([H-02] and [H-11]). The identified issues in the response list are either incomplete or unrelated to the specific problems described in the issue report. Improvements are needed to ensure comprehensive coverage of all vulnerabilities in the `FeePoolV0.sol` contract.",0,1,2,10,"```
+None.
+```","The **Average Precision (AP)** for the query is **0.0**. 
+
+Since there are no true positives in the ranked list of predictions, the precision at every rank is 0, and the average of these values is also 0.",0,29.12173628807070,2223.0,3.0
+ReferralFeePoolV0.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/IReferralFeePool.sol"";
+
+contract ReferralFeePoolV0 is IReferralFeePool {
+    IMochiEngine public immutable engine;
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    uint256 public rewards;
+
+    mapping(address => uint256) public reward;
+
+    constructor(address _engine, address _uniswap) {
+        engine = IMochiEngine(_engine);
+        uniswapRouter = IUniswapV2Router02(_uniswap);
+    }
+
+    function addReward(address _recipient) external override {
+        uint256 newReward = engine.usdm().balanceOf(address(this)) - rewards;
+        reward[_recipient] += newReward;
+        rewards += newReward;
+    }
+
+    function claimRewardAsMochi() external {
+        IUSDM usdm = engine.usdm();
+        address[] memory path = new address[](2);
+        path[0] = address(usdm);
+        path[1] = uniswapRouter.WETH();
+        path[2] = address(engine.mochi());
+        usdm.approve(address(uniswapRouter), reward[msg.sender]);
+        // we are going to ingore the slippages here
+        uniswapRouter.swapExactTokensForTokens(
+            reward[msg.sender],
+            1,
+            path,
+            address(this),
+            type(uint256).max
+        );
+        engine.mochi().transfer(
+            msg.sender,
+            engine.mochi().balanceOf(address(this))
+        );
+    }
+}",369.0,48.0,"[H-03] ReferralFeePoolV0.sol#claimRewardAsMochi() Array out of bound exception
+In `ReferralFeePoolV0.sol#claimRewardAsMochi()`, `path` is defined as an array of length 2 while it should be length 3.
+As a result, at L33, an out-of-bound exception will be thrown and revert the transaction.
+Impact: `claimRewardAsMochi()` will not work as expected so that all the referral fees cannot be claimed but stuck in the contract.
+
+[H-06] Referrer can drain ReferralFeePoolV0
+function `claimRewardAsMochi` in ReferralFeePoolV0.sol did not reduce user reward balance, allowing referrer to claim the same reward repeatedly and thus draining the fee pool.
+
+[M-02] regerralFeePool is vulnerable to MEV searcher
+`claimRewardAsMochi` in the ReferralFeePoolV0 ignores slippage. This is not a desirable design. There are a lot of MEV searchers in the current network. Swapping assets with no slippage control would get rekted. Please refer to https://github.com/flashbots/pm.
+Given the current state of the Ethereum network, users would likely be sandwiched. I consider this is a high-risk issue.",3.0,"pragma solidity ^0.8.0;
+
+import ""@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/IReferralFeePool.sol"";
+
+contract ReferralFeePoolV0 is IReferralFeePool {
+    IMochiEngine public immutable engine;
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    uint256 public rewards;
+
+    mapping(address => uint256) public reward;
+
+    constructor(address _engine, address _uniswap) {
+        engine = IMochiEngine(_engine);
+        uniswapRouter = IUniswapV2Router02(_uniswap);
+    }
+
+    function addReward(address _recipient) external override {
+        uint256 newReward = engine.usdm().balanceOf(address(this)) - rewards;
+        reward[_recipient] += newReward;
+        rewards += newReward;
+    }
+
+    function claimRewardAsMochi() external {
+        IUSDM usdm = engine.usdm();
+        address[] memory path = new address[](2);
+        path[0] = address(usdm);
+        path[1] = uniswapRouter.WETH();
+        path[2] = address(engine.mochi());
+        usdm.approve(address(uniswapRouter), reward[msg.sender]);
+        
+        uniswapRouter.swapExactTokensForTokens(
+            reward[msg.sender],
+            1,
+            path,
+            address(this),
+            type(uint256).max
+        );
+        engine.mochi().transfer(
+            msg.sender,
+            engine.mochi().balanceOf(address(this))
+        );
+    }
+}",344.0,2,1,"<think>
+Let me analyze this contract for vulnerabilities:
+
+1. Array out of bounds in the `claimRewardAsMochi` function:
+   - The function creates a path array with 2 elements: `address[] memory path = new address[](2);`
+   - But then tries to assign 3 elements: path[0], path[1], and path[2]
+   - This will cause an out-of-bounds error on `path[2] = address(engine.mochi());`
+
+2. Re-entrancy vulnerability in `claimRewardAsMochi`:
+   - The function first approves tokens before zeroing out the reward balance
+   - It performs external calls (`swapExactTokensForTokens` and `transfer`) before updating the state
+   - If those external contracts are malicious or have vulnerabilities, they could re-enter and claim the reward multiple times
+
+3. Missing zero address check in constructor:
+   - The constructor doesn't validate if `_engine` or `_uniswap` are the zero address
+
+4. No access control on `addReward`:
+   - The `addReward` function is external with no access control, allowing anyone to call it
+   - This could lead to unauthorized reward distribution
+
+5. Potential integer overflow/underflow in `addReward`:
+   - While Solidity 0.8.0+ has built-in overflow/underflow checks, the logic in `addReward` assumes that the current balance minus rewards is always positive and represents a new reward
+
+6. Swapping tokens without minimum output amount check:
+   - In `claimRewardAsMochi`, the minimum output amount is set to 1, which could lead to significant slippage
+   - There's no deadline for the swap either (using max uint256)
+
+7. No reward accounting update after claim:
+   - The function `claimRewardAsMochi` doesn't reset `reward[msg.sender]` to 0 after claiming
+   - This means a user could potentially claim rewards multiple times
+</think># Vulnerabilities in ReferralFeePoolV0 Contract
+
+1. **Array Out of Bounds Error**:
+   - In `claimRewardAsMochi()`, the path array is initialized with size 2 (`new address[](2)`) but then 3 elements are assigned (path[0], path[1], and path[2]). This will cause an out-of-bounds error when accessing path[2].
+
+2. **Missing Reward Reset After Claiming**:
+   - After claiming rewards in `claimRewardAsMochi()`, `reward[msg.sender]` is never reset to zero. This allows users to claim the same reward multiple times.
+
+3. **Re-entrancy Vulnerability**:
+   - The contract calls external functions (`swapExactTokensForTokens` and `transfer`) after approving tokens but before updating state. This could allow re-entrancy attacks.
+
+4. **No Access Control**:
+   - `addReward()` is marked as external with no access control, allowing anyone to call it and manipulate rewards.
+
+5. **Inconsistent State Tracking**:
+   - The `rewards` variable is incremented in `addReward()` but never decremented in `claimRewardAsMochi()`, leading to inconsistent state tracking.
+
+6. **Missing Zero Address Validation**:
+   - No checks in the constructor to ensure `_engine` and `_uniswap` are not zero addresses.
+
+7. **Swap Slippage Vulnerability**:
+   - In `claimRewardAsMochi()`, minimum output amount is set to 1, which could result in significant slippage/value loss.
+
+8. **Infinite Approval Risk**:
+   - Each call to `claimRewardAsMochi()` issues a new approval without revoking the previous one.
+
+9. **Self-Transfer of Tokens**:
+   - In `claimRewardAsMochi()`, tokens are swapped to the contract itself and then transferred to the user, rather than directly to the user.
+
+10. **No Deadline for Swaps**:
+    - Using `type(uint256).max` as the deadline for swaps means transactions can be pending indefinitely, potentially executing at unfavorable prices.","### **[H-03] ReferralFeePoolV0.sol#claimRewardAsMochi() Array out of bound exception**
+
+**Report Description**:  
+In `ReferralFeePoolV0.sol#claimRewardAsMochi()`, the `path` array is defined with a length of 2, but it should be length 3. As a result, an out-of-bound exception will be thrown at L33, reverting the transaction. This prevents `claimRewardAsMochi()` from functioning as expected, causing referral fees to remain stuck in the contract.
+
+**Match in Response List**:  
+Matches with the issue titled **""Array Out of Bounds Error""** in the response list.
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue with the `path` array being initialized with a length of 2 but attempting to assign 3 elements. This directly aligns with the reported issue and correctly explains the out-of-bounds error.
+
+---
+
+### **[H-06] Referrer can drain ReferralFeePoolV0**
+
+**Report Description**:  
+The `claimRewardAsMochi` function in `ReferralFeePoolV0.sol` does not reduce the user's reward balance after claiming, allowing a referrer to claim the same reward repeatedly. This could lead to the draining of the fee pool.
+
+**Match in Response List**:  
+Matches with the issue titled **""Missing Reward Reset After Claiming""** in the response list.
+
+**Validation**:  
+**Correct**. The response correctly identifies the issue of not resetting `reward[msg.sender]` to zero after claiming, which allows users to claim rewards multiple times. This aligns with the reported issue and its potential impact.
+
+---
+
+### **[M-02] ReferralFeePoolV0 is vulnerable to MEV searcher**
+
+**Report Description**:  
+The `claimRewardAsMochi` function in `ReferralFeePoolV0.sol` ignores slippage, making it vulnerable to MEV searchers. Swapping assets without slippage control could result in significant losses, especially in the current Ethereum network environment where users are likely to be sandwiched.
+
+**Match in Response List**:  
+Matches with the issue titled **""Swap Slippage Vulnerability""** in the response list.
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue of setting the minimum output amount to 1, which could lead to significant slippage. This aligns with the reported issue and its potential impact on users.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+
+- **[H-03] ReferralFeePoolV0.sol#claimRewardAsMochi() Array out of bound exception**
+- **[H-06] Referrer can drain ReferralFeePoolV0**
+- **[M-02] ReferralFeePoolV0 is vulnerable to MEV searcher**
+
+**Partially Correct Matches**:
+
+- *None*
+
+**Missed Issues from Issue Report**:
+
+- *None*
+
+---
+
+### **Additional Observations**
+
+While the response list covers the reported issues accurately, it also identifies additional vulnerabilities not mentioned in the issue report, such as:
+
+1. **Re-entrancy Vulnerability**: The response highlights the risk of re-entrancy due to external calls before state updates.
+2. **No Access Control**: The response points out the lack of access control on the `addReward` function.
+3. **Missing Zero Address Validation**: The response notes the absence of zero address checks in the constructor.
+4. **Infinite Approval Risk**: The response identifies the risk of issuing new approvals without revoking previous ones.
+5. **No Deadline for Swaps**: The response mentions the use of `type(uint256).max` as the deadline, which could lead to unfavorable execution.
+
+These additional findings demonstrate a thorough analysis of the contract, even though they were not explicitly mentioned in the issue report.",3,0,0,10,"```
+1. Array Out of Bounds Error
+2. Missing Reward Reset After Claiming
+3. Swap Slippage Vulnerability
+```","To calculate the **Average Precision (AP)**, we follow these steps:
+
+1. **Identify the ranks of the true positives** in the ranked list of predictions:
+   - ""Array Out of Bounds Error"" appears at rank **1**.
+   - ""Missing Reward Reset After Claiming"" appears at rank **2**.
+   - ""Swap Slippage Vulnerability"" appears at rank **7**.
+
+2. **Calculate the precision at each rank** where a true positive appears:
+   - At rank 1: \( P@1 = \frac{1}{1} = 1.0 \)
+   - At rank 2: \( P@2 = \frac{2}{2} = 1.0 \)
+   - At rank 7: \( P@7 = \frac{3}{7} \approx 0.4286 \)
+
+3. **Average the precision values** for all true positives:
+   \[
+   AP = \frac{1.0 + 1.0 + 0.4286}{3} \approx 0.8095
+   \]
+
+Thus, the **Average Precision (AP)** is:
+
+**0.8095**",0.8095,18.50140380859380,1495.0,3.0
+MochiProfileV0.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""../interfaces/IMochiProfile.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+
+///@notice this is where policies including some math is registered will be able to swap the profile when current profile is not suitable
+///@dev this profile is built with https://docs.google.com/spreadsheets/d/1T2WKpwj5QmueR7O8R9AXNbnHLc-rJ_-8DLdRI2eJZqA
+contract MochiProfileV0 is IMochiProfile {
+    using Float for float;
+    using Float for uint256;
+    IMochiEngine public immutable engine;
+
+    uint256 public override liquidityRequirement;
+
+    uint256 public override minimumDebt;
+
+    mapping(address => AssetClass) internal _assetClass;
+
+    mapping(address => uint256) public override creditCap;
+
+    uint256 public immutable secPerYear;
+
+    uint256 public override delay;
+
+    constructor(address _engine) {
+        secPerYear = 31536000;
+        engine = IMochiEngine(_engine);
+
+        liquidityRequirement = 1000000e18; // 1million dollar
+        minimumDebt = 1000e18;
+        delay = 3 minutes;
+    }
+
+    modifier onlyGov() {
+        require(msg.sender == engine.governance(), ""!gov"");
+        _;
+    }
+
+    function assetClass(address _asset)
+        public
+        view
+        override
+        returns (AssetClass)
+    {
+        return _assetClass[_asset];
+    }
+
+    function changeLiquidityRequirement(uint256 _requirement)
+        external
+        override
+        onlyGov
+    {
+        liquidityRequirement = _requirement;
+    }
+
+    function registerAsset(address _asset) external {
+        uint256 liq = engine.cssr().getLiquidity(_asset);
+        require(liq >= liquidityRequirement, ""<liquidity"");
+        _register(_asset, AssetClass.Sigma);
+    }
+
+    function registerAssetByGov(
+        address[] calldata _asset,
+        AssetClass[] calldata _classes
+    ) external onlyGov {
+        for (uint256 i = 0; i < _asset.length; i++) {
+            _register(_asset[i], _classes[i]);
+            engine.vaultFactory().deployVault(_asset[i]);
+        }
+    }
+
+    function _register(address _asset, AssetClass _class) internal {
+        _assetClass[_asset] = _class;
+    }
+
+    function changeMinimumDebt(uint256 _debt) external override onlyGov {
+        minimumDebt = _debt;
+    }
+
+    function changeAssetClass(
+        address[] calldata _assets,
+        AssetClass[] calldata _classes
+    ) external override onlyGov {
+        for (uint256 i = 0; i < _assets.length; i++) {
+            _assetClass[_assets[i]] = _classes[i];
+        }
+    }
+
+    function changeCreditCap(
+        address[] calldata _assets,
+        uint256[] calldata _caps
+    ) external onlyGov {
+        for (uint256 i = 0; i < _assets.length; i++) {
+            creditCap[_assets[i]] = _caps[i];
+        }
+    }
+
+    function setDelay(uint256 _delay) external onlyGov {
+        delay = _delay;
+    }
+
+    ///@notice The Collateral Factor at which the users vault will be liquidated
+    function liquidationFactor(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 95, denominator: 100});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 85, denominator: 100});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 80, denominator: 100});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 75, denominator: 100});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 65, denominator: 100});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 40, denominator: 100});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function riskFactor(address _asset) public view returns (uint256) {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return 1;
+        } else if (class == AssetClass.Alpha) {
+            return 2;
+        } else if (class == AssetClass.Gamma) {
+            return 3;
+        } else if (class == AssetClass.Delta) {
+            return 4;
+        } else if (class == AssetClass.Zeta) {
+            return 5;
+        } else if (class == AssetClass.Sigma) {
+            return 6;
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function maxCollateralFactor(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 90, denominator: 100});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 80, denominator: 100});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 75, denominator: 100});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 65, denominator: 100});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 55, denominator: 100});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 45, denominator: 100});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function baseFee() public pure returns (float memory) {
+        return float({numerator: 5, denominator: 1000});
+    }
+
+    function liquidationFee(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 45, denominator: 1000});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 100, denominator: 1000});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 125, denominator: 1000});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 150, denominator: 1000});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 175, denominator: 1000});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 200, denominator: 1000});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function keeperFee(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 5, denominator: 1000});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 10, denominator: 1000});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 15, denominator: 1000});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 20, denominator: 1000});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 25, denominator: 1000});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 30, denominator: 1000});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function maxFee(AssetClass _class) public pure returns (float memory) {
+        if (_class == AssetClass.Stable) {
+            return float({numerator: 10, denominator: 1000});
+        } else if (_class == AssetClass.Alpha) {
+            return float({numerator: 15, denominator: 1000});
+        } else if (_class == AssetClass.Gamma) {
+            return float({numerator: 20, denominator: 1000});
+        } else if (_class == AssetClass.Delta) {
+            return float({numerator: 21, denominator: 1000});
+        } else if (_class == AssetClass.Zeta) {
+            return float({numerator: 22, denominator: 1000});
+        } else if (_class == AssetClass.Sigma) {
+            return float({numerator: 23, denominator: 1000});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function stabilityFee(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        float memory base = baseFee();
+        AssetClass class = assetClass(_asset);
+        float memory max = maxFee(class);
+        float memory u = utilizationRatio(_asset);
+        if (u.gt(float({numerator: 1, denominator: 1}))) {
+            return max;
+        }
+        return base.add(max.sub(base).mul(u));
+    }
+
+    function calculateFeeIndex(
+        address _asset,
+        uint256 _currentIndex,
+        uint256 _lastAccrued
+    ) external view override returns (uint256) {
+        float memory feePerYear = stabilityFee(_asset);
+        uint256 timePassed = block.timestamp - _lastAccrued;
+        float memory feeAccumulated = feePerYear.mul(
+            float({numerator: timePassed, denominator: secPerYear})
+        );
+        return _currentIndex + _currentIndex.multiply(feeAccumulated);
+    }
+
+    ///@dev returns utilization ratio scaled with 1e18
+    function utilizationRatio(address _asset)
+        public
+        view
+        override
+        returns (float memory ratio)
+    {
+        IMochiVault vault = engine.vaultFactory().getVault(_asset);
+        uint256 debts = vault.debts();
+        uint256 cap = creditCap[_asset];
+        return float({numerator: debts, denominator: cap});
+    }
+}",2270.0,285.0,"***[H-04] `registerAsset()` can `overwrite _assetClass` value***
+Everyone can call the function `registerAsset()` of MochiProfileV0.sol Assuming the liquidity for the asset is sufficient, `registerAsset()` will reset the _assetClass of an already registered asset to AssetClass.Sigma.
+When the `_assetClass` is changed to `AssetClass.Sigma` then `liquidationFactor()`, `riskFactor()`, `maxCollateralFactor()`, `liquidationFee()` `keeperFee()` `maxFee()` will also return a different value. Then the entire vault will behave differently. The threshold for liquidation will also be different, possibly leading to a liquidation that isn't supposed to happen.",1.0,"pragma solidity ^0.8.0;
+
+import ""../interfaces/IMochiProfile.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+
+
+
+contract MochiProfileV0 is IMochiProfile {
+    using Float for float;
+    using Float for uint256;
+    IMochiEngine public immutable engine;
+
+    uint256 public override liquidityRequirement;
+
+    uint256 public override minimumDebt;
+
+    mapping(address => AssetClass) internal _assetClass;
+
+    mapping(address => uint256) public override creditCap;
+
+    uint256 public immutable secPerYear;
+
+    uint256 public override delay;
+
+    constructor(address _engine) {
+        secPerYear = 31536000;
+        engine = IMochiEngine(_engine);
+
+        liquidityRequirement = 1000000e18; 
+        minimumDebt = 1000e18;
+        delay = 3 minutes;
+    }
+
+    modifier onlyGov() {
+        require(msg.sender == engine.governance(), ""!gov"");
+        _;
+    }
+
+    function assetClass(address _asset)
+        public
+        view
+        override
+        returns (AssetClass)
+    {
+        return _assetClass[_asset];
+    }
+
+    function changeLiquidityRequirement(uint256 _requirement)
+        external
+        override
+        onlyGov
+    {
+        liquidityRequirement = _requirement;
+    }
+
+    function registerAsset(address _asset) external {
+        uint256 liq = engine.cssr().getLiquidity(_asset);
+        require(liq >= liquidityRequirement, ""<liquidity"");
+        _register(_asset, AssetClass.Sigma);
+    }
+
+    function registerAssetByGov(
+        address[] calldata _asset,
+        AssetClass[] calldata _classes
+    ) external onlyGov {
+        for (uint256 i = 0; i < _asset.length; i++) {
+            _register(_asset[i], _classes[i]);
+            engine.vaultFactory().deployVault(_asset[i]);
+        }
+    }
+
+    function _register(address _asset, AssetClass _class) internal {
+        _assetClass[_asset] = _class;
+    }
+
+    function changeMinimumDebt(uint256 _debt) external override onlyGov {
+        minimumDebt = _debt;
+    }
+
+    function changeAssetClass(
+        address[] calldata _assets,
+        AssetClass[] calldata _classes
+    ) external override onlyGov {
+        for (uint256 i = 0; i < _assets.length; i++) {
+            _assetClass[_assets[i]] = _classes[i];
+        }
+    }
+
+    function changeCreditCap(
+        address[] calldata _assets,
+        uint256[] calldata _caps
+    ) external onlyGov {
+        for (uint256 i = 0; i < _assets.length; i++) {
+            creditCap[_assets[i]] = _caps[i];
+        }
+    }
+
+    function setDelay(uint256 _delay) external onlyGov {
+        delay = _delay;
+    }
+
+    
+    function liquidationFactor(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 95, denominator: 100});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 85, denominator: 100});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 80, denominator: 100});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 75, denominator: 100});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 65, denominator: 100});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 40, denominator: 100});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function riskFactor(address _asset) public view returns (uint256) {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return 1;
+        } else if (class == AssetClass.Alpha) {
+            return 2;
+        } else if (class == AssetClass.Gamma) {
+            return 3;
+        } else if (class == AssetClass.Delta) {
+            return 4;
+        } else if (class == AssetClass.Zeta) {
+            return 5;
+        } else if (class == AssetClass.Sigma) {
+            return 6;
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function maxCollateralFactor(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 90, denominator: 100});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 80, denominator: 100});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 75, denominator: 100});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 65, denominator: 100});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 55, denominator: 100});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 45, denominator: 100});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function baseFee() public pure returns (float memory) {
+        return float({numerator: 5, denominator: 1000});
+    }
+
+    function liquidationFee(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 45, denominator: 1000});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 100, denominator: 1000});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 125, denominator: 1000});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 150, denominator: 1000});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 175, denominator: 1000});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 200, denominator: 1000});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function keeperFee(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        AssetClass class = assetClass(_asset);
+        if (class == AssetClass.Stable) {
+            return float({numerator: 5, denominator: 1000});
+        } else if (class == AssetClass.Alpha) {
+            return float({numerator: 10, denominator: 1000});
+        } else if (class == AssetClass.Gamma) {
+            return float({numerator: 15, denominator: 1000});
+        } else if (class == AssetClass.Delta) {
+            return float({numerator: 20, denominator: 1000});
+        } else if (class == AssetClass.Zeta) {
+            return float({numerator: 25, denominator: 1000});
+        } else if (class == AssetClass.Sigma) {
+            return float({numerator: 30, denominator: 1000});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function maxFee(AssetClass _class) public pure returns (float memory) {
+        if (_class == AssetClass.Stable) {
+            return float({numerator: 10, denominator: 1000});
+        } else if (_class == AssetClass.Alpha) {
+            return float({numerator: 15, denominator: 1000});
+        } else if (_class == AssetClass.Gamma) {
+            return float({numerator: 20, denominator: 1000});
+        } else if (_class == AssetClass.Delta) {
+            return float({numerator: 21, denominator: 1000});
+        } else if (_class == AssetClass.Zeta) {
+            return float({numerator: 22, denominator: 1000});
+        } else if (_class == AssetClass.Sigma) {
+            return float({numerator: 23, denominator: 1000});
+        } else {
+            revert(""invalid"");
+        }
+    }
+
+    function stabilityFee(address _asset)
+        public
+        view
+        override
+        returns (float memory)
+    {
+        float memory base = baseFee();
+        AssetClass class = assetClass(_asset);
+        float memory max = maxFee(class);
+        float memory u = utilizationRatio(_asset);
+        if (u.gt(float({numerator: 1, denominator: 1}))) {
+            return max;
+        }
+        return base.add(max.sub(base).mul(u));
+    }
+
+    function calculateFeeIndex(
+        address _asset,
+        uint256 _currentIndex,
+        uint256 _lastAccrued
+    ) external view override returns (uint256) {
+        float memory feePerYear = stabilityFee(_asset);
+        uint256 timePassed = block.timestamp - _lastAccrued;
+        float memory feeAccumulated = feePerYear.mul(
+            float({numerator: timePassed, denominator: secPerYear})
+        );
+        return _currentIndex + _currentIndex.multiply(feeAccumulated);
+    }
+
+    
+    function utilizationRatio(address _asset)
+        public
+        view
+        override
+        returns (float memory ratio)
+    {
+        IMochiVault vault = engine.vaultFactory().getVault(_asset);
+        uint256 debts = vault.debts();
+        uint256 cap = creditCap[_asset];
+        return float({numerator: debts, denominator: cap});
+    }
+}",2146.0,1,0,"<think>
+Let me analyze this contract to identify potential vulnerabilities:
+
+1. **Missing Import**: Float library is used but not imported - I don't see an import for the Float library which is used throughout the contract.
+
+2. **Input Validation Issues**:
+   - In `registerAssetByGov()`, there's no check that `_asset.length` == `_classes.length`
+   - Same for `changeCreditCap()` - no check that `_assets.length` == `_caps.length`
+   - Same for `changeAssetClass()`
+
+3. **Possible Integer Overflow/Underflow**: Though Solidity 0.8.0+ has built-in overflow/underflow protection, calculations should still be analyzed carefully:
+   - `calculateFeeIndex()` involves math that could potentially lead to precision issues
+
+4. **Access Control Issues**:
+   - `registerAsset()` can be called by anyone, not just governance. This might be intended but could be exploited.
+   - Engine's governance address is trusted - if there are issues with that contract, it could affect this one.
+
+5. **Missing Events**: No events are emitted for state changes, which can make it difficult to track changes off-chain.
+
+6. **Initialization Check Missing**: No checks to ensure the engine address is valid in the constructor (i.e., not zero address).
+
+7. **Immutable Variables**: `secPerYear` is immutable but might need to be adjusted for leap years.
+
+8. **Possible DOS Attack**: 
+   - `registerAssetByGov()` iterates through arrays without limiting their size. If arrays are too large, the function might run out of gas.
+
+9. **Utilization Ratio Issue**:
+   - In `utilizationRatio()`, if `creditCap[_asset]` is 0, it will cause a division by zero error.
+
+10. **Possible Flash Loan Attack**:
+    - `registerAsset()` checks liquidity but might be vulnerable to manipulation through flash loans if the liquidity check mechanism is vulnerable.
+
+11. **Fixed Values**:
+    - Hard-coded values like liquidation factors, risk factors, etc. cannot be changed by governance if market conditions change.
+
+12. **Delay Parameter**:
+    - `delay` parameter is defined but not used in the contract, which might indicate missing functionality.
+</think># Vulnerabilities in MochiProfileV0 Contract
+
+After analyzing the contract, I've identified the following vulnerabilities and issues:
+
+## Critical Vulnerabilities
+
+1. **Missing Float Library Import**: The contract uses `Float` library extensively (`using Float for float`, `using Float for uint256`), but doesn't import it.
+
+2. **Division by Zero Risk**: In `utilizationRatio()`, if `creditCap[_asset]` is 0, it will cause a division by zero error that would revert the transaction.
+
+## High Severity Issues
+
+3. **Array Length Validation Missing**:
+   - In `registerAssetByGov()`: No check that `_asset.length` equals `_classes.length`
+   - In `changeCreditCap()`: No check that `_assets.length` equals `_caps.length`
+   - In `changeAssetClass()`: No check that `_assets.length` equals `_classes.length`
+
+4. **Missing Zero Address Check**: No validation that `_engine` is not the zero address in the constructor.
+
+5. **Unlimited Size in Array Iterations**: Functions like `registerAssetByGov()` iterate through arrays without size limits, potentially causing out-of-gas errors if arrays are too large.
+
+## Medium Severity Issues
+
+6. **Public Asset Registration**: `registerAsset()` can be called by any user, allowing manipulation if the liquidity requirement can be temporarily met (e.g., through flash loans).
+
+7. **No Event Emissions**: The contract doesn't emit events for critical state changes, reducing transparency and making off-chain tracking difficult.
+
+8. **Unused Parameter**: `delay` state variable is defined and can be set by governance but is never used in the contract.
+
+## Low Severity/Informational Issues
+
+9. **Hard-coded Values**: Various financial parameters like liquidation factors and fees are hard-coded and not adjustable by governance.
+
+10. **Immutable Time Constants**: `secPerYear` is immutable at 31536000 seconds, not accounting for leap years.
+
+11. **Potential Precision Loss**: Complex calculations in `calculateFeeIndex()` might lead to precision issues over time.
+
+12. **Missing Comments/Documentation**: The contract lacks comprehensive documentation explaining the purpose and behavior of critical functions.
+
+13. **Governance Dependency**: The contract's security depends on the integrity of the engine's governance system.
+
+Each of these issues should be addressed to improve the contract's security, reliability, and maintainability.","### **[H-04] `registerAsset()` can overwrite `_assetClass` value**
+
+**Report Description**:
+The `registerAsset()` function in `MochiProfileV0.sol` allows anyone to call it, assuming the liquidity for the asset is sufficient. This function resets the `_assetClass` of an already registered asset to `AssetClass.Sigma`. Changing the `_assetClass` affects multiple functions such as `liquidationFactor()`, `riskFactor()`, `maxCollateralFactor()`, `liquidationFee()`, `keeperFee()`, and `maxFee()`, leading to different behaviors in the vault. This could result in unintended liquidations and other operational discrepancies.
+
+**Match in Response List**:
+Matches with the issue titled **""Public Asset Registration""** in the response list.
+
+**Validation**:
+**Correct**. The response accurately identifies the issue with the `registerAsset()` function being callable by anyone, which aligns with the reported vulnerability. It correctly explains the risks associated with allowing public registration of assets, which could lead to manipulation and unintended changes in the vault's behavior. This matches the core concern of the reported issue, where the `_assetClass` can be overwritten, leading to significant operational impacts.
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+
+- **[H-04] `registerAsset()` can overwrite `_assetClass` value**
+
+**Partially Correct Matches**:
+
+- *None*
+
+**Missed Issues from Issue Report**:
+
+- *None*
+
+---
+
+This analysis shows that the response list effectively covers the reported issue, providing a correct identification and explanation of the vulnerability.",1,0,0,13,"```
+1. Public Asset Registration
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the rank of the true positive**:
+   - The true positive is ""Public Asset Registration"".
+   - In the ranked list of predictions, ""Public Asset Registration"" appears at rank **6**.
+
+2. **Calculate the precision at rank 6**:
+   - Precision at rank \( k \) (\( P@k \)) is calculated as the number of true positives up to rank \( k \) divided by \( k \).
+   - Up to rank 6, there is **1** true positive.
+   - \( P@6 = \frac{1}{6} \approx 0.1667 \).
+
+3. **Compute the Average Precision (AP)**:
+   - Since there is only one true positive, the AP is simply the precision at the rank where the true positive appears.
+   - \( AP = 0.1667 \).
+
+**Output**:
+```
+0.1667
+```",0.1667,26.773711919784500,3810.0,3.0
+MochiTreasuryV0.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/ICurveVotingEscrow.sol"";
+
+contract MochiTreasuryV0 {
+    IMochiEngine public immutable engine;
+
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    IERC20 public immutable crv;
+    ICurveVotingEscrow public immutable veCrv;
+    bool public lockCrv;
+    uint256 public operationShare;
+    uint256 public veCRVShare;
+
+    constructor(
+        address _engine,
+        address _uniswap,
+        address _crv,
+        address _veCrv
+    ) {
+        engine = IMochiEngine(_engine);
+        uniswapRouter = IUniswapV2Router02(_uniswap);
+        crv = IERC20(_crv);
+        veCrv = ICurveVotingEscrow(_veCrv);
+        lockCrv = false;
+    }
+
+    receive() external payable {}
+
+    function withdrawCRV() external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        crv.transfer(msg.sender, crv.balanceOf(address(this)));
+    }
+
+    function withdrawLock() external {
+        veCrv.withdraw();
+    }
+
+    function veCRVInitialize() external {
+        require(lockCrv, ""!lock"");
+        updateFee();
+        _buyCRV();
+        veCrv.create_lock(
+            crv.balanceOf(address(this)),
+            block.timestamp + 90 days
+        );
+    }
+
+    function toggleLocking() external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        lockCrv = !lockCrv;
+    }
+
+    function updateFee() public {
+        uint256 updatedFee = engine.usdm().balanceOf(address(this)) -
+            operationShare -
+            veCRVShare;
+        operationShare += updatedFee / 2;
+        veCRVShare += updatedFee / 2;
+    }
+
+    function claimOperationCost() external {
+        updateFee();
+        engine.usdm().transfer(engine.operationWallet(), operationShare);
+        operationShare = 0;
+    }
+
+    function veCRVlock() external {
+        require(lockCrv, ""!lock"");
+        updateFee();
+        _buyCRV();
+        _lockCRV();
+        veCRVShare = 0;
+    }
+
+    function _buyCRV() internal {
+        IUSDM usdm = engine.usdm();
+        address[] memory path = new address[](2);
+        path[0] = address(usdm);
+        path[1] = address(crv);
+        usdm.approve(address(uniswapRouter), veCRVShare);
+        uniswapRouter.swapExactTokensForTokens(
+            veCRVShare,
+            1,
+            path,
+            address(this),
+            type(uint256).max
+        );
+    }
+
+    function _lockCRV() internal {
+        crv.approve(address(veCrv), crv.balanceOf(address(this)));
+        veCrv.increase_amount(crv.balanceOf(address(this)));
+        veCrv.increase_unlock_time(block.timestamp + 90 days);
+    }
+}",688.0,101.0,"[H-09] treasury is vulnerable to sandwich attack
+There's a permissionless function `veCRVlock` in `MochiTreasury`. Since everyone can trigger this function, the attacker can launch a sandwich attack with flashloan to steal the funds. MochiTreasuryV0.sol#L73-L94
+Attackers can possibly steal all the funds in the treasury. 
+
+[M-14] MochiTreasuryV0.withdrawLock() Is Callable When Locking Has Been Toggled
+`withdrawLock()` does not prevent users from calling this function when locking has been toggled. As a result, withdraws may be made unexpectedly.",2.0,"pragma solidity ^0.8.0;
+
+import ""@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/ICurveVotingEscrow.sol"";
+
+contract MochiTreasuryV0 {
+    IMochiEngine public immutable engine;
+
+    IUniswapV2Router02 public immutable uniswapRouter;
+
+    IERC20 public immutable crv;
+    ICurveVotingEscrow public immutable veCrv;
+    bool public lockCrv;
+    uint256 public operationShare;
+    uint256 public veCRVShare;
+
+    constructor(
+        address _engine,
+        address _uniswap,
+        address _crv,
+        address _veCrv
+    ) {
+        engine = IMochiEngine(_engine);
+        uniswapRouter = IUniswapV2Router02(_uniswap);
+        crv = IERC20(_crv);
+        veCrv = ICurveVotingEscrow(_veCrv);
+        lockCrv = false;
+    }
+
+    receive() external payable {}
+
+    function withdrawCRV() external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        crv.transfer(msg.sender, crv.balanceOf(address(this)));
+    }
+
+    function withdrawLock() external {
+        veCrv.withdraw();
+    }
+
+    function veCRVInitialize() external {
+        require(lockCrv, ""!lock"");
+        updateFee();
+        _buyCRV();
+        veCrv.create_lock(
+            crv.balanceOf(address(this)),
+            block.timestamp + 90 days
+        );
+    }
+
+    function toggleLocking() external {
+        require(msg.sender == engine.governance(), ""!gov"");
+        lockCrv = !lockCrv;
+    }
+
+    function updateFee() public {
+        uint256 updatedFee = engine.usdm().balanceOf(address(this)) -
+            operationShare -
+            veCRVShare;
+        operationShare += updatedFee / 2;
+        veCRVShare += updatedFee / 2;
+    }
+
+    function claimOperationCost() external {
+        updateFee();
+        engine.usdm().transfer(engine.operationWallet(), operationShare);
+        operationShare = 0;
+    }
+
+    function veCRVlock() external {
+        require(lockCrv, ""!lock"");
+        updateFee();
+        _buyCRV();
+        _lockCRV();
+        veCRVShare = 0;
+    }
+
+    function _buyCRV() internal {
+        IUSDM usdm = engine.usdm();
+        address[] memory path = new address[](2);
+        path[0] = address(usdm);
+        path[1] = address(crv);
+        usdm.approve(address(uniswapRouter), veCRVShare);
+        uniswapRouter.swapExactTokensForTokens(
+            veCRVShare,
+            1,
+            path,
+            address(this),
+            type(uint256).max
+        );
+    }
+
+    function _lockCRV() internal {
+        crv.approve(address(veCrv), crv.balanceOf(address(this)));
+        veCrv.increase_amount(crv.balanceOf(address(this)));
+        veCrv.increase_unlock_time(block.timestamp + 90 days);
+    }
+}",676.0,1,1,"<think>
+Let's review this contract for potential vulnerabilities by going through it line by line and understanding its functionality:
+
+1. The contract is called `MochiTreasuryV0` and seems to manage funds for a Mochi project, particularly handling CRV tokens and interactions with Curve's veCRV mechanism.
+
+Potential issues:
+
+1. **Deadline issue in swapExactTokensForTokens**: 
+   - In `_buyCRV()`, the contract calls `uniswapRouter.swapExactTokensForTokens` with a deadline of `type(uint256).max`. 
+   - This means the transaction can stay in the mempool indefinitely, potentially being processed at unfavorable exchange rates.
+
+2. **Minimum output tokens issue**:
+   - Also in `_buyCRV()`, the `swapExactTokensForTokens` uses a minimum output of `1` token.
+   - This means the contract is susceptible to sandwich attacks or slippage with almost no protection.
+
+3. **Reentrancy concerns**:
+   - The contract doesn't follow the checks-effects-interactions pattern in some functions.
+   - For example, in `updateFee()`, it reads the balance before updating state variables.
+
+4. **Missing zero address checks**:
+   - The constructor doesn't check if the provided addresses are non-zero.
+
+5. **Missing return values**:
+   - The ERC20 transfer return values are not checked, which could lead to silent failures.
+
+6. **Unchecked arithmetic**:
+   - Even though the contract is on Solidity 0.8+, which has built-in overflow/underflow protection, there are arithmetic operations without checks for logical issues.
+   - For example, in `updateFee()`, the calculation `updatedFee = engine.usdm().balanceOf(address(this)) - operationShare - veCRVShare;` assumes that `balanceOf` is always greater than the sum of `operationShare` and `veCRVShare`, which may not be the case.
+
+7. **Lock timing issue**:
+   - In `veCRVInitialize()` and `_lockCRV()`, the locking time is set to `block.timestamp + 90 days`, which means if these functions are called frequently, the lock time will keep extending.
+
+8. **Inadequate permissions**:
+   - Some critical functions like `withdrawLock()` can be called by anyone.
+
+9. **No checking token allowance before transfer**:
+   - Before calling `crv.transfer()` in `withdrawCRV()`, there's no check if the contract has enough CRV tokens.
+
+10. **Unused parameters**:
+    - The `withdrawLock()` function doesn't use any parameters, which is fine, but it's worth noting.
+</think># Vulnerabilities in MochiTreasuryV0 Contract
+
+1. **Unrestricted Access to `withdrawLock()`**:
+   - Anyone can call the `withdrawLock()` function, which calls `veCrv.withdraw()`. This is a critical function that should have access controls.
+
+2. **Inadequate Slippage Protection**:
+   - In `_buyCRV()`, the `swapExactTokensForTokens` uses `1` as the minimum output amount, making it highly vulnerable to sandwich attacks and front-running.
+
+3. **Infinite Transaction Deadline**:
+   - The `swapExactTokensForTokens` in `_buyCRV()` uses `type(uint256).max` as the deadline, allowing transactions to remain valid indefinitely, potentially executing at unfavorable times.
+
+4. **Missing Zero Address Validation**:
+   - Constructor doesn't validate that input addresses are non-zero, which could lead to contract being deployed with incorrect dependencies.
+
+5. **Unchecked ERC20 Return Values**:
+   - ERC20 transfer and approve function return values aren't checked, which could lead to silent failures with tokens that return false instead of reverting.
+
+6. **Potential Underflow in `updateFee()`**:
+   - The calculation `updatedFee = engine.usdm().balanceOf(address(this)) - operationShare - veCRVShare` assumes the balance is always sufficient. If not, this will cause a revert in Solidity 0.8.0 but might indicate a logic error.
+
+7. **No Validation of Lock Status in `withdrawLock()`**:
+   - The function doesn't check if there's anything to withdraw or if the lock has expired.
+
+8. **Centralization Risk**:
+   - Critical functions like `withdrawCRV()` and `toggleLocking()` are only callable by governance, creating a centralization risk.
+
+9. **Unlimited Token Approvals**:
+   - Contract gives unlimited approvals to external contracts (Uniswap router and veCrv) instead of approving only the necessary amount.
+
+10. **Lack of Events**:
+    - No events are emitted for important state changes, making it difficult to track actions and debug issues.
+
+11. **Unclear Division Logic**:
+    - In `updateFee()`, the fee division may result in loss of precision if amounts are odd numbers.
+
+12. **Lock Extension Logic**:
+    - In `_lockCRV()`, the lock time is always extended to `block.timestamp + 90 days`, regardless of the current lock expiration, potentially extending locks unnecessarily.","### **Comparison and Evaluation**
+
+---
+
+#### **[H-09] Treasury is Vulnerable to Sandwich Attack**
+
+**Report Description**:  
+The permissionless function `veCRVlock` in `MochiTreasury` allows anyone to trigger it, enabling attackers to launch a sandwich attack using flash loans to steal funds. This vulnerability could result in the theft of all funds in the treasury.
+
+**Match in Response List**:  
+Matches with the issue titled **""Inadequate Slippage Protection""** in the response list.
+
+**Validation**:  
+**Partially Correct**. The response identifies the risk of sandwich attacks in the context of `_buyCRV()` due to inadequate slippage protection. However, it does not explicitly address the `veCRVlock` function or the specific attack vector described in the issue. While the response correctly highlights the general risk of sandwich attacks, it misses the specific vulnerability in `veCRVlock`.
+
+---
+
+#### **[M-14] MochiTreasuryV0.withdrawLock() Is Callable When Locking Has Been Toggled**
+
+**Report Description**:  
+The `withdrawLock()` function does not prevent users from calling it when locking has been toggled. This could lead to unexpected withdrawals, potentially compromising the intended locking mechanism.
+
+**Match in Response List**:  
+Matches with the issue titled **""No Validation of Lock Status in `withdrawLock()`""** in the response list.
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue with `withdrawLock()` not validating the lock status. It correctly highlights the risk of unexpected withdrawals due to the lack of checks, which aligns with the issue description.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- **[M-14] MochiTreasuryV0.withdrawLock() Is Callable When Locking Has Been Toggled**
+
+**Partially Correct Matches**:
+- **[H-09] Treasury is Vulnerable to Sandwich Attack**
+
+**Missed Issues from Issue Report**:
+- *None*
+
+---
+
+### **Detailed Analysis**
+
+1. **[H-09] Treasury is Vulnerable to Sandwich Attack**:  
+   - The response partially addresses the issue by identifying the general risk of sandwich attacks in `_buyCRV()`. However, it does not cover the specific vulnerability in the `veCRVlock` function, which is the core of the issue. This omission makes the response **partially correct**.
+
+2. **[M-14] MochiTreasuryV0.withdrawLock() Is Callable When Locking Has Been Toggled**:  
+   - The response correctly identifies the lack of validation in `withdrawLock()` and the associated risks. This aligns perfectly with the issue description, making the response **correct**.
+
+---
+
+### **Recommendations**
+
+1. **Expand Coverage of Sandwich Attack Issue**:  
+   - The response should explicitly address the `veCRVlock` function and its vulnerability to sandwich attacks, as this is the primary concern in the issue report.
+
+2. **Enhance Specificity in Responses**:  
+   - While the response list covers many vulnerabilities, it should ensure that specific functions and their unique risks are highlighted to provide a more comprehensive analysis.
+
+3. **Include Mitigation Strategies**:  
+   - For each identified vulnerability, the response could suggest mitigation strategies (e.g., adding access controls, validating lock status, or implementing slippage protection) to improve the contract's security.",1,1,0,12,"```
+1. No Validation of Lock Status in `withdrawLock()`
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the ranks of true positives**:
+   - The true positive is: `1. No Validation of Lock Status in \`withdrawLock()\``
+   - This true positive appears at rank **1** in the ranked list of predictions.
+
+2. **Calculate precision at rank 1**:
+   - Precision at rank 1 (\( P@1 \)) is calculated as:
+     \[
+     P@1 = \frac{\text{Number of true positives up to rank 1}}{\text{Rank}} = \frac{1}{1} = 1.0
+     \]
+
+3. **Compute the Average Precision (AP)**:
+   - Since there is only one true positive, the AP is simply the precision at rank 1:
+     \[
+     AP = 1.0
+     \]
+
+**Output**:
+```
+1.0
+```",1,24.59396386146550,2253.0,3.0
+MochiEngine.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""./vault/MochiVaultFactory.sol"";
+import ""./assets/usdm.sol"";
+import ""./interfaces/IMochiEngine.sol"";
+
+contract MochiEngine is IMochiEngine {
+    // immutable values
+    IMochiVaultFactory public immutable override vaultFactory;
+    // mutable values
+    IMochi public override mochi;
+    IVMochi public override vMochi;
+    address public override governance;
+    address public override treasury;
+    address public override operationWallet;
+    IUSDM public override usdm;
+    IMinter public override minter;
+    ICSSRRouter public override cssr;
+    IMochiProfile public override mochiProfile;
+    IDiscountProfile public override discountProfile;
+    ILiquidator public override liquidator;
+    IFeePool public override feePool;
+    IReferralFeePool public override referralFeePool;
+    IMochiNFT public override nft;
+
+    constructor(address _governance) {
+        governance = _governance;
+        vaultFactory = IMochiVaultFactory(new MochiVaultFactory(address(this)));
+        operationWallet = msg.sender;
+    }
+
+    modifier onlyGov() {
+        require(msg.sender == governance, ""!gov"");
+        _;
+    }
+
+    function changeMochi(address _mochi) external onlyGov {
+        mochi = IMochi(_mochi);
+    }
+
+    function changeVMochi(address _vmochi) external onlyGov {
+        vMochi = IVMochi(_vmochi);
+    }
+
+    function changeUSDM(address _usdm) external onlyGov {
+        usdm = IUSDM(_usdm);
+    }
+
+    function changeMinter(address _minter) external onlyGov {
+        minter = IMinter(_minter);
+    }
+
+    function changeGovernance(address _governance) external onlyGov {
+        governance = _governance;
+    }
+
+    function changeTreasury(address _treasury) external onlyGov {
+        treasury = _treasury;
+    }
+
+    function changeOperationWallet(address _operation) external onlyGov {
+        operationWallet = _operation;
+    }
+
+    function changeCSSR(address _cssr) external onlyGov {
+        cssr = ICSSRRouter(_cssr);
+    }
+
+    function changeProfile(address _profile) external onlyGov {
+        mochiProfile = IMochiProfile(_profile);
+    }
+
+    function changeDiscountProfile(address _profile) external onlyGov {
+        discountProfile = IDiscountProfile(_profile);
+    }
+
+    function changeLiquidator(address _liquidator) external onlyGov {
+        liquidator = ILiquidator(_liquidator);
+    }
+
+    function changeFeePool(address _feePool) external onlyGov {
+        feePool = IFeePool(_feePool);
+    }
+
+    function changeReferralFeePool(address _referralFeePool) external onlyGov {
+        referralFeePool = IReferralFeePool(_referralFeePool);
+    }
+
+    function changeNFT(address _nft) external onlyGov {
+        nft = IMochiNFT(_nft);
+    }
+}",661.0,94.0,"***[H-10] Changing NFT contract in the `MochiEngine` would break the protocol***
+`MochiEngine` allows the operator to change the NFT contract in MochiEngine.sol#L91-L93
+All the vaults would point to a different NFT address. As a result, users would not be access their positions. The entire protocol would be broken.
+IMHO, A function that would break the entire protocol shouldn't exist.",1.0,"pragma solidity ^0.8.0;
+
+import ""./vault/MochiVaultFactory.sol"";
+import ""./assets/usdm.sol"";
+import ""./interfaces/IMochiEngine.sol"";
+
+contract MochiEngine is IMochiEngine {
+    
+    IMochiVaultFactory public immutable override vaultFactory;
+    
+    IMochi public override mochi;
+    IVMochi public override vMochi;
+    address public override governance;
+    address public override treasury;
+    address public override operationWallet;
+    IUSDM public override usdm;
+    IMinter public override minter;
+    ICSSRRouter public override cssr;
+    IMochiProfile public override mochiProfile;
+    IDiscountProfile public override discountProfile;
+    ILiquidator public override liquidator;
+    IFeePool public override feePool;
+    IReferralFeePool public override referralFeePool;
+    IMochiNFT public override nft;
+
+    constructor(address _governance) {
+        governance = _governance;
+        vaultFactory = IMochiVaultFactory(new MochiVaultFactory(address(this)));
+        operationWallet = msg.sender;
+    }
+
+    modifier onlyGov() {
+        require(msg.sender == governance, ""!gov"");
+        _;
+    }
+
+    function changeMochi(address _mochi) external onlyGov {
+        mochi = IMochi(_mochi);
+    }
+
+    function changeVMochi(address _vmochi) external onlyGov {
+        vMochi = IVMochi(_vmochi);
+    }
+
+    function changeUSDM(address _usdm) external onlyGov {
+        usdm = IUSDM(_usdm);
+    }
+
+    function changeMinter(address _minter) external onlyGov {
+        minter = IMinter(_minter);
+    }
+
+    function changeGovernance(address _governance) external onlyGov {
+        governance = _governance;
+    }
+
+    function changeTreasury(address _treasury) external onlyGov {
+        treasury = _treasury;
+    }
+
+    function changeOperationWallet(address _operation) external onlyGov {
+        operationWallet = _operation;
+    }
+
+    function changeCSSR(address _cssr) external onlyGov {
+        cssr = ICSSRRouter(_cssr);
+    }
+
+    function changeProfile(address _profile) external onlyGov {
+        mochiProfile = IMochiProfile(_profile);
+    }
+
+    function changeDiscountProfile(address _profile) external onlyGov {
+        discountProfile = IDiscountProfile(_profile);
+    }
+
+    function changeLiquidator(address _liquidator) external onlyGov {
+        liquidator = ILiquidator(_liquidator);
+    }
+
+    function changeFeePool(address _feePool) external onlyGov {
+        feePool = IFeePool(_feePool);
+    }
+
+    function changeReferralFeePool(address _referralFeePool) external onlyGov {
+        referralFeePool = IReferralFeePool(_referralFeePool);
+    }
+
+    function changeNFT(address _nft) external onlyGov {
+        nft = IMochiNFT(_nft);
+    }
+}",641.0,1,0,"<think>
+Let's analyze the MochiEngine contract for potential vulnerabilities:
+
+1. Lack of address validation in setter functions: None of the setter functions validate that the provided address is non-zero. This could lead to problems if accidentally set to address(0).
+
+2. No initialization checks: Many critical components (mochi, vMochi, treasury, etc.) are not initialized in the constructor and don't have checks in their usage to ensure they're set before being used.
+
+3. Single point of failure: The governance address has complete control over all system parameters. If this account is compromised, the entire system can be manipulated.
+
+4. No time-locks for critical parameter changes: Changes to critical addresses happen immediately without any delay, which doesn't give users time to react to potentially malicious changes.
+
+5. No events emitted: The contract doesn't emit events when critical parameters are changed, making it difficult to track changes off-chain.
+
+6. No two-step ownership transfer: The governance address can be changed in a single transaction, which is risky compared to a two-step process where the new address has to accept the role.
+
+7. No access control for certain functions beyond governance: For a complex system like this, having only one level of access control might be insufficient.
+
+8. Immutable vaultFactory: Once the contract is deployed, the vaultFactory cannot be changed, which could be problematic if issues are found with that implementation.
+
+9. No emergency functions: There don't appear to be any emergency pause or shutdown mechanisms if critical vulnerabilities are discovered.
+</think># Vulnerabilities in MochiEngine Contract
+
+After analyzing the MochiEngine contract, I've identified the following vulnerabilities:
+
+1. **Missing Zero-Address Validation**
+   - None of the setter functions validate that input addresses are non-zero
+   - Could lead to system failures if critical components like governance, treasury, or USDM are set to address(0)
+
+2. **Incomplete Initialization**
+   - Many critical components (mochi, vMochi, treasury, etc.) are not initialized in the constructor
+   - No checks exist to ensure these components are properly set before system use
+
+3. **Centralized Control**
+   - The governance address has unlimited power to change all critical parameters
+   - Single point of failure if the governance address is compromised
+
+4. **No Change Events**
+   - No events are emitted when critical parameters are changed
+   - Makes tracking system changes difficult and lacks transparency
+
+5. **No Timelock for Critical Changes**
+   - Critical address changes take effect immediately
+   - Users have no time to react to potentially malicious configuration changes
+
+6. **Unsafe Governance Transfer**
+   - `changeGovernance` function allows direct transfer without confirmation
+   - Should use a two-step transfer pattern (propose + accept)
+
+7. **No Circuit Breaker**
+   - Lacks emergency pause functionality
+   - No way to halt the system if a critical vulnerability is discovered
+
+8. **No Access Control Granularity**
+   - Only has one access level (`onlyGov`)
+   - Different functions may require different permission levels for proper security separation
+
+9. **Immutable VaultFactory**
+   - Once deployed, the vaultFactory cannot be changed
+   - Problematic if bugs are discovered in the factory implementation
+
+These vulnerabilities could potentially lead to system failures, loss of funds, or complete system takeover by malicious actors.","---
+
+**[H-10] Changing NFT contract in the `MochiEngine` would break the protocol**
+
+**Report Description**:  
+The `MochiEngine` contract allows the operator to change the NFT contract address (lines 91-93 in `MochiEngine.sol`). If the NFT contract is changed, all vaults would point to a different NFT address, rendering users unable to access their positions. This could break the entire protocol. The existence of such a function is highly risky, as it introduces a single point of failure that could disrupt the system entirely.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address the specific issue of changing the NFT contract in `MochiEngine`. While the response list identifies several vulnerabilities related to governance, initialization, and access control, it does not mention the critical risk of allowing the NFT contract address to be changed, which could break the protocol. This is a significant oversight, as the issue represents a severe single point of failure that is not covered in the response list.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- **[H-10] Changing NFT contract in the `MochiEngine` would break the protocol**
+
+--- 
+
+The response list fails to address the specific issue of changing the NFT contract in `MochiEngine`, which is a critical vulnerability that could disrupt the entire protocol. This gap highlights the need for a more comprehensive analysis of the contract's functionality and potential risks.",0,0,1,9,"```
+None.
+```",0.0,0,16.03215003013610,1631.0,3.0
+VestedRewardPool.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""../interfaces/IMochi.sol"";
+import ""@mochifi/vmochi/contracts/interfaces/IVMochi.sol"";
+
+contract VestedRewardPool {
+    IMochi public immutable mochi;
+    IVMochi public immutable vMochi;
+
+    uint256 public mochiUnderManagement;
+
+    mapping(address => Vesting) public vesting;
+
+    struct Vesting {
+        uint256 vested;
+        uint256 ends;
+        uint256 claimable;
+    }
+
+    modifier checkClaimable(address recipient) {
+        if (vesting[recipient].ends < block.timestamp) {
+            vesting[recipient].claimable += vesting[recipient].vested;
+            vesting[recipient].vested = 0;
+            vesting[recipient].ends = 0;
+        }
+        _;
+    }
+
+    constructor(address _mochi, address _vmochi) {
+        mochi = IMochi(_mochi);
+        vMochi = IVMochi(_vmochi);
+    }
+
+    function vest(address _recipient) external checkClaimable(_recipient) {
+        uint256 amount = mochi.balanceOf(address(this)) - mochiUnderManagement;
+        uint256 weightedEnd = (vesting[_recipient].vested *
+            vesting[_recipient].ends +
+            amount *
+            (block.timestamp + 90 days)) /
+            (vesting[_recipient].vested + amount);
+        vesting[_recipient].vested += amount;
+        vesting[_recipient].ends = weightedEnd;
+        mochiUnderManagement += amount;
+    }
+
+    function claim() external checkClaimable(msg.sender) {
+        mochi.transfer(msg.sender, vesting[msg.sender].claimable);
+        mochiUnderManagement -= vesting[msg.sender].claimable;
+        vesting[msg.sender].claimable = 0;
+    }
+
+    function lock(uint256 _amount) external checkClaimable(msg.sender) {
+        mochi.approve(address(vMochi), _amount);
+        (, uint256 end) = vMochi.locked(msg.sender);
+        if (end >= block.timestamp + 90 days) {
+            vMochi.depositFor(msg.sender, _amount);
+        } else {
+            revert(""lock should be longer than 90 days"");
+        }
+        vesting[msg.sender].vested -= _amount;
+        mochiUnderManagement -= _amount;
+    }
+
+    function forceClaim(uint256 _amount) external checkClaimable(msg.sender) {
+        mochi.transfer(msg.sender, _amount / 2);
+        mochi.transfer(address(vMochi), _amount / 2);
+        vesting[msg.sender].vested -= _amount;
+        mochiUnderManagement -= _amount;
+    }
+}",586.0,72.0,"***[H-13] Tokens Can Be Stolen By Frontrunning `VestedRewardPool.vest()` and `VestedRewardPool.lock()`***
+The VestedRewardPool.sol contract is a public facing contract aimed at vesting tokens for a minimum of 90 days before allowing the recipient to withdraw their `mochi`. The `vest()` function does not utilise `safeTransferFrom()` to ensure that vested tokens are correctly allocated to the recipient. As a result, it is possible to frontrun a call to `vest()` and effectively steal a recipient's vested tokens. The same issue applies to the `lock()` function.",0.0,"pragma solidity ^0.8.0;
+
+import ""../interfaces/IMochi.sol"";
+import ""@mochifi/vmochi/contracts/interfaces/IVMochi.sol"";
+
+contract VestedRewardPool {
+    IMochi public immutable mochi;
+    IVMochi public immutable vMochi;
+
+    uint256 public mochiUnderManagement;
+
+    mapping(address => Vesting) public vesting;
+
+    struct Vesting {
+        uint256 vested;
+        uint256 ends;
+        uint256 claimable;
+    }
+
+    modifier checkClaimable(address recipient) {
+        if (vesting[recipient].ends < block.timestamp) {
+            vesting[recipient].claimable += vesting[recipient].vested;
+            vesting[recipient].vested = 0;
+            vesting[recipient].ends = 0;
+        }
+        _;
+    }
+
+    constructor(address _mochi, address _vmochi) {
+        mochi = IMochi(_mochi);
+        vMochi = IVMochi(_vmochi);
+    }
+
+    function vest(address _recipient) external checkClaimable(_recipient) {
+        uint256 amount = mochi.balanceOf(address(this)) - mochiUnderManagement;
+        uint256 weightedEnd = (vesting[_recipient].vested *
+            vesting[_recipient].ends +
+            amount *
+            (block.timestamp + 90 days)) /
+            (vesting[_recipient].vested + amount);
+        vesting[_recipient].vested += amount;
+        vesting[_recipient].ends = weightedEnd;
+        mochiUnderManagement += amount;
+    }
+
+    function claim() external checkClaimable(msg.sender) {
+        mochi.transfer(msg.sender, vesting[msg.sender].claimable);
+        mochiUnderManagement -= vesting[msg.sender].claimable;
+        vesting[msg.sender].claimable = 0;
+    }
+
+    function lock(uint256 _amount) external checkClaimable(msg.sender) {
+        mochi.approve(address(vMochi), _amount);
+        (, uint256 end) = vMochi.locked(msg.sender);
+        if (end >= block.timestamp + 90 days) {
+            vMochi.depositFor(msg.sender, _amount);
+        } else {
+            revert(""lock should be longer than 90 days"");
+        }
+        vesting[msg.sender].vested -= _amount;
+        mochiUnderManagement -= _amount;
+    }
+
+    function forceClaim(uint256 _amount) external checkClaimable(msg.sender) {
+        mochi.transfer(msg.sender, _amount / 2);
+        mochi.transfer(address(vMochi), _amount / 2);
+        vesting[msg.sender].vested -= _amount;
+        mochiUnderManagement -= _amount;
+    }
+}",574.0,1,0,"<think>
+Let's analyze this contract for any vulnerabilities:
+
+1. **Integer Overflow/Underflow**: The contract uses Solidity 0.8.0+ which has built-in overflow/underflow protection, so this is less of a concern.
+
+2. **Reentrancy**: Let's check for potential reentrancy issues:
+   - The `claim()` function calls `mochi.transfer()` before updating state variables
+   - The `forceClaim()` function makes external calls before updating state variables
+   - The `lock()` function calls `vMochi.depositFor()` before updating state variables
+   These could potentially allow reentrancy attacks.
+
+3. **Unchecked External Calls**: The contract makes external calls but doesn't check their return values (especially in `lock()` for `vMochi.depositFor()`).
+
+4. **Missing Input Validation**: 
+   - The `vest()` function doesn't validate input parameters.
+   - The `forceClaim()` doesn't check if `_amount` is less than `vesting[msg.sender].vested`.
+
+5. **State Variable Inconsistency**: 
+   - In `claim()`, if the transfer fails, the state variables will be inconsistently updated.
+   - Same issue in `forceClaim()` and `lock()`.
+
+6. **Division by Zero**: In the `vest()` function, if `vesting[_recipient].vested + amount` equals zero, there will be a division by zero error.
+
+7. **Potential Integer Division Issues**: The `forceClaim()` function divides `_amount` by 2, which could result in loss of precision if `_amount` is odd.
+
+8. **Precision Loss**: In the `vest()` function's calculation of `weightedEnd`, there could be precision loss due to integer division.
+
+9. **Timestamp Dependence**: The contract relies on `block.timestamp` for expiration logic, which can be slightly manipulated by miners (though within a small timeframe).
+
+10. **Unprotected Function**: The `vest()` function can be called by anyone, potentially allowing unauthorized parties to vest tokens for arbitrary recipients.
+
+11. **Approval Vulnerability**: In the `lock()` function, the contract approves tokens for vMochi before checking if the user has a valid lock. This means the approval operation happens even if the function will revert.
+
+12. **No Zero-Amount Check**: Functions like `forceClaim()` don't check if `_amount` is zero, which could lead to unnecessary operations.
+
+13. **Missing Events**: The contract lacks events for important state changes, making it harder to track what's happening off-chain.
+
+14. **Potential for Locked Tokens**: If a user's vesting end time is far in the future, their tokens could be locked for an extended period without the ability to access them.
+</think># Vulnerabilities in VestedRewardPool Contract
+
+## 1. Inadequate Access Control
+- `vest()` function lacks access control, allowing anyone to trigger vesting for any recipient. This should be restricted to authorized users only.
+
+## 2. State Updates After External Calls (Reentrancy Risk)
+- In `claim()`, `lock()`, and `forceClaim()` functions, the contract makes external calls (`mochi.transfer()` and `vMochi.depositFor()`) before updating state variables, which is vulnerable to reentrancy attacks.
+
+## 3. Insufficient Input Validation
+- `forceClaim()` does not verify if `_amount` is less than or equal to `vesting[msg.sender].vested`, potentially allowing users to claim more tokens than vested.
+- No checks for zero amount operations in functions like `forceClaim()`.
+
+## 4. Integer Division Issues
+- `forceClaim()` uses `_amount / 2` which will round down for odd values, causing precision loss and possibly leaving 1 wei of tokens stuck in the contract.
+
+## 5. Missing Return Value Checks
+- External calls to `mochi.transfer()` and `vMochi.depositFor()` don't check return values to confirm successful execution.
+
+## 6. Potential Division by Zero
+- In `vest()`, if both `vesting[_recipient].vested` and `amount` are zero, it would cause a division by zero error.
+
+## 7. Improper State Handling
+- If token transfers fail in `claim()` or `forceClaim()`, state variables would be inconsistently updated.
+
+## 8. Approve Before Checks in `lock()`
+- The contract approves tokens before checking if the user has a valid lock period, wasting gas if the function reverts.
+
+## 9. Timestamp Dependence
+- The contract relies on `block.timestamp` for timing logic, which can be slightly manipulated by miners.
+
+## 10. Missing Events
+- No events are emitted for important actions like vesting, claiming, and locking, making contract activity difficult to track.
+
+## 11. Lack of Emergency Stop Mechanism
+- No functionality to pause the contract in case a vulnerability is discovered.
+
+## 12. Potential Locked Funds
+- No mechanism to withdraw tokens in case of emergency, which could lead to permanently locked funds.","---
+
+**[H-13] Tokens Can Be Stolen By Frontrunning `VestedRewardPool.vest()` and `VestedRewardPool.lock()`**
+
+**Report Description**:
+The `VestedRewardPool.sol` contract is a public-facing contract designed to vest tokens for a minimum of 90 days before allowing recipients to withdraw their `mochi`. The `vest()` function does not use `safeTransferFrom()` to ensure that vested tokens are correctly allocated to the recipient. This oversight allows an attacker to frontrun a call to `vest()` and steal the recipient's vested tokens. The same issue applies to the `lock()` function, which also lacks proper safeguards against frontrunning.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of frontrunning vulnerabilities in the `vest()` and `lock()` functions. While the response list identifies several other vulnerabilities (e.g., reentrancy, insufficient input validation, and missing return value checks), it fails to mention the critical risk of frontrunning attacks, which is the core issue described in the report. This omission represents a significant gap in the response list's coverage of the contract's vulnerabilities.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[H-13] Tokens Can Be Stolen By Frontrunning `VestedRewardPool.vest()` and `VestedRewardPool.lock()`**
+
+---
+
+**Analysis**:
+The response list provides a comprehensive analysis of various vulnerabilities in the `VestedRewardPool` contract, such as reentrancy, integer division issues, and missing input validation. However, it completely overlooks the critical frontrunning vulnerability described in the issue report. This gap highlights the importance of thoroughly reviewing all potential attack vectors, especially those involving external interactions and timing dependencies. Future analyses should ensure that frontrunning risks are explicitly addressed, particularly in contracts handling token transfers and vesting mechanisms.",0,0,1,12,"```
+None.
+```","The **Average Precision (AP)** for the query is **0.0**. 
+
+Since there are no true positives in the ranked list of predictions, the precision at every rank is 0, and thus the average precision is also 0.",0,22.43759703636170,1974.0,3.0
+MachiVaultFactory.sol,"// SPDX-License-Identifier: AGPL-3.0
+
+pragma solidity ^0.8.0;
+
+import ""@mochifi/library/contracts/Beacon.sol"";
+import ""@mochifi/library/contracts/BeaconProxyDeployer.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/IMochiVaultFactory.sol"";
+
+contract MochiVaultFactory is IMochiVaultFactory {
+    IMochiEngine public immutable engine;
+    Beacon public immutable beacon;
+    address public template;
+
+    constructor(address _engine) {
+        beacon = new Beacon(address(0));
+        engine = IMochiEngine(_engine);
+    }
+
+    function updateTemplate(address _newTemplate) external override {
+        require(msg.sender == engine.governance(), ""!gov"");
+        address(beacon).call(abi.encode(_newTemplate));
+        template = _newTemplate;
+    }
+
+    function deployVault(address _asset)
+        external
+        override
+        returns (IMochiVault)
+    {
+        bytes memory initCode = abi.encodeWithSelector(
+            bytes4(keccak256(""initialize(address)"")),
+            _asset
+        );
+        return
+            IMochiVault(BeaconProxyDeployer.deploy(address(beacon), initCode));
+    }
+
+    function getVault(address _asset)
+        external
+        view
+        override
+        returns (IMochiVault)
+    {
+        bytes memory initCode = abi.encodeWithSelector(
+            bytes4(keccak256(""initialize(address)"")),
+            _asset
+        );
+        return
+            IMochiVault(
+                BeaconProxyDeployer.calculateAddress(
+                    address(this),
+                    address(beacon),
+                    initCode
+                )
+            );
+    }
+}",348.0,58.0,"***[M-12] anyone can create a vault by directly calling the factory***
+Function `deployVault()`
+In MochiVaultFactory.sol#L26-L37, there's no permission control in the vaultFactory. Anyone can create a vault. The transaction would be reverted when the government tries to deploy such an asset.
+As the protocol checks whether the vault is a valid vault by comparing the contract's address with the computed address, the protocol would recognize the random vault as a valid one.",1.0,"pragma solidity ^0.8.0;
+
+import ""@mochifi/library/contracts/Beacon.sol"";
+import ""@mochifi/library/contracts/BeaconProxyDeployer.sol"";
+import ""../interfaces/IMochiEngine.sol"";
+import ""../interfaces/IMochiVaultFactory.sol"";
+
+contract MochiVaultFactory is IMochiVaultFactory {
+    IMochiEngine public immutable engine;
+    Beacon public immutable beacon;
+    address public template;
+
+    constructor(address _engine) {
+        beacon = new Beacon(address(0));
+        engine = IMochiEngine(_engine);
+    }
+
+    function updateTemplate(address _newTemplate) external override {
+        require(msg.sender == engine.governance(), ""!gov"");
+        address(beacon).call(abi.encode(_newTemplate));
+        template = _newTemplate;
+    }
+
+    function deployVault(address _asset)
+        external
+        override
+        returns (IMochiVault)
+    {
+        bytes memory initCode = abi.encodeWithSelector(
+            bytes4(keccak256(""initialize(address)"")),
+            _asset
+        );
+        return
+            IMochiVault(BeaconProxyDeployer.deploy(address(beacon), initCode));
+    }
+
+    function getVault(address _asset)
+        external
+        view
+        override
+        returns (IMochiVault)
+    {
+        bytes memory initCode = abi.encodeWithSelector(
+            bytes4(keccak256(""initialize(address)"")),
+            _asset
+        );
+        return
+            IMochiVault(
+                BeaconProxyDeployer.calculateAddress(
+                    address(this),
+                    address(beacon),
+                    initCode
+                )
+            );
+    }
+}",336.0,0,1,"<think>
+Let's analyze this contract for potential vulnerabilities:
+
+1. **Low-level call in updateTemplate()**: The contract uses `address(beacon).call(abi.encode(_newTemplate))` to update the template in the beacon. This is suspicious because:
+   - It doesn't check the return value of the call
+   - It doesn't use a proper function selector, just passes encoded data
+   - It's using a low-level call rather than a direct function call
+
+2. **Initialization issue**: The beacon is initialized with address(0) in the constructor. This seems problematic since the beacon is supposed to point to a valid implementation contract.
+
+3. **No checks on _asset**: The deployVault and getVault functions don't validate the _asset parameter, which could lead to invalid vaults being created.
+
+4. **Lack of events**: The contract updates critical states like template but doesn't emit events, which makes it harder to track changes.
+
+5. **Potential reentrancy**: Although not immediately exploitable, the contract uses external calls which could open up reentrancy vectors if not properly handled in the Beacon contract.
+
+6. **Potential centralization issues**: The updateTemplate function is only callable by governance, which centralizes control.
+
+7. **Use of keccak256 for function selectors**: Using `bytes4(keccak256(""initialize(address)""))` is correct but potentially fragile if function signatures change.
+
+The most severe vulnerability appears to be the incorrect use of low-level call to update the beacon template.
+</think># Vulnerabilities in MochiVaultFactory Contract
+
+## 1. Improper Beacon Initialization
+- The Beacon is initialized with address(0) in the constructor. This is a critical issue as the beacon is supposed to point to a valid implementation contract. Deploying proxies with a null implementation address will result in non-functional vaults.
+
+## 2. Unsafe Low-Level Call in updateTemplate()
+- The function uses `address(beacon).call(abi.encode(_newTemplate))` without:
+  - Checking the return value of the call
+  - Using a proper function selector
+  - Handling potential failure scenarios
+  
+This is likely attempting to update the beacon implementation but is implementing it incorrectly. The correct way would be to call the `upgradeTo(address)` function on the Beacon contract.
+
+## 3. No Input Validation
+- `deployVault()` and `getVault()` don't validate that `_asset` is a legitimate token address
+- `updateTemplate()` doesn't verify that `_newTemplate` is a valid contract with the required interface
+
+## 4. Missing Events
+- Critical state changes like updating the template don't emit events, making it difficult to track changes and affecting transparency
+
+## 5. Potential for Inconsistent State
+- The `template` variable is maintained separately from what's stored in the Beacon contract
+- This could lead to a situation where `template` doesn't match the actual implementation used by the beacon
+
+## 6. Lack of Function Access Control
+- While `updateTemplate()` has access control, `deployVault()` allows anyone to deploy vaults without restrictions
+
+## 7. No Initialization Guard
+- The contract doesn't prevent `initialize()` from being called directly on the implementation contract
+
+## 8. Potential Centralization Risk
+- Only the governance address can update the template, creating a centralized control point
+
+These vulnerabilities could lead to non-functional vaults, inconsistent contract behavior, and potential exploitation of the beacon proxy system.","### **[M-12] Anyone can create a vault by directly calling the factory**
+
+**Report Description**:  
+The `deployVault()` function in `MochiVaultFactory.sol` lacks permission control, allowing anyone to create a vault. This could lead to the deployment of invalid vaults, as the protocol relies on comparing the contract's address with the computed address to validate vaults. The absence of access control could result in the creation of unauthorized or malicious vaults, potentially compromising the protocol's integrity.
+
+**Match in Response List**:  
+Matches with the issue titled **""Lack of Function Access Control""** in the response list.
+
+**Validation**:  
+**Correct**. The response accurately identifies the lack of access control in the `deployVault()` function, which aligns with the reported issue. The response highlights that `deployVault()` allows anyone to deploy vaults without restrictions, which is the core concern raised in the issue report. This matches Solidity best practices, which emphasize the importance of implementing proper access control mechanisms to prevent unauthorized actions.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[M-12] Anyone can create a vault by directly calling the factory**
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- *None*
+
+---
+
+### **Additional Observations**  
+While the response list does not explicitly mention the specific risk of invalid vaults being recognized as valid due to address comparison, it correctly identifies the broader issue of missing access control in `deployVault()`. This is sufficient to address the core vulnerability described in the issue report.",1,0,0,8,"```
+1. Lack of Function Access Control
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the ranks of true positives in the ranked list of predictions**:
+   - The true positive is ""Lack of Function Access Control"".
+   - This appears at rank 7 in the ranked list of predictions.
+
+2. **Calculate the precision at that rank**:
+   - Precision at rank 7 (\( P@7 \)) is the number of true positives up to rank 7 divided by 7.
+   - Since there is only one true positive up to rank 7, \( P@7 = \frac{1}{7} \approx 0.1429 \).
+
+3. **Average the precision values**:
+   - Since there is only one true positive, the AP is simply the precision at that rank.
+
+**Average Precision (AP)**:
+\[
+AP = 0.1429
+\]
+
+So, the **Average Precision (AP)** for the query is **0.1429**.",0.1429,15.67965316772460,1290.0,3.0
+,,,,,,,,12,5,,,7,3,7,84,,,2.2858,,,

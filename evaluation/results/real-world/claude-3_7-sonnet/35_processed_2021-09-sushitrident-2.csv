@@ -1,0 +1,3155 @@
+nameid,code,tokens,loc,issue,vulnumber,code_snippet,processtokens,high_severity_count,medium_severity_count,Findings,Comparison,Correct Matches,Partially Correct,Missed,GPT-generated,matchList,MAP,Score,execution_time,total_tokens,total_steps
+ConcentratedLiquidityPool.sol,"// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity >=0.8.0;
+
+import ""../../interfaces/IBentoBoxMinimal.sol"";
+import ""../../interfaces/IMasterDeployer.sol"";
+import ""../../interfaces/IPool.sol"";
+import ""../../interfaces/IPositionManager.sol"";
+import ""../../interfaces/ITridentCallee.sol"";
+import ""../../interfaces/ITridentRouter.sol"";
+import ""../../libraries/concentratedPool/FullMath.sol"";
+import ""../../libraries/concentratedPool/TickMath.sol"";
+import ""../../libraries/concentratedPool/UnsafeMath.sol"";
+import ""../../libraries/concentratedPool/DyDxMath.sol"";
+import ""../../libraries/concentratedPool/SwapLib.sol"";
+import ""../../libraries/concentratedPool/Ticks.sol"";
+import ""hardhat/console.sol"";
+
+/// @notice Trident exchange pool template with concentrated liquidity and constant product formula for swapping between an ERC-20 token pair.
+/// @dev The reserves are stored as bento shares.
+//      The curve is applied to shares as well. This pool does not care about the underlying amounts.
+contract ConcentratedLiquidityPool is IPool {
+    using Ticks for mapping(int24 => Ticks.Tick);
+
+    event Mint(address indexed sender, uint256 amount0, uint256 amount1, address indexed recipient);
+    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed recipient);
+    event Collect(address indexed sender, uint256 amount0, uint256 amount1);
+    event Sync(uint256 reserveShares0, uint256 reserveShares1);
+
+    /// @dev References for tickSpacing:
+    // 100 tickSpacing -> 2% between ticks.
+    bytes32 public constant override poolIdentifier = ""Trident:ConcentratedLiquidity"";
+
+    uint24 internal constant MAX_FEE = 100000; /// @dev Maximum `swapFee` is 10%.
+
+    uint128 internal immutable MAX_TICK_LIQUIDITY;
+    uint24 internal immutable tickSpacing;
+    uint24 internal immutable swapFee; /// @dev 1000 corresponds to 0.1% fee. Fee is measured in pips.
+
+    address internal immutable barFeeTo;
+    IBentoBoxMinimal internal immutable bento;
+    IMasterDeployer internal immutable masterDeployer;
+
+    address internal immutable token0;
+    address internal immutable token1;
+
+    uint128 public liquidity;
+
+    uint160 internal secondsPerLiquidity; /// @dev Multiplied by 2^128.
+    uint32 internal lastObservation;
+
+    uint256 public feeGrowthGlobal0; /// @dev All fee growth counters are multiplied by 2^128.
+    uint256 public feeGrowthGlobal1;
+
+    uint256 public barFee;
+
+    uint128 internal token0ProtocolFee;
+    uint128 internal token1ProtocolFee;
+
+    uint128 internal reserve0; /// @dev `bento` share balance tracker.
+    uint128 internal reserve1;
+
+    uint160 internal price; /// @dev Sqrt of price aka. √(y/x), multiplied by 2^96.
+    int24 internal nearestTick; /// @dev Tick that is just below the current price.
+
+    uint256 internal unlocked;
+    modifier lock() {
+        require(unlocked == 1, ""LOCKED"");
+        unlocked = 2;
+        _;
+        unlocked = 1;
+    }
+
+    mapping(int24 => Ticks.Tick) public ticks;
+    mapping(address => mapping(int24 => mapping(int24 => Position))) public positions;
+
+    struct Position {
+        uint128 liquidity;
+        uint256 feeGrowthInside0Last;
+        uint256 feeGrowthInside1Last;
+    }
+
+    struct SwapCache {
+        uint256 feeAmount;
+        uint256 totalFeeAmount;
+        uint256 protocolFee;
+        uint256 feeGrowthGlobal;
+        uint256 currentPrice;
+        uint256 currentLiquidity;
+        uint256 input;
+        int24 nextTickToCross;
+    }
+
+    struct MintParams {
+        int24 lowerOld;
+        int24 lower;
+        int24 upperOld;
+        int24 upper;
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        bool token0native;
+        bool token1native;
+        /// @dev To mint an NFT the positionOwner should be set to the positionManager contract.
+        address positionOwner;
+        /// @dev When minting through the positionManager contract positionRecipient should be the NFT recipient.
+        //    It can be set to address(0) if we are not minting through the positionManager contract.
+        address positionRecipient;
+    }
+
+    /// @dev Only set immutable variables here - state changes made here will not be used.
+    constructor(bytes memory _deployData, IMasterDeployer _masterDeployer) {
+        (address _token0, address _token1, uint24 _swapFee, uint160 _price, uint24 _tickSpacing) = abi.decode(
+            _deployData,
+            (address, address, uint24, uint160, uint24)
+        );
+
+        require(_token0 != address(0), ""ZERO_ADDRESS"");
+        require(_token0 != address(this), ""INVALID_TOKEN0"");
+        require(_token1 != address(this), ""INVALID_TOKEN1"");
+        require(_swapFee <= MAX_FEE, ""INVALID_SWAP_FEE"");
+        
+        token0 = _token0;
+        token1 = _token1;
+        swapFee = _swapFee;
+        price = _price;
+        tickSpacing = _tickSpacing;
+        /// @dev Prevents global liquidity overflow in the case all ticks are initialised.
+        MAX_TICK_LIQUIDITY = Ticks.getMaxLiquidity(_tickSpacing);
+        ticks[TickMath.MIN_TICK] = Ticks.Tick(TickMath.MIN_TICK, TickMath.MAX_TICK, uint128(0), 0, 0, 0);
+        ticks[TickMath.MAX_TICK] = Ticks.Tick(TickMath.MIN_TICK, TickMath.MAX_TICK, uint128(0), 0, 0, 0);
+        nearestTick = TickMath.MIN_TICK;
+        bento = IBentoBoxMinimal(_masterDeployer.bento());
+        barFeeTo = _masterDeployer.barFeeTo();
+        barFee = _masterDeployer.barFee();
+        masterDeployer = _masterDeployer;
+        unlocked = 1;
+    }
+
+    /// @dev Mints LP tokens - should be called via the router after transferring `bento` tokens.
+    // The router must ensure that sufficient LP tokens are minted by using the return value.
+    function mint(bytes calldata data) public override lock returns (uint256 _liquidity) {
+        MintParams memory mintParams = abi.decode(data, (MintParams));
+
+        uint256 priceLower = uint256(TickMath.getSqrtRatioAtTick(mintParams.lower));
+        uint256 priceUpper = uint256(TickMath.getSqrtRatioAtTick(mintParams.upper));
+        uint256 currentPrice = uint256(price);
+
+        _liquidity = DyDxMath.getLiquidityForAmounts(
+            priceLower,
+            priceUpper,
+            currentPrice,
+            mintParams.amount1Desired,
+            mintParams.amount0Desired
+        );
+
+        {
+            require(_liquidity <= MAX_TICK_LIQUIDITY, ""LIQUIDITY_OVERFLOW"");
+
+            (uint256 amount0fees, uint256 amount1fees) = _updatePosition(
+                mintParams.positionOwner,
+                mintParams.lower,
+                mintParams.upper,
+                int128(uint128(_liquidity))
+            );
+            if (amount0fees > 0) {
+                _transfer(token0, amount0fees, mintParams.positionOwner, false);
+                reserve0 -= uint128(amount0fees);
+            }
+            if (amount1fees > 0) {
+                _transfer(token1, amount1fees, mintParams.positionOwner, false);
+                reserve1 -= uint128(amount1fees);
+            }
+        }
+
+        unchecked {
+            if (priceLower < currentPrice && currentPrice < priceUpper) liquidity += uint128(_liquidity);
+        }
+
+        _ensureTickSpacing(mintParams.lower, mintParams.upper);
+        nearestTick = Ticks.insert(
+            ticks,
+            feeGrowthGlobal0,
+            feeGrowthGlobal1,
+            secondsPerLiquidity,
+            mintParams.lowerOld,
+            mintParams.lower,
+            mintParams.upperOld,
+            mintParams.upper,
+            uint128(_liquidity),
+            nearestTick,
+            uint160(currentPrice)
+        );
+
+        (uint128 amount0Actual, uint128 amount1Actual) = _getAmountsForLiquidity(priceLower, priceUpper, currentPrice, _liquidity);
+
+        ITridentRouter.TokenInput[] memory callbackData = new ITridentRouter.TokenInput[](2);
+        callbackData[0] = ITridentRouter.TokenInput(token0, mintParams.token0native, amount0Actual);
+        callbackData[1] = ITridentRouter.TokenInput(token1, mintParams.token1native, amount1Actual);
+
+        ITridentCallee(msg.sender).tridentMintCallback(abi.encode(callbackData));
+
+        unchecked {
+            if (amount0Actual != 0) {
+                require(amount0Actual + reserve0 <= _balance(token0), ""TOKEN0_MISSING"");
+                reserve0 += amount0Actual;
+            }
+
+            if (amount1Actual != 0) {
+                require(amount1Actual + reserve1 <= _balance(token1), ""TOKEN1_MISSING"");
+                reserve1 += amount1Actual;
+            }
+        }
+
+        (uint256 feeGrowth0, uint256 feeGrowth1) = rangeFeeGrowth(mintParams.lower, mintParams.upper);
+
+        if (mintParams.positionRecipient != address(0)) {
+            IPositionManager(mintParams.positionOwner).positionMintCallback(
+                mintParams.positionRecipient,
+                mintParams.lower,
+                mintParams.upper,
+                uint128(_liquidity),
+                feeGrowth0,
+                feeGrowth1
+            );
+        }
+
+        emit Mint(mintParams.positionOwner, amount0Actual, amount1Actual, mintParams.positionRecipient);
+    }
+
+    /// @dev Burns LP tokens sent to this contract. The router must ensure that the user gets sufficient output tokens.
+    function burn(bytes calldata data) public override lock returns (IPool.TokenAmount[] memory withdrawnAmounts) {
+        (int24 lower, int24 upper, uint128 amount, address recipient, bool unwrapBento) = abi.decode(
+            data,
+            (int24, int24, uint128, address, bool)
+        );
+
+        uint160 priceLower = TickMath.getSqrtRatioAtTick(lower);
+        uint160 priceUpper = TickMath.getSqrtRatioAtTick(upper);
+        uint160 currentPrice = price;
+
+        unchecked {
+            if (priceLower < currentPrice && currentPrice < priceUpper) liquidity -= amount;
+        }
+
+        (uint256 amount0, uint256 amount1) = _getAmountsForLiquidity(
+            uint256(priceLower),
+            uint256(priceUpper),
+            uint256(currentPrice),
+            uint256(amount)
+        );
+
+        (uint256 amount0fees, uint256 amount1fees) = _updatePosition(msg.sender, lower, upper, -int128(amount));
+
+        unchecked {
+            amount0 += amount0fees;
+            amount1 += amount1fees;
+        }
+
+        withdrawnAmounts = new TokenAmount[](2);
+        withdrawnAmounts[0] = TokenAmount({token: token0, amount: amount0});
+        withdrawnAmounts[1] = TokenAmount({token: token1, amount: amount1});
+
+        unchecked {
+            reserve0 -= uint128(amount0fees);
+            reserve1 -= uint128(amount1fees);
+        }
+
+        _transferBothTokens(recipient, amount0, amount1, unwrapBento);
+
+        nearestTick = Ticks.remove(ticks, lower, upper, amount, nearestTick);
+        emit Burn(msg.sender, amount0, amount1, recipient);
+    }
+
+    function burnSingle(bytes calldata) public override returns (uint256) {
+        revert();
+    }
+
+    function collect(
+        int24 lower,
+        int24 upper,
+        address recipient,
+        bool unwrapBento
+    ) public lock returns (uint256 amount0fees, uint256 amount1fees) {
+        (amount0fees, amount1fees) = _updatePosition(msg.sender, lower, upper, 0);
+
+        _transferBothTokens(recipient, amount0fees, amount1fees, unwrapBento);
+
+        reserve0 -= uint128(amount0fees);
+        reserve1 -= uint128(amount1fees);
+
+        emit Collect(msg.sender, amount0fees, amount1fees);
+    }
+
+    /// @dev Swaps one token for another. The router must prefund this contract and ensure there isn't too much slippage
+    // - price is √(y/x)
+    // - x is token0
+    // - zero for one -> price will move down.
+    function swap(bytes memory data) public override lock returns (uint256 amountOut) {
+        (bool zeroForOne, uint256 inAmount, address recipient, bool unwrapBento) = abi.decode(data, (bool, uint256, address, bool));
+
+        SwapCache memory cache = SwapCache({
+            feeAmount: 0,
+            totalFeeAmount: 0,
+            protocolFee: 0,
+            feeGrowthGlobal: zeroForOne ? feeGrowthGlobal1 : feeGrowthGlobal0,
+            currentPrice: uint256(price),
+            currentLiquidity: uint256(liquidity),
+            input: inAmount,
+            nextTickToCross: zeroForOne ? nearestTick : ticks[nearestTick].nextTick
+        });
+
+        {
+            uint256 timestamp = block.timestamp;
+            uint256 diff = timestamp - uint256(lastObservation); /// @dev Underflow in 2106.
+            if (diff > 0 && liquidity > 0) {
+                lastObservation = uint32(timestamp);
+                secondsPerLiquidity += uint160((diff << 128) / liquidity);
+            }
+        }
+
+        while (cache.input != 0) {
+            uint256 nextTickPrice = uint256(TickMath.getSqrtRatioAtTick(cache.nextTickToCross));
+            uint256 output = 0;
+            bool cross = false;
+
+            if (zeroForOne) {
+                // Trading token 0 (x) for token 1 (y).
+                // Price is decreasing.
+                // Maximum input amount within current tick range: Δx = Δ(1/√𝑃) · L.
+                uint256 maxDx = DyDxMath.getDx(cache.currentLiquidity, nextTickPrice, cache.currentPrice, false);
+
+                if (cache.input <= maxDx) {
+                    // We can swap within the current range.
+                    uint256 liquidityPadded = cache.currentLiquidity << 96;
+                    // Calculate new price after swap: √𝑃[new] =  L · √𝑃 / (L + Δx · √𝑃)
+                    // This is derrived from Δ(1/√𝑃) = Δx/L
+                    // where Δ(1/√𝑃) is 1/√𝑃[old] - 1/√𝑃[new] and we solve for √𝑃[new].
+                    // In case of an owerflow we can use: √𝑃[new] = L / (L / √𝑃 + Δx).
+                    // This is derrived by dividing the original fraction by √𝑃 on both sides.
+                    uint256 newPrice = uint256(
+                        FullMath.mulDivRoundingUp(liquidityPadded, cache.currentPrice, liquidityPadded + cache.currentPrice * cache.input)
+                    );
+
+                    if (!(nextTickPrice <= newPrice && newPrice < cache.currentPrice)) {
+                        // Overflow. We use a modified version of the formula.
+                        newPrice = uint160(UnsafeMath.divRoundingUp(liquidityPadded, liquidityPadded / cache.currentPrice + cache.input));
+                    }
+                    // Based on the price difference calculate the output of th swap: Δy = Δ√P · L.
+                    output = DyDxMath.getDy(cache.currentLiquidity, newPrice, cache.currentPrice, false);
+                    cache.currentPrice = newPrice;
+                    cache.input = 0;
+                } else {
+                    // Execute swap step and cross the tick.
+                    output = DyDxMath.getDy(cache.currentLiquidity, nextTickPrice, cache.currentPrice, false);
+                    cache.currentPrice = nextTickPrice;
+                    cross = true;
+                    cache.input -= maxDx;
+                }
+            } else {
+                // Price is increasing.
+                // Maximum swap amount within the current tick range: Δy = Δ√P · L.
+                uint256 maxDy = DyDxMath.getDy(cache.currentLiquidity, cache.currentPrice, nextTickPrice, false);
+
+                if (cache.input <= maxDy) {
+                    // We can swap within the current range.
+                    // Calculate new price after swap: ΔP = Δy/L.
+                    uint256 newPrice = cache.currentPrice +
+                        FullMath.mulDiv(cache.input, 0x1000000000000000000000000, cache.currentLiquidity);
+                    /// @dev Calculate output of swap
+                    // - Δx = Δ(1/√P) · L.
+                    output = DyDxMath.getDx(cache.currentLiquidity, cache.currentPrice, newPrice, false);
+                    cache.currentPrice = newPrice;
+                    cache.input = 0;
+                } else {
+                    /// @dev Swap & cross the tick.
+                    output = DyDxMath.getDx(cache.currentLiquidity, cache.currentPrice, nextTickPrice, false);
+                    cache.currentPrice = nextTickPrice;
+                    cross = true;
+                    cache.input -= maxDy;
+                }
+            }
+            (cache.totalFeeAmount, amountOut, cache.protocolFee, cache.feeGrowthGlobal) = SwapLib.handleFees(
+                output,
+                swapFee,
+                barFee,
+                cache.currentLiquidity,
+                cache.totalFeeAmount,
+                amountOut,
+                cache.protocolFee,
+                cache.feeGrowthGlobal
+            );
+            if (cross) {
+                (cache.currentLiquidity, cache.nextTickToCross) = Ticks.cross(
+                    ticks,
+                    cache.nextTickToCross,
+                    secondsPerLiquidity,
+                    cache.currentLiquidity,
+                    cache.feeGrowthGlobal,
+                    zeroForOne
+                );
+                if (cache.currentLiquidity == 0) {
+                    // We step into a zone that has liquidity - or we reach the end of the linked list.
+                    cache.currentPrice = uint256(TickMath.getSqrtRatioAtTick(cache.nextTickToCross));
+                    (cache.currentLiquidity, cache.nextTickToCross) = Ticks.cross(
+                        ticks,
+                        cache.nextTickToCross,
+                        secondsPerLiquidity,
+                        cache.currentLiquidity,
+                        cache.feeGrowthGlobal,
+                        zeroForOne
+                    );
+                }
+            }
+        }
+
+        price = uint160(cache.currentPrice);
+
+        int24 newNearestTick = zeroForOne ? cache.nextTickToCross : ticks[cache.nextTickToCross].previousTick;
+
+        if (nearestTick != newNearestTick) {
+            nearestTick = newNearestTick;
+            liquidity = uint128(cache.currentLiquidity);
+        }
+
+        _updateReserves(zeroForOne, uint128(inAmount), amountOut);
+
+        _updateFees(zeroForOne, cache.feeGrowthGlobal, uint128(cache.protocolFee));
+
+        if (zeroForOne) {
+            _transfer(token1, amountOut, recipient, unwrapBento);
+            emit Swap(recipient, token0, token1, inAmount, amountOut);
+        } else {
+            _transfer(token0, amountOut, recipient, unwrapBento);
+            emit Swap(recipient, token1, token0, inAmount, amountOut);
+        }
+    }
+
+    /// @dev Reserved for IPool.
+    function flashSwap(bytes calldata) public override returns (uint256) {
+        revert();
+    }
+
+    /// @dev Updates `barFee` for Trident protocol.
+    function updateBarFee() public {
+        barFee = IMasterDeployer(masterDeployer).barFee();
+    }
+
+    /// @dev Collects fees for Trident protocol.
+    function collectProtocolFee() public lock returns (uint128 amount0, uint128 amount1) {
+        if (token0ProtocolFee > 1) {
+            amount0 = token0ProtocolFee - 1;
+            token0ProtocolFee = 1;
+            reserve0 -= amount0;
+            _transfer(token0, amount0, barFeeTo, false);
+        }
+        if (token1ProtocolFee > 1) {
+            amount1 = token1ProtocolFee - 1;
+            token1ProtocolFee = 1;
+            reserve1 -= amount1;
+            _transfer(token1, amount1, barFeeTo, false);
+        }
+    }
+
+    function _ensureTickSpacing(int24 lower, int24 upper) internal view {
+        require(lower % int24(tickSpacing) == 0, ""INVALID_TICK"");
+        require((lower / int24(tickSpacing)) % 2 == 0, ""LOWER_EVEN"");
+
+        require(upper % int24(tickSpacing) == 0, ""INVALID_TICK"");
+        require((upper / int24(tickSpacing)) % 2 != 0, ""UPPER_ODD""); /// @dev Can be either -1 or 1.
+    }
+
+    function _getAmountsForLiquidity(
+        uint256 priceLower,
+        uint256 priceUpper,
+        uint256 currentPrice,
+        uint256 liquidityAmount
+    ) internal pure returns (uint128 token0amount, uint128 token1amount) {
+        if (priceUpper <= currentPrice) {
+            /// @dev Only supply `token1` (`token1` is Y).
+            token1amount = uint128(DyDxMath.getDy(liquidityAmount, priceLower, priceUpper, true));
+        } else if (currentPrice <= priceLower) {
+            /// @dev Only supply `token0` (`token0` is X).
+            token0amount = uint128(DyDxMath.getDx(liquidityAmount, priceLower, priceUpper, true));
+        } else {
+            /// @dev Supply both tokens.
+            token0amount = uint128(DyDxMath.getDx(liquidityAmount, currentPrice, priceUpper, true));
+            token1amount = uint128(DyDxMath.getDy(liquidityAmount, priceLower, currentPrice, true));
+        }
+    }
+
+    function _updateReserves(
+        bool zeroForOne,
+        uint128 inAmount,
+        uint256 amountOut
+    ) internal {
+        if (zeroForOne) {
+            uint256 balance0 = _balance(token0);
+            uint128 newBalance = reserve0 + inAmount;
+            require(uint256(newBalance) <= balance0, ""TOKEN0_MISSING"");
+            reserve0 = newBalance;
+            reserve1 -= uint128(amountOut);
+        } else {
+            uint256 balance1 = _balance(token1);
+            uint128 newBalance = reserve1 + inAmount;
+            require(uint256(newBalance) <= balance1, ""TOKEN1_MISSING"");
+            reserve1 = newBalance;
+            reserve0 -= uint128(amountOut);
+        }
+    }
+
+    function _updateFees(
+        bool zeroForOne,
+        uint256 feeGrowthGlobal,
+        uint128 protocolFee
+    ) internal {
+        if (zeroForOne) {
+            feeGrowthGlobal1 = feeGrowthGlobal;
+            token1ProtocolFee += protocolFee;
+        } else {
+            feeGrowthGlobal0 = feeGrowthGlobal;
+            token0ProtocolFee += protocolFee;
+        }
+    }
+
+    function _updatePosition(
+        address owner,
+        int24 lower,
+        int24 upper,
+        int128 amount
+    ) internal returns (uint256 amount0fees, uint256 amount1fees) {
+        Position storage position = positions[owner][lower][upper];
+
+        (uint256 growth0current, uint256 growth1current) = rangeFeeGrowth(lower, upper);
+        amount0fees = FullMath.mulDiv(
+            growth0current - position.feeGrowthInside0Last,
+            position.liquidity,
+            0x100000000000000000000000000000000
+        );
+
+        amount1fees = FullMath.mulDiv(
+            growth1current - position.feeGrowthInside1Last,
+            position.liquidity,
+            0x100000000000000000000000000000000
+        );
+
+        if (amount < 0) position.liquidity -= uint128(-amount);
+        if (amount > 0) position.liquidity += uint128(amount);
+
+        require(position.liquidity < MAX_TICK_LIQUIDITY, ""MAX_TICK_LIQUIDITY"");
+
+        position.feeGrowthInside0Last = growth0current;
+        position.feeGrowthInside1Last = growth1current;
+    }
+
+    function _balance(address token) internal view returns (uint256 balance) {
+        balance = bento.balanceOf(token, address(this));
+    }
+
+    function _transfer(
+        address token,
+        uint256 shares,
+        address to,
+        bool unwrapBento
+    ) internal {
+        if (unwrapBento) {
+            bento.withdraw(token, address(this), to, 0, shares);
+        } else {
+            bento.transfer(token, address(this), to, shares);
+        }
+    }
+
+    function _transferBothTokens(
+        address to,
+        uint256 shares0,
+        uint256 shares1,
+        bool unwrapBento
+    ) internal {
+        if (unwrapBento) {
+            bento.withdraw(token0, address(this), to, 0, shares0);
+            bento.withdraw(token1, address(this), to, 0, shares1);
+        } else {
+            bento.transfer(token0, address(this), to, shares0);
+            bento.transfer(token1, address(this), to, shares1);
+        }
+    }
+
+    /// @dev Generic formula for fee growth inside a range: (globalGrowth - growthBelow - growthAbove)
+    // - available counters: global, outside u, outside v.
+
+    //                  u         ▼         v
+    // ----|----|-------|xxxxxxxxxxxxxxxxxxx|--------|--------- (global - feeGrowthOutside(u) - feeGrowthOutside(v))
+
+    //             ▼    u                   v
+    // ----|----|-------|xxxxxxxxxxxxxxxxxxx|--------|--------- (global - (global - feeGrowthOutside(u)) - feeGrowthOutside(v))
+
+    //                  u                   v    ▼
+    // ----|----|-------|xxxxxxxxxxxxxxxxxxx|--------|--------- (global - feeGrowthOutside(u) - (global - feeGrowthOutside(v)))
+
+    /// @notice Calculates the fee growth inside a range (per unit of liquidity).
+    /// @dev Multiply `rangeFeeGrowth` delta by the provided liquidity to get accrued fees for some period.
+    function rangeFeeGrowth(int24 lowerTick, int24 upperTick) public view returns (uint256 feeGrowthInside0, uint256 feeGrowthInside1) {
+        int24 currentTick = nearestTick;
+
+        Ticks.Tick storage lower = ticks[lowerTick];
+        Ticks.Tick storage upper = ticks[upperTick];
+
+        /// @dev Calculate fee growth below & above.
+        uint256 _feeGrowthGlobal0 = feeGrowthGlobal0;
+        uint256 _feeGrowthGlobal1 = feeGrowthGlobal1;
+        uint256 feeGrowthBelow0;
+        uint256 feeGrowthBelow1;
+        uint256 feeGrowthAbove0;
+        uint256 feeGrowthAbove1;
+
+        if (lowerTick <= currentTick) {
+            feeGrowthBelow0 = lower.feeGrowthOutside0;
+            feeGrowthBelow1 = lower.feeGrowthOutside1;
+        } else {
+            feeGrowthBelow0 = _feeGrowthGlobal0 - lower.feeGrowthOutside0;
+            feeGrowthBelow1 = _feeGrowthGlobal1 - lower.feeGrowthOutside1;
+        }
+
+        if (currentTick < upperTick) {
+            feeGrowthAbove0 = upper.feeGrowthOutside0;
+            feeGrowthAbove1 = upper.feeGrowthOutside1;
+        } else {
+            feeGrowthAbove0 = _feeGrowthGlobal0 - upper.feeGrowthOutside0;
+            feeGrowthAbove1 = _feeGrowthGlobal1 - upper.feeGrowthOutside1;
+        }
+
+        feeGrowthInside0 = _feeGrowthGlobal0 - feeGrowthBelow0 - feeGrowthAbove0;
+        feeGrowthInside1 = _feeGrowthGlobal1 - feeGrowthBelow1 - feeGrowthAbove1;
+    }
+
+    function rangeSecondsInside(int24 lowerTick, int24 upperTick) public view returns (uint256 secondsInside) {
+        int24 currentTick = nearestTick;
+
+        Ticks.Tick storage lower = ticks[lowerTick];
+        Ticks.Tick storage upper = ticks[upperTick];
+
+        uint256 secondsGlobal = secondsPerLiquidity;
+        uint256 secondsBelow;
+        uint256 secondsAbove;
+
+        if (lowerTick <= currentTick) {
+            secondsBelow = lower.secondsPerLiquidityOutside;
+        } else {
+            secondsBelow = secondsGlobal - lower.secondsPerLiquidityOutside;
+        }
+
+        if (currentTick < upperTick) {
+            secondsAbove = upper.secondsPerLiquidityOutside;
+        } else {
+            secondsAbove = secondsGlobal - upper.secondsPerLiquidityOutside;
+        }
+
+        secondsInside = secondsGlobal - secondsBelow - secondsAbove;
+    }
+
+    function getAssets() public view override returns (address[] memory assets) {
+        assets = new address[](2);
+        assets[0] = token0;
+        assets[1] = token1;
+    }
+
+    /// @dev Reserved for IPool.
+    function getAmountOut(bytes calldata) public pure override returns (uint256) {
+        revert();
+    }
+
+    function getImmutables()
+        public
+        view
+        returns (
+            uint128 _MAX_TICK_LIQUIDITY,
+            uint24 _tickSpacing,
+            uint24 _swapFee,
+            address _barFeeTo,
+            IBentoBoxMinimal _bento,
+            IMasterDeployer _masterDeployer,
+            address _token0,
+            address _token1
+        )
+    {
+        _MAX_TICK_LIQUIDITY = MAX_TICK_LIQUIDITY;
+        _tickSpacing = tickSpacing;
+        _swapFee = swapFee; /// @dev 1000 corresponds to 0.1% fee.
+        _barFeeTo = barFeeTo;
+        _bento = bento;
+        _masterDeployer = masterDeployer;
+        _token0 = token0;
+        _token1 = token1;
+    }
+
+    function getPriceAndNearestTicks() public view returns (uint160 _price, int24 _nearestTick) {
+        _price = price;
+        _nearestTick = nearestTick;
+    }
+
+    function getTokenProtocolFees() public view returns (uint128 _token0ProtocolFee, uint128 _token1ProtocolFee) {
+        _token0ProtocolFee = token0ProtocolFee;
+        _token1ProtocolFee = token1ProtocolFee;
+    }
+
+    function getReserves() public view returns (uint128 _reserve0, uint128 _reserve1) {
+        _reserve0 = reserve0;
+        _reserve1 = reserve1;
+    }
+
+    function getLiquidityAndLastObservation() public view returns (uint160 _secondsPerLiquidity, uint32 _lastObservation) {
+        _secondsPerLiquidity = secondsPerLiquidity;
+        _lastObservation = lastObservation;
+    }
+}",6722.0,716.0,"[H-01] Unsafe cast in ConcentratedLiquidityPool.burn leads to attack
+The `ConcentratedLiquidityPool.burn` function performs an unsafe cast of a `uint128` type to a signed integer.
+“(uint256 amount0fees, uint256 amount1fees) = _updatePosition(msg.sender, lower, upper, -int128(amount));”
+Note that amount is chosen by the caller and when choosing amount = 2**128 - 1, this is interpreted as 0xFFFFFFFFF... = -1 as a signed integer. Thus -(-1)=1 adds 1 liquidity unit to the position
+This allows an attacker to not only mint LP tokens for free but as this is the burn function it also redeems token0/1 amounts according to the unmodified uint128 amount which is an extremely large value.
+
+[H-04] Overflow in the mint function of ConcentratedLiquidityPool causes LPs' funds to be stolen
+Similar to a previous finding in the IndexPool contract, the `mint` function of `ConcentratedLiquidityPool` allows integer overflows when checking the balance is larger or equal to the received amount of token plus the reserve. As a result, the attacker could get a large amount of liquidity but only provide a small number of tokens to the pool, effectively stealing other LPs' funds when burning his liquidity.
+
+[H-05] Incorrect usage of typecasting in _getAmountsForLiquidity lets an attacker steal funds from the pool
+The `_getAmountsForLiquidity` function of `ConcentratedLiquidityPool` explicitly converts the result of DyDxMath.getDy and DyDxMath.getDx from type `uint256` to type `uint128`. The explicit casting without checking whether the integer exceeds the maximum number (i.e., `type(uint128).max`) could cause incorrect results being used. Specifically, an attacker could exploit this bug to mint a large amount of liquidity but only pay a little of `token0` or `token1` to the pool and effectively steal other's funds when burning his liquidity.
+
+[H-08] Wrong inequality when adding/removing liquidity in current price range
+The `ConcentratedLiquidityPool.mint/burn` functions add/remove `liquidity` when `(priceLower < currentPrice && currentPrice < priceUpper)`. Shouldn't it also be changed if `priceLower == currentPrice`?
+
+[H-09] range fee growth underflow
+The function RangeFeeGrowth (ConcentratedLiquidityPool.sol#L601-L633) would revert the transaction in some cases.
+When a pool cross a tick, it only updates either feeGrowthOutside0 or feeGrowthOutside1. Ticks.sol#L23-L53
+RangeFeeGrowth calculates the fee as follow:
+   “ feeGrowthInside0 = _feeGrowthGlobal0 - feeGrowthBelow0 - feeGrowthAbove0;""
+    “feeGrowthInside1 = _feeGrowthGlobal1 - feeGrowthBelow1 - feeGrowthAbove1;”
+‘feeGrowthBelow + feeGrowthAbove' is not necessary smaller than ‘_feeGrowthGlobal’. Please see POC.
+Users can not provide liquidity or burn liquidity. Fund will get stocked in the contract. I consider this is a high-risk issue.
+
+[H-10] ConcentratedLiquidityPool.burn() Wrong implementationThe reserves should be updated once LP tokens are burned to match the actual total bento shares hold by the pool.
+However, the current implementation only updated reserves with the fees subtracted.
+Makes the ‘reserve0' and ‘reserve1’ smaller than the current balance0 and balance1.
+
+[H-11] ConcentratedLiquidityPool: incorrect feeGrowthGlobal accounting when crossing ticks
+Variable `feeGrowthGlobal` 
+Swap fees are taken from the output. Hence, if swapping token0 for token1 (zeroForOne is true), then fees are taken in token1. We see this to be the case in the initialization of feeGrowthGlobal in the swap cache
+feeGrowthGlobal = zeroForOne ? feeGrowthGlobal1 : feeGrowthGlobal0;
+and in _updateFees().
+However, looking at Ticks.cross(), the logic is the reverse, which causes wrong fee accounting.
+
+[H-12] ConcentratedLiquidityPool: secondsPerLiquidity should be modified whenever pool liquidity changes
+Variable `secondsPerLiquidity`
+`secondsPerLiquidity` is updated as such: `secondsPerLiquidity += uint160((diff << 128) / liquidity); where diff = timestamp - uint256(lastObservation)`. Hence, whenever liquidity changes, secondsPerLiquidity should be updated prior to the change.
+In particular, this affects the mint() and burn() functions, in the case where liquidity changes when lowerTick <= currentTick < upperTick.
+In fact, the latest secondsPerLiquidity value should be calculated and used in Ticks.insert(). For comparison, notice how UniswapV3 fetches the latest value by calling observations.observeSingle() in its _updatePosition() function.
+
+[H-13] Burning does not update reserves
+The ConcentratedLiquidityPool.burn function sends out amount0/amount1 tokens but only updates the reserves by decreasing it by the fees of these amounts.
+This leads to the pool having wrong reserves after any burn action. The pool's balance will be much lower than the reserve variables.
+
+[H-14] ConcentratedLiquidityPool: `rangeFeeGrowth` and `secondsPerLiquidity` math needs to be unchecked
+The fee growth mechanism, and by extension, `secondsPerLiquidity` mechanism of Uniswap V3 has the ability to underflow. It is therefore a necessity for the math to (ironically) be unsafe / unchecked.",10.0,"pragma solidity >=0.8.0;
+
+import ""../../interfaces/IBentoBoxMinimal.sol"";
+import ""../../interfaces/IMasterDeployer.sol"";
+import ""../../interfaces/IPool.sol"";
+import ""../../interfaces/IPositionManager.sol"";
+import ""../../interfaces/ITridentCallee.sol"";
+import ""../../interfaces/ITridentRouter.sol"";
+import ""../../libraries/concentratedPool/FullMath.sol"";
+import ""../../libraries/concentratedPool/TickMath.sol"";
+import ""../../libraries/concentratedPool/UnsafeMath.sol"";
+import ""../../libraries/concentratedPool/DyDxMath.sol"";
+import ""../../libraries/concentratedPool/SwapLib.sol"";
+import ""../../libraries/concentratedPool/Ticks.sol"";
+import ""hardhat/console.sol"";
+
+
+
+
+contract ConcentratedLiquidityPool is IPool {
+    using Ticks for mapping(int24 => Ticks.Tick);
+
+    event Mint(address indexed sender, uint256 amount0, uint256 amount1, address indexed recipient);
+    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed recipient);
+    event Collect(address indexed sender, uint256 amount0, uint256 amount1);
+    event Sync(uint256 reserveShares0, uint256 reserveShares1);
+
+    
+    
+    bytes32 public constant override poolIdentifier = ""Trident:ConcentratedLiquidity"";
+
+    uint24 internal constant MAX_FEE = 100000; 
+
+    uint128 internal immutable MAX_TICK_LIQUIDITY;
+    uint24 internal immutable tickSpacing;
+    uint24 internal immutable swapFee; 
+
+    address internal immutable barFeeTo;
+    IBentoBoxMinimal internal immutable bento;
+    IMasterDeployer internal immutable masterDeployer;
+
+    address internal immutable token0;
+    address internal immutable token1;
+
+    uint128 public liquidity;
+
+    uint160 internal secondsPerLiquidity; 
+    uint32 internal lastObservation;
+
+    uint256 public feeGrowthGlobal0; 
+    uint256 public feeGrowthGlobal1;
+
+    uint256 public barFee;
+
+    uint128 internal token0ProtocolFee;
+    uint128 internal token1ProtocolFee;
+
+    uint128 internal reserve0; 
+    uint128 internal reserve1;
+
+    uint160 internal price; 
+    int24 internal nearestTick; 
+
+    uint256 internal unlocked;
+    modifier lock() {
+        require(unlocked == 1, ""LOCKED"");
+        unlocked = 2;
+        _;
+        unlocked = 1;
+    }
+
+    mapping(int24 => Ticks.Tick) public ticks;
+    mapping(address => mapping(int24 => mapping(int24 => Position))) public positions;
+
+    struct Position {
+        uint128 liquidity;
+        uint256 feeGrowthInside0Last;
+        uint256 feeGrowthInside1Last;
+    }
+
+    struct SwapCache {
+        uint256 feeAmount;
+        uint256 totalFeeAmount;
+        uint256 protocolFee;
+        uint256 feeGrowthGlobal;
+        uint256 currentPrice;
+        uint256 currentLiquidity;
+        uint256 input;
+        int24 nextTickToCross;
+    }
+
+    struct MintParams {
+        int24 lowerOld;
+        int24 lower;
+        int24 upperOld;
+        int24 upper;
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        bool token0native;
+        bool token1native;
+        
+        address positionOwner;
+        
+        
+        address positionRecipient;
+    }
+
+    
+    constructor(bytes memory _deployData, IMasterDeployer _masterDeployer) {
+        (address _token0, address _token1, uint24 _swapFee, uint160 _price, uint24 _tickSpacing) = abi.decode(
+            _deployData,
+            (address, address, uint24, uint160, uint24)
+        );
+
+        require(_token0 != address(0), ""ZERO_ADDRESS"");
+        require(_token0 != address(this), ""INVALID_TOKEN0"");
+        require(_token1 != address(this), ""INVALID_TOKEN1"");
+        require(_swapFee <= MAX_FEE, ""INVALID_SWAP_FEE"");
+        
+        token0 = _token0;
+        token1 = _token1;
+        swapFee = _swapFee;
+        price = _price;
+        tickSpacing = _tickSpacing;
+        
+        MAX_TICK_LIQUIDITY = Ticks.getMaxLiquidity(_tickSpacing);
+        ticks[TickMath.MIN_TICK] = Ticks.Tick(TickMath.MIN_TICK, TickMath.MAX_TICK, uint128(0), 0, 0, 0);
+        ticks[TickMath.MAX_TICK] = Ticks.Tick(TickMath.MIN_TICK, TickMath.MAX_TICK, uint128(0), 0, 0, 0);
+        nearestTick = TickMath.MIN_TICK;
+        bento = IBentoBoxMinimal(_masterDeployer.bento());
+        barFeeTo = _masterDeployer.barFeeTo();
+        barFee = _masterDeployer.barFee();
+        masterDeployer = _masterDeployer;
+        unlocked = 1;
+    }
+
+    
+    
+    function mint(bytes calldata data) public override lock returns (uint256 _liquidity) {
+        MintParams memory mintParams = abi.decode(data, (MintParams));
+
+        uint256 priceLower = uint256(TickMath.getSqrtRatioAtTick(mintParams.lower));
+        uint256 priceUpper = uint256(TickMath.getSqrtRatioAtTick(mintParams.upper));
+        uint256 currentPrice = uint256(price);
+
+        _liquidity = DyDxMath.getLiquidityForAmounts(
+            priceLower,
+            priceUpper,
+            currentPrice,
+            mintParams.amount1Desired,
+            mintParams.amount0Desired
+        );
+
+        {
+            require(_liquidity <= MAX_TICK_LIQUIDITY, ""LIQUIDITY_OVERFLOW"");
+
+            (uint256 amount0fees, uint256 amount1fees) = _updatePosition(
+                mintParams.positionOwner,
+                mintParams.lower,
+                mintParams.upper,
+                int128(uint128(_liquidity))
+            );
+            if (amount0fees > 0) {
+                _transfer(token0, amount0fees, mintParams.positionOwner, false);
+                reserve0 -= uint128(amount0fees);
+            }
+            if (amount1fees > 0) {
+                _transfer(token1, amount1fees, mintParams.positionOwner, false);
+                reserve1 -= uint128(amount1fees);
+            }
+        }
+
+        unchecked {
+            if (priceLower < currentPrice && currentPrice < priceUpper) liquidity += uint128(_liquidity);
+        }
+
+        _ensureTickSpacing(mintParams.lower, mintParams.upper);
+        nearestTick = Ticks.insert(
+            ticks,
+            feeGrowthGlobal0,
+            feeGrowthGlobal1,
+            secondsPerLiquidity,
+            mintParams.lowerOld,
+            mintParams.lower,
+            mintParams.upperOld,
+            mintParams.upper,
+            uint128(_liquidity),
+            nearestTick,
+            uint160(currentPrice)
+        );
+
+        (uint128 amount0Actual, uint128 amount1Actual) = _getAmountsForLiquidity(priceLower, priceUpper, currentPrice, _liquidity);
+
+        ITridentRouter.TokenInput[] memory callbackData = new ITridentRouter.TokenInput[](2);
+        callbackData[0] = ITridentRouter.TokenInput(token0, mintParams.token0native, amount0Actual);
+        callbackData[1] = ITridentRouter.TokenInput(token1, mintParams.token1native, amount1Actual);
+
+        ITridentCallee(msg.sender).tridentMintCallback(abi.encode(callbackData));
+
+        unchecked {
+            if (amount0Actual != 0) {
+                require(amount0Actual + reserve0 <= _balance(token0), ""TOKEN0_MISSING"");
+                reserve0 += amount0Actual;
+            }
+
+            if (amount1Actual != 0) {
+                require(amount1Actual + reserve1 <= _balance(token1), ""TOKEN1_MISSING"");
+                reserve1 += amount1Actual;
+            }
+        }
+
+        (uint256 feeGrowth0, uint256 feeGrowth1) = rangeFeeGrowth(mintParams.lower, mintParams.upper);
+
+        if (mintParams.positionRecipient != address(0)) {
+            IPositionManager(mintParams.positionOwner).positionMintCallback(
+                mintParams.positionRecipient,
+                mintParams.lower,
+                mintParams.upper,
+                uint128(_liquidity),
+                feeGrowth0,
+                feeGrowth1
+            );
+        }
+
+        emit Mint(mintParams.positionOwner, amount0Actual, amount1Actual, mintParams.positionRecipient);
+    }
+
+    
+    function burn(bytes calldata data) public override lock returns (IPool.TokenAmount[] memory withdrawnAmounts) {
+        (int24 lower, int24 upper, uint128 amount, address recipient, bool unwrapBento) = abi.decode(
+            data,
+            (int24, int24, uint128, address, bool)
+        );
+
+        uint160 priceLower = TickMath.getSqrtRatioAtTick(lower);
+        uint160 priceUpper = TickMath.getSqrtRatioAtTick(upper);
+        uint160 currentPrice = price;
+
+        unchecked {
+            if (priceLower < currentPrice && currentPrice < priceUpper) liquidity -= amount;
+        }
+
+        (uint256 amount0, uint256 amount1) = _getAmountsForLiquidity(
+            uint256(priceLower),
+            uint256(priceUpper),
+            uint256(currentPrice),
+            uint256(amount)
+        );
+
+        (uint256 amount0fees, uint256 amount1fees) = _updatePosition(msg.sender, lower, upper, -int128(amount));
+
+        unchecked {
+            amount0 += amount0fees;
+            amount1 += amount1fees;
+        }
+
+        withdrawnAmounts = new TokenAmount[](2);
+        withdrawnAmounts[0] = TokenAmount({token: token0, amount: amount0});
+        withdrawnAmounts[1] = TokenAmount({token: token1, amount: amount1});
+
+        unchecked {
+            reserve0 -= uint128(amount0fees);
+            reserve1 -= uint128(amount1fees);
+        }
+
+        _transferBothTokens(recipient, amount0, amount1, unwrapBento);
+
+        nearestTick = Ticks.remove(ticks, lower, upper, amount, nearestTick);
+        emit Burn(msg.sender, amount0, amount1, recipient);
+    }
+
+    function burnSingle(bytes calldata) public override returns (uint256) {
+        revert();
+    }
+
+    function collect(
+        int24 lower,
+        int24 upper,
+        address recipient,
+        bool unwrapBento
+    ) public lock returns (uint256 amount0fees, uint256 amount1fees) {
+        (amount0fees, amount1fees) = _updatePosition(msg.sender, lower, upper, 0);
+
+        _transferBothTokens(recipient, amount0fees, amount1fees, unwrapBento);
+
+        reserve0 -= uint128(amount0fees);
+        reserve1 -= uint128(amount1fees);
+
+        emit Collect(msg.sender, amount0fees, amount1fees);
+    }
+
+    
+    
+    
+    
+    function swap(bytes memory data) public override lock returns (uint256 amountOut) {
+        (bool zeroForOne, uint256 inAmount, address recipient, bool unwrapBento) = abi.decode(data, (bool, uint256, address, bool));
+
+        SwapCache memory cache = SwapCache({
+            feeAmount: 0,
+            totalFeeAmount: 0,
+            protocolFee: 0,
+            feeGrowthGlobal: zeroForOne ? feeGrowthGlobal1 : feeGrowthGlobal0,
+            currentPrice: uint256(price),
+            currentLiquidity: uint256(liquidity),
+            input: inAmount,
+            nextTickToCross: zeroForOne ? nearestTick : ticks[nearestTick].nextTick
+        });
+
+        {
+            uint256 timestamp = block.timestamp;
+            uint256 diff = timestamp - uint256(lastObservation); 
+            if (diff > 0 && liquidity > 0) {
+                lastObservation = uint32(timestamp);
+                secondsPerLiquidity += uint160((diff << 128) / liquidity);
+            }
+        }
+
+        while (cache.input != 0) {
+            uint256 nextTickPrice = uint256(TickMath.getSqrtRatioAtTick(cache.nextTickToCross));
+            uint256 output = 0;
+            bool cross = false;
+
+            if (zeroForOne) {
+                
+                
+                
+                uint256 maxDx = DyDxMath.getDx(cache.currentLiquidity, nextTickPrice, cache.currentPrice, false);
+
+                if (cache.input <= maxDx) {
+                    
+                    uint256 liquidityPadded = cache.currentLiquidity << 96;
+                    
+                    
+                    
+                    
+                    
+                    uint256 newPrice = uint256(
+                        FullMath.mulDivRoundingUp(liquidityPadded, cache.currentPrice, liquidityPadded + cache.currentPrice * cache.input)
+                    );
+
+                    if (!(nextTickPrice <= newPrice && newPrice < cache.currentPrice)) {
+                        
+                        newPrice = uint160(UnsafeMath.divRoundingUp(liquidityPadded, liquidityPadded / cache.currentPrice + cache.input));
+                    }
+                    
+                    output = DyDxMath.getDy(cache.currentLiquidity, newPrice, cache.currentPrice, false);
+                    cache.currentPrice = newPrice;
+                    cache.input = 0;
+                } else {
+                    
+                    output = DyDxMath.getDy(cache.currentLiquidity, nextTickPrice, cache.currentPrice, false);
+                    cache.currentPrice = nextTickPrice;
+                    cross = true;
+                    cache.input -= maxDx;
+                }
+            } else {
+                
+                
+                uint256 maxDy = DyDxMath.getDy(cache.currentLiquidity, cache.currentPrice, nextTickPrice, false);
+
+                if (cache.input <= maxDy) {
+                    
+                    
+                    uint256 newPrice = cache.currentPrice +
+                        FullMath.mulDiv(cache.input, 0x1000000000000000000000000, cache.currentLiquidity);
+                    
+                    
+                    output = DyDxMath.getDx(cache.currentLiquidity, cache.currentPrice, newPrice, false);
+                    cache.currentPrice = newPrice;
+                    cache.input = 0;
+                } else {
+                    
+                    output = DyDxMath.getDx(cache.currentLiquidity, cache.currentPrice, nextTickPrice, false);
+                    cache.currentPrice = nextTickPrice;
+                    cross = true;
+                    cache.input -= maxDy;
+                }
+            }
+            (cache.totalFeeAmount, amountOut, cache.protocolFee, cache.feeGrowthGlobal) = SwapLib.handleFees(
+                output,
+                swapFee,
+                barFee,
+                cache.currentLiquidity,
+                cache.totalFeeAmount,
+                amountOut,
+                cache.protocolFee,
+                cache.feeGrowthGlobal
+            );
+            if (cross) {
+                (cache.currentLiquidity, cache.nextTickToCross) = Ticks.cross(
+                    ticks,
+                    cache.nextTickToCross,
+                    secondsPerLiquidity,
+                    cache.currentLiquidity,
+                    cache.feeGrowthGlobal,
+                    zeroForOne
+                );
+                if (cache.currentLiquidity == 0) {
+                    
+                    cache.currentPrice = uint256(TickMath.getSqrtRatioAtTick(cache.nextTickToCross));
+                    (cache.currentLiquidity, cache.nextTickToCross) = Ticks.cross(
+                        ticks,
+                        cache.nextTickToCross,
+                        secondsPerLiquidity,
+                        cache.currentLiquidity,
+                        cache.feeGrowthGlobal,
+                        zeroForOne
+                    );
+                }
+            }
+        }
+
+        price = uint160(cache.currentPrice);
+
+        int24 newNearestTick = zeroForOne ? cache.nextTickToCross : ticks[cache.nextTickToCross].previousTick;
+
+        if (nearestTick != newNearestTick) {
+            nearestTick = newNearestTick;
+            liquidity = uint128(cache.currentLiquidity);
+        }
+
+        _updateReserves(zeroForOne, uint128(inAmount), amountOut);
+
+        _updateFees(zeroForOne, cache.feeGrowthGlobal, uint128(cache.protocolFee));
+
+        if (zeroForOne) {
+            _transfer(token1, amountOut, recipient, unwrapBento);
+            emit Swap(recipient, token0, token1, inAmount, amountOut);
+        } else {
+            _transfer(token0, amountOut, recipient, unwrapBento);
+            emit Swap(recipient, token1, token0, inAmount, amountOut);
+        }
+    }
+
+    
+    function flashSwap(bytes calldata) public override returns (uint256) {
+        revert();
+    }
+
+    
+    function updateBarFee() public {
+        barFee = IMasterDeployer(masterDeployer).barFee();
+    }
+
+    
+    function collectProtocolFee() public lock returns (uint128 amount0, uint128 amount1) {
+        if (token0ProtocolFee > 1) {
+            amount0 = token0ProtocolFee - 1;
+            token0ProtocolFee = 1;
+            reserve0 -= amount0;
+            _transfer(token0, amount0, barFeeTo, false);
+        }
+        if (token1ProtocolFee > 1) {
+            amount1 = token1ProtocolFee - 1;
+            token1ProtocolFee = 1;
+            reserve1 -= amount1;
+            _transfer(token1, amount1, barFeeTo, false);
+        }
+    }
+
+    function _ensureTickSpacing(int24 lower, int24 upper) internal view {
+        require(lower % int24(tickSpacing) == 0, ""INVALID_TICK"");
+        require((lower / int24(tickSpacing)) % 2 == 0, ""LOWER_EVEN"");
+
+        require(upper % int24(tickSpacing) == 0, ""INVALID_TICK"");
+        require((upper / int24(tickSpacing)) % 2 != 0, ""UPPER_ODD""); 
+    }
+
+    function _getAmountsForLiquidity(
+        uint256 priceLower,
+        uint256 priceUpper,
+        uint256 currentPrice,
+        uint256 liquidityAmount
+    ) internal pure returns (uint128 token0amount, uint128 token1amount) {
+        if (priceUpper <= currentPrice) {
+            
+            token1amount = uint128(DyDxMath.getDy(liquidityAmount, priceLower, priceUpper, true));
+        } else if (currentPrice <= priceLower) {
+            
+            token0amount = uint128(DyDxMath.getDx(liquidityAmount, priceLower, priceUpper, true));
+        } else {
+            
+            token0amount = uint128(DyDxMath.getDx(liquidityAmount, currentPrice, priceUpper, true));
+            token1amount = uint128(DyDxMath.getDy(liquidityAmount, priceLower, currentPrice, true));
+        }
+    }
+
+    function _updateReserves(
+        bool zeroForOne,
+        uint128 inAmount,
+        uint256 amountOut
+    ) internal {
+        if (zeroForOne) {
+            uint256 balance0 = _balance(token0);
+            uint128 newBalance = reserve0 + inAmount;
+            require(uint256(newBalance) <= balance0, ""TOKEN0_MISSING"");
+            reserve0 = newBalance;
+            reserve1 -= uint128(amountOut);
+        } else {
+            uint256 balance1 = _balance(token1);
+            uint128 newBalance = reserve1 + inAmount;
+            require(uint256(newBalance) <= balance1, ""TOKEN1_MISSING"");
+            reserve1 = newBalance;
+            reserve0 -= uint128(amountOut);
+        }
+    }
+
+    function _updateFees(
+        bool zeroForOne,
+        uint256 feeGrowthGlobal,
+        uint128 protocolFee
+    ) internal {
+        if (zeroForOne) {
+            feeGrowthGlobal1 = feeGrowthGlobal;
+            token1ProtocolFee += protocolFee;
+        } else {
+            feeGrowthGlobal0 = feeGrowthGlobal;
+            token0ProtocolFee += protocolFee;
+        }
+    }
+
+    function _updatePosition(
+        address owner,
+        int24 lower,
+        int24 upper,
+        int128 amount
+    ) internal returns (uint256 amount0fees, uint256 amount1fees) {
+        Position storage position = positions[owner][lower][upper];
+
+        (uint256 growth0current, uint256 growth1current) = rangeFeeGrowth(lower, upper);
+        amount0fees = FullMath.mulDiv(
+            growth0current - position.feeGrowthInside0Last,
+            position.liquidity,
+            0x100000000000000000000000000000000
+        );
+
+        amount1fees = FullMath.mulDiv(
+            growth1current - position.feeGrowthInside1Last,
+            position.liquidity,
+            0x100000000000000000000000000000000
+        );
+
+        if (amount < 0) position.liquidity -= uint128(-amount);
+        if (amount > 0) position.liquidity += uint128(amount);
+
+        require(position.liquidity < MAX_TICK_LIQUIDITY, ""MAX_TICK_LIQUIDITY"");
+
+        position.feeGrowthInside0Last = growth0current;
+        position.feeGrowthInside1Last = growth1current;
+    }
+
+    function _balance(address token) internal view returns (uint256 balance) {
+        balance = bento.balanceOf(token, address(this));
+    }
+
+    function _transfer(
+        address token,
+        uint256 shares,
+        address to,
+        bool unwrapBento
+    ) internal {
+        if (unwrapBento) {
+            bento.withdraw(token, address(this), to, 0, shares);
+        } else {
+            bento.transfer(token, address(this), to, shares);
+        }
+    }
+
+    function _transferBothTokens(
+        address to,
+        uint256 shares0,
+        uint256 shares1,
+        bool unwrapBento
+    ) internal {
+        if (unwrapBento) {
+            bento.withdraw(token0, address(this), to, 0, shares0);
+            bento.withdraw(token1, address(this), to, 0, shares1);
+        } else {
+            bento.transfer(token0, address(this), to, shares0);
+            bento.transfer(token1, address(this), to, shares1);
+        }
+    }
+
+    
+    
+
+    
+    
+
+    
+    
+
+    
+    
+
+    
+    
+    function rangeFeeGrowth(int24 lowerTick, int24 upperTick) public view returns (uint256 feeGrowthInside0, uint256 feeGrowthInside1) {
+        int24 currentTick = nearestTick;
+
+        Ticks.Tick storage lower = ticks[lowerTick];
+        Ticks.Tick storage upper = ticks[upperTick];
+
+        
+        uint256 _feeGrowthGlobal0 = feeGrowthGlobal0;
+        uint256 _feeGrowthGlobal1 = feeGrowthGlobal1;
+        uint256 feeGrowthBelow0;
+        uint256 feeGrowthBelow1;
+        uint256 feeGrowthAbove0;
+        uint256 feeGrowthAbove1;
+
+        if (lowerTick <= currentTick) {
+            feeGrowthBelow0 = lower.feeGrowthOutside0;
+            feeGrowthBelow1 = lower.feeGrowthOutside1;
+        } else {
+            feeGrowthBelow0 = _feeGrowthGlobal0 - lower.feeGrowthOutside0;
+            feeGrowthBelow1 = _feeGrowthGlobal1 - lower.feeGrowthOutside1;
+        }
+
+        if (currentTick < upperTick) {
+            feeGrowthAbove0 = upper.feeGrowthOutside0;
+            feeGrowthAbove1 = upper.feeGrowthOutside1;
+        } else {
+            feeGrowthAbove0 = _feeGrowthGlobal0 - upper.feeGrowthOutside0;
+            feeGrowthAbove1 = _feeGrowthGlobal1 - upper.feeGrowthOutside1;
+        }
+
+        feeGrowthInside0 = _feeGrowthGlobal0 - feeGrowthBelow0 - feeGrowthAbove0;
+        feeGrowthInside1 = _feeGrowthGlobal1 - feeGrowthBelow1 - feeGrowthAbove1;
+    }
+
+    function rangeSecondsInside(int24 lowerTick, int24 upperTick) public view returns (uint256 secondsInside) {
+        int24 currentTick = nearestTick;
+
+        Ticks.Tick storage lower = ticks[lowerTick];
+        Ticks.Tick storage upper = ticks[upperTick];
+
+        uint256 secondsGlobal = secondsPerLiquidity;
+        uint256 secondsBelow;
+        uint256 secondsAbove;
+
+        if (lowerTick <= currentTick) {
+            secondsBelow = lower.secondsPerLiquidityOutside;
+        } else {
+            secondsBelow = secondsGlobal - lower.secondsPerLiquidityOutside;
+        }
+
+        if (currentTick < upperTick) {
+            secondsAbove = upper.secondsPerLiquidityOutside;
+        } else {
+            secondsAbove = secondsGlobal - upper.secondsPerLiquidityOutside;
+        }
+
+        secondsInside = secondsGlobal - secondsBelow - secondsAbove;
+    }
+
+    function getAssets() public view override returns (address[] memory assets) {
+        assets = new address[](2);
+        assets[0] = token0;
+        assets[1] = token1;
+    }
+
+    
+    function getAmountOut(bytes calldata) public pure override returns (uint256) {
+        revert();
+    }
+
+    function getImmutables()
+        public
+        view
+        returns (
+            uint128 _MAX_TICK_LIQUIDITY,
+            uint24 _tickSpacing,
+            uint24 _swapFee,
+            address _barFeeTo,
+            IBentoBoxMinimal _bento,
+            IMasterDeployer _masterDeployer,
+            address _token0,
+            address _token1
+        )
+    {
+        _MAX_TICK_LIQUIDITY = MAX_TICK_LIQUIDITY;
+        _tickSpacing = tickSpacing;
+        _swapFee = swapFee; 
+        _barFeeTo = barFeeTo;
+        _bento = bento;
+        _masterDeployer = masterDeployer;
+        _token0 = token0;
+        _token1 = token1;
+    }
+
+    function getPriceAndNearestTicks() public view returns (uint160 _price, int24 _nearestTick) {
+        _price = price;
+        _nearestTick = nearestTick;
+    }
+
+    function getTokenProtocolFees() public view returns (uint128 _token0ProtocolFee, uint128 _token1ProtocolFee) {
+        _token0ProtocolFee = token0ProtocolFee;
+        _token1ProtocolFee = token1ProtocolFee;
+    }
+
+    function getReserves() public view returns (uint128 _reserve0, uint128 _reserve1) {
+        _reserve0 = reserve0;
+        _reserve1 = reserve1;
+    }
+
+    function getLiquidityAndLastObservation() public view returns (uint160 _secondsPerLiquidity, uint32 _lastObservation) {
+        _secondsPerLiquidity = secondsPerLiquidity;
+        _lastObservation = lastObservation;
+    }
+}",5628.0,10,0,"<think>
+Let me analyze this ConcentratedLiquidityPool contract for vulnerabilities. I'll look for:
+
+1. Reentrancy issues
+2. Integer overflow/underflow 
+3. Access control problems
+4. Logic issues
+5. Input validation flaws
+6. Other security concerns
+
+Initial observations:
+
+1. The contract uses a lock modifier to prevent reentrancy, which is good.
+2. The contract uses Solidity ^0.8.0 which has built-in overflow/underflow protection.
+3. The contract handles funds and performs external calls to other contracts, which could be sources of vulnerabilities.
+
+Let's examine each potential vulnerability:
+</think># Vulnerabilities in ConcentratedLiquidityPool Contract
+
+## 1. Reentrancy Vulnerabilities
+
+- **External Callbacks Without Reentrancy Guards**: The contract makes external calls to `ITridentCallee(msg.sender).tridentMintCallback()` and `IPositionManager(mintParams.positionOwner).positionMintCallback()` in the `mint()` function. Although the contract has a lock modifier, these callbacks can potentially be exploited if the callback logic attempts to reenter the contract through a different function.
+
+- **Late State Changes**: In the `mint()` function, state updates occur after external calls, which is generally a reentrancy risk pattern.
+
+## 2. Integer Handling Issues
+
+- **Possible Arithmetic Underflow**: In the `_updatePosition()` function, if `amount < 0`, it decreases `position.liquidity` by `uint128(-amount)`. While Solidity 0.8.0+ protects against overflows/underflows, casting a negative value to an unsigned type can lead to unexpected behavior.
+
+- **Unchecked Block Casting**: Several instances of unchecked blocks with type casting could potentially lead to overflow or truncation issues, especially in the mathematical operations throughout the contract.
+
+## 3. Access Control Problems
+
+- **Missing Access Controls**: Several critical functions like `collectProtocolFee()` and `updateBarFee()` lack proper access controls, allowing anyone to call them.
+
+## 4. Logic Vulnerabilities
+
+- **Price Manipulation**: The price calculation logic in the swap function might be vulnerable to price manipulation attacks due to complex mathematical operations.
+
+- **Tick Cross Logic**: The tick crossing logic is complex and could contain vulnerabilities where the state is not properly updated during swaps under specific edge conditions.
+
+## 5. Input Validation Issues
+
+- **Missing Validation**: Some functions like `_transfer` don't validate if the address is valid (e.g., not address(0)).
+
+- **Tick Range Validation**: While there's validation of tick spacing, other aspects of tick range could potentially be manipulated.
+
+## 6. Economic/Design Vulnerabilities
+
+- **Sandwich Attack Vulnerability**: The contract doesn't include features to protect against sandwich attacks or frontrunning, which are common in DEX pools.
+
+- **Flash Loan Attack Vectors**: The contract states ""revert()"" for flashSwap functionality, but the overall design might still be vulnerable to flash loan attacks through other entry points.
+
+## 7. Gas Optimization Issues
+
+- **High Gas Consumption**: Some functions like `swap()` have complex calculations that could lead to high gas consumption or even transaction failures due to out-of-gas errors.
+
+## 8. Missing Return Values
+
+- **Functions Without Return Values**: Some functions that are expected to return values don't explicitly return anything, which could cause integration issues.
+
+## 9. Proxy Pattern Vulnerabilities
+
+- **Initialization Concerns**: If this contract is designed to be used with proxies, there's no clear initialization function with protections against multiple initializations.
+
+## 10. Fee-related Vulnerabilities
+
+- **Fee Calculation Logic**: The complex fee calculation could potentially have edge cases where fees are calculated incorrectly, especially in the `SwapLib.handleFees()` call.
+
+These vulnerabilities should be carefully audited and addressed before deploying the contract to production. Advanced testing with fuzzing and formal verification would also be beneficial for this complex contract.","### **[H-01] Unsafe cast in ConcentratedLiquidityPool.burn leads to attack**
+
+**Report Description**:
+The `ConcentratedLiquidityPool.burn` function performs an unsafe cast of a `uint128` type to a signed integer. Specifically, the line `(uint256 amount0fees, uint256 amount1fees) = _updatePosition(msg.sender, lower, upper, -int128(amount));` is vulnerable. If the caller sets `amount = 2**128 - 1`, it is interpreted as `-1` as a signed integer, leading to `-(-1) = 1`. This allows an attacker to mint LP tokens for free and redeem token0/1 amounts based on the unmodified `uint128` amount, which is an extremely large value. This could lead to significant financial losses.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of unsafe casting in the `burn` function. While it mentions integer handling issues and unchecked block casting, it does not identify the exact vulnerability described in the issue report.
+
+---
+
+### **[H-04] Overflow in the mint function of ConcentratedLiquidityPool causes LPs' funds to be stolen**
+
+**Report Description**:
+The `mint` function of `ConcentratedLiquidityPool` allows integer overflows when checking if the balance is larger or equal to the received amount of token plus the reserve. This could allow an attacker to provide a small number of tokens but receive a large amount of liquidity, effectively stealing other LPs' funds when burning their liquidity.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list mentions integer handling issues and possible arithmetic underflow but does not specifically address the overflow vulnerability in the `mint` function described in the issue report.
+
+---
+
+### **[H-05] Incorrect usage of typecasting in _getAmountsForLiquidity lets an attacker steal funds from the pool**
+
+**Report Description**:
+The `_getAmountsForLiquidity` function explicitly converts the result of `DyDxMath.getDy` and `DyDxMath.getDx` from `uint256` to `uint128` without checking if the integer exceeds the maximum value of `uint128`. This could lead to incorrect results, allowing an attacker to mint a large amount of liquidity while paying little for `token0` or `token1`, effectively stealing funds from the pool.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of incorrect typecasting in the `_getAmountsForLiquidity` function.
+
+---
+
+### **[H-08] Wrong inequality when adding/removing liquidity in current price range**
+
+**Report Description**:
+The `ConcentratedLiquidityPool.mint/burn` functions add/remove liquidity when `(priceLower < currentPrice && currentPrice < priceUpper)`. The issue suggests that the condition should also include `priceLower == currentPrice`.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of incorrect inequality in the `mint/burn` functions.
+
+---
+
+### **[H-09] Range fee growth underflow**
+
+**Report Description**:
+The `RangeFeeGrowth` function may revert the transaction in some cases because `feeGrowthBelow + feeGrowthAbove` is not necessarily smaller than `_feeGrowthGlobal`. This could prevent users from providing or burning liquidity, causing funds to be stuck in the contract.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of underflow in the `RangeFeeGrowth` function.
+
+---
+
+### **[H-10] ConcentratedLiquidityPool.burn() Wrong implementation**
+
+**Report Description**:
+The `burn` function updates reserves only with the fees subtracted, making `reserve0` and `reserve1` smaller than the actual `balance0` and `balance1`. This discrepancy could lead to incorrect accounting of reserves.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of incorrect reserve updates in the `burn` function.
+
+---
+
+### **[H-11] ConcentratedLiquidityPool: incorrect feeGrowthGlobal accounting when crossing ticks**
+
+**Report Description**:
+The `feeGrowthGlobal` variable is incorrectly updated when crossing ticks, leading to wrong fee accounting. Specifically, the logic in `Ticks.cross()` is reversed compared to the initialization in the swap cache.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of incorrect `feeGrowthGlobal` accounting.
+
+---
+
+### **[H-12] ConcentratedLiquidityPool: secondsPerLiquidity should be modified whenever pool liquidity changes**
+
+**Report Description**:
+The `secondsPerLiquidity` variable is not updated correctly when liquidity changes, particularly in the `mint()` and `burn()` functions. This could lead to incorrect calculations of liquidity over time.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of incorrect `secondsPerLiquidity` updates.
+
+---
+
+### **[H-13] Burning does not update reserves**
+
+**Report Description**:
+The `burn` function sends out `amount0/amount1` tokens but only updates the reserves by decreasing them by the fees of these amounts. This leads to incorrect reserve values after any burn action.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of incorrect reserve updates in the `burn` function.
+
+---
+
+### **[H-14] ConcentratedLiquidityPool: `rangeFeeGrowth` and `secondsPerLiquidity` math needs to be unchecked**
+
+**Report Description**:
+The fee growth mechanism, and by extension, the `secondsPerLiquidity` mechanism, can underflow. Therefore, the math should be unchecked to prevent reverts.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of underflow in the `rangeFeeGrowth` and `secondsPerLiquidity` mechanisms.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[H-01] Unsafe cast in ConcentratedLiquidityPool.burn leads to attack**
+- **[H-04] Overflow in the mint function of ConcentratedLiquidityPool causes LPs' funds to be stolen**
+- **[H-05] Incorrect usage of typecasting in _getAmountsForLiquidity lets an attacker steal funds from the pool**
+- **[H-08] Wrong inequality when adding/removing liquidity in current price range**
+- **[H-09] Range fee growth underflow**
+- **[H-10] ConcentratedLiquidityPool.burn() Wrong implementation**
+- **[H-11] ConcentratedLiquidityPool: incorrect feeGrowthGlobal accounting when crossing ticks**
+- **[H-12] ConcentratedLiquidityPool: secondsPerLiquidity should be modified whenever pool liquidity changes**
+- **[H-13] Burning does not update reserves**
+- **[H-14] ConcentratedLiquidityPool: `rangeFeeGrowth` and `secondsPerLiquidity` math needs to be unchecked**
+
+---
+
+The response list fails to address any of the specific issues raised in the issue report. While it mentions general categories of vulnerabilities (e.g., integer handling, access control), it does not provide accurate or sufficient coverage of the specific vulnerabilities described in the issue report.",0,0,10,10,"```
+None.
+```",0.0,0,23.66992211341860,8657.0,3.0
+ConcentratedLiquidityPoolManager.sol,"// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity >=0.8.0;
+
+import ""../../interfaces/IConcentratedLiquidityPool.sol"";
+import ""./ConcentratedLiquidityPosition.sol"";
+
+/// @notice Trident Concentrated Liquidity Pool periphery contract that combines non-fungible position management and staking.
+contract ConcentratedLiquidityPoolManager is ConcentratedLiquidityPosition {
+    event AddIncentive(IConcentratedLiquidityPool indexed pool, Incentive indexed incentive);
+    event ReclaimIncentive(IConcentratedLiquidityPool indexed pool, uint256 indexed incentiveId);
+    event Subscribe(uint256 indexed positionId, uint256 indexed incentiveId);
+    event ClaimReward(uint256 indexed positionId, uint256 indexed incentiveId, address indexed recipient);
+
+    struct Incentive {
+        address owner;
+        address token;
+        uint256 rewardsUnclaimed;
+        uint160 secondsClaimed; // @dev x128.
+        uint32 startTime;
+        uint32 endTime;
+        uint32 expiry;
+    }
+
+    struct Stake {
+        uint160 secondsInsideLast; // @dev x128.
+        bool initialized;
+    }
+
+    mapping(IConcentratedLiquidityPool => uint256) public incentiveCount;
+    mapping(IConcentratedLiquidityPool => mapping(uint256 => Incentive)) public incentives;
+    mapping(uint256 => mapping(uint256 => Stake)) public stakes;
+
+    constructor(address wETH, address _masterDeployer) ConcentratedLiquidityPosition(wETH, _masterDeployer) {}
+
+    function addIncentive(IConcentratedLiquidityPool pool, Incentive memory incentive) public {
+        uint32 current = uint32(block.timestamp);
+        require(current <= incentive.startTime, ""ALREADY_STARTED"");
+        require(current <= incentive.endTime, ""ALREADY_ENDED"");
+        require(incentive.startTime < incentive.endTime, ""START_PAST_END"");
+        require(incentive.endTime + 5 weeks < incentive.expiry, ""END_PAST_BUFFER"");
+        require(incentive.rewardsUnclaimed != 0, ""NO_REWARDS"");
+        incentives[pool][incentiveCount[pool]++] = incentive;
+        _transfer(incentive.token, msg.sender, address(this), incentive.rewardsUnclaimed, false);
+        emit AddIncentive(pool, incentive);
+    }
+
+    /// @dev Withdraws any unclaimed incentive rewards.
+    function reclaimIncentive(
+        IConcentratedLiquidityPool pool,
+        uint256 incentiveId,
+        uint256 amount,
+        address receiver,
+        bool unwrapBento
+    ) public {
+        Incentive storage incentive = incentives[pool][incentiveId];
+        require(incentive.owner == msg.sender, ""NOT_OWNER"");
+        require(incentive.expiry < block.timestamp, ""EXPIRED"");
+        require(incentive.rewardsUnclaimed >= amount, ""ALREADY_CLAIMED"");
+        _transfer(incentive.token, address(this), receiver, amount, unwrapBento);
+        emit ReclaimIncentive(pool, incentiveId);
+    }
+
+    /// @dev Subscribes a non-fungible position token to an incentive.
+    function subscribe(uint256 positionId, uint256 incentiveId) public {
+        Position memory position = positions[positionId];
+        IConcentratedLiquidityPool pool = position.pool;
+        Incentive memory incentive = incentives[pool][positionId];
+        Stake storage stake = stakes[positionId][incentiveId];
+        require(position.liquidity != 0, ""INACTIVE"");
+        require(stake.secondsInsideLast == 0, ""SUBSCRIBED"");
+        require(incentiveId <= incentiveCount[pool], ""NOT_INCENTIVE"");
+        require(block.timestamp > incentive.startTime && block.timestamp < incentive.endTime, ""TIMED_OUT"");
+        stakes[positionId][incentiveId] = Stake(uint160(pool.rangeSecondsInside(position.lower, position.upper)), true);
+        emit Subscribe(positionId, incentiveId);
+    }
+
+    function claimReward(
+        uint256 positionId,
+        uint256 incentiveId,
+        address recipient,
+        bool unwrapBento
+    ) public {
+        require(ownerOf[positionId] == msg.sender, ""OWNER"");
+        Position memory position = positions[positionId];
+        IConcentratedLiquidityPool pool = position.pool;
+        Incentive storage incentive = incentives[position.pool][positionId];
+        Stake storage stake = stakes[positionId][incentiveId];
+        require(stake.initialized, ""UNINITIALIZED"");
+        uint256 secondsPerLiquidityInside = pool.rangeSecondsInside(position.lower, position.upper) - stake.secondsInsideLast;
+        uint256 secondsInside = secondsPerLiquidityInside * position.liquidity;
+        uint256 maxTime = incentive.endTime < block.timestamp ? block.timestamp : incentive.endTime;
+        uint256 secondsUnclaimed = (maxTime - incentive.startTime) << (128 - incentive.secondsClaimed);
+        uint256 rewards = (incentive.rewardsUnclaimed * secondsInside) / secondsUnclaimed;
+        incentive.rewardsUnclaimed -= rewards;
+        incentive.secondsClaimed += uint160(secondsInside);
+        stake.secondsInsideLast += uint160(secondsPerLiquidityInside);
+        _transfer(incentive.token, address(this), recipient, rewards, unwrapBento);
+        emit ClaimReward(positionId, incentiveId, recipient);
+    }
+
+    function getReward(uint256 positionId, uint256 incentiveId) public view returns (uint256 rewards, uint256 secondsInside) {
+        Position memory position = positions[positionId];
+        IConcentratedLiquidityPool pool = position.pool;
+        Incentive memory incentive = incentives[pool][positionId];
+        Stake memory stake = stakes[positionId][incentiveId];
+        if (stake.initialized) {
+            secondsInside = (pool.rangeSecondsInside(position.lower, position.upper) - stake.secondsInsideLast) * position.liquidity;
+            uint256 maxTime = incentive.endTime < block.timestamp ? block.timestamp : incentive.endTime;
+            uint256 secondsUnclaimed = (maxTime - incentive.startTime) << (128 - incentive.secondsClaimed);
+            rewards = (incentive.rewardsUnclaimed * secondsInside) / secondsUnclaimed;
+        }
+    }
+}",1294.0,116.0,"[H-02] Wrong usage of `positionId` in ConcentratedLiquidityPoolManager
+In the `subscribe` function of ConcentratedLiquidityPoolManager, the `incentive` to subscribed is determined as follows:
+“Incentive memory incentive = incentives[pool][positionId];”
+However, `positionId` should be `incentiveId`, a counter that increases by one whenever a new incentive is added to the pool. The usage of `positionId` could cause the wrong incentive to be used, and in general, the incentive is not found, and the transaction reverts (the condition `block.timestamp < incentive.endTime` is not met). The `getReward` and `claimReward` functions have the bug of misusing `positionId` as the index of incentives.
+
+[H-03] ConcentratedLiquidityPoolManager's incentives can be stolen
+The ConcentratedLiquidityPoolManager keeps all tokens for all incentives in the same contract. The `reclaimIncentive` function does not reduce the `incentive.rewardsUnclaimed` field and thus one can reclaim tokens several times. This allows anyone to steal all tokens from all incentives by creating an incentive themself, and once it's expired, repeatedly claim the unclaimed rewards until the token balance is empty.
+
+[H-16] Possible attacks on Seconds * Liquidity calculation
+This is a possible line of attack on the staking contract, in particular the `claimReward()` function: ConcentratedLiquidityPoolManager.sol#L90 L94
+- A user with some spare capital mints a liquidity position with a very tight range (1-2 ticks wide) at the current price. Because the range is so small, his position.liquidity on his NFT is large (DyDxMath.sol).
+- The user then sets up a bot to frontrun any price changes that someone else tries to do, burning his position after claiming rewards. He then mints a new liquidity position at the new price after the other persons trades go through.
+- Rinse and repeat this process. If done correctly, no funds are at risk from the bot owner, he doesn't pay any fees for burning/minting either.
+
+[M-01] Incentive should check that it hasn't started yet
+The `ConcentratedLiquidityPoolManager.addIncentive` function can add an incentive that already has a non-zero `incentive.secondsClaimed`.
+
+[M-02] Cannot claim reward
+The `ConcentratedLiquidityPoolManager.claimReward` requires `stake.initialized` but it is never set. It also performs a strange computation as `128 - incentive.secondsClaimed` which will almost always underflow and revert the transaction.
+
+[M-06] ConcentratedLiquidityPoolManager.sol `claimReward()` and `reclaimIncentive()` will fail when incentive.token is `token0` or `token1`
+In `ConcentratedLiquidityPosition.collect()`, balances of token0 and token1 in bento will be used to pay the fees.In the case of someone add an incentive with `token0` or `token1`, the incentive in the balance of bento will be used to pay fees until the balance is completely consumed.
+As a result, when a user calls claimReward(), the contract may not have enough balance to pay (it supposed to have it), cause the transaction to fail.",6.0,"pragma solidity >=0.8.0;
+
+import ""../../interfaces/IConcentratedLiquidityPool.sol"";
+import ""./ConcentratedLiquidityPosition.sol"";
+
+
+contract ConcentratedLiquidityPoolManager is ConcentratedLiquidityPosition {
+    event AddIncentive(IConcentratedLiquidityPool indexed pool, Incentive indexed incentive);
+    event ReclaimIncentive(IConcentratedLiquidityPool indexed pool, uint256 indexed incentiveId);
+    event Subscribe(uint256 indexed positionId, uint256 indexed incentiveId);
+    event ClaimReward(uint256 indexed positionId, uint256 indexed incentiveId, address indexed recipient);
+
+    struct Incentive {
+        address owner;
+        address token;
+        uint256 rewardsUnclaimed;
+        uint160 secondsClaimed; 
+        uint32 startTime;
+        uint32 endTime;
+        uint32 expiry;
+    }
+
+    struct Stake {
+        uint160 secondsInsideLast; 
+        bool initialized;
+    }
+
+    mapping(IConcentratedLiquidityPool => uint256) public incentiveCount;
+    mapping(IConcentratedLiquidityPool => mapping(uint256 => Incentive)) public incentives;
+    mapping(uint256 => mapping(uint256 => Stake)) public stakes;
+
+    constructor(address wETH, address _masterDeployer) ConcentratedLiquidityPosition(wETH, _masterDeployer) {}
+
+    function addIncentive(IConcentratedLiquidityPool pool, Incentive memory incentive) public {
+        uint32 current = uint32(block.timestamp);
+        require(current <= incentive.startTime, ""ALREADY_STARTED"");
+        require(current <= incentive.endTime, ""ALREADY_ENDED"");
+        require(incentive.startTime < incentive.endTime, ""START_PAST_END"");
+        require(incentive.endTime + 5 weeks < incentive.expiry, ""END_PAST_BUFFER"");
+        require(incentive.rewardsUnclaimed != 0, ""NO_REWARDS"");
+        incentives[pool][incentiveCount[pool]++] = incentive;
+        _transfer(incentive.token, msg.sender, address(this), incentive.rewardsUnclaimed, false);
+        emit AddIncentive(pool, incentive);
+    }
+
+    
+    function reclaimIncentive(
+        IConcentratedLiquidityPool pool,
+        uint256 incentiveId,
+        uint256 amount,
+        address receiver,
+        bool unwrapBento
+    ) public {
+        Incentive storage incentive = incentives[pool][incentiveId];
+        require(incentive.owner == msg.sender, ""NOT_OWNER"");
+        require(incentive.expiry < block.timestamp, ""EXPIRED"");
+        require(incentive.rewardsUnclaimed >= amount, ""ALREADY_CLAIMED"");
+        _transfer(incentive.token, address(this), receiver, amount, unwrapBento);
+        emit ReclaimIncentive(pool, incentiveId);
+    }
+
+    
+    function subscribe(uint256 positionId, uint256 incentiveId) public {
+        Position memory position = positions[positionId];
+        IConcentratedLiquidityPool pool = position.pool;
+        Incentive memory incentive = incentives[pool][positionId];
+        Stake storage stake = stakes[positionId][incentiveId];
+        require(position.liquidity != 0, ""INACTIVE"");
+        require(stake.secondsInsideLast == 0, ""SUBSCRIBED"");
+        require(incentiveId <= incentiveCount[pool], ""NOT_INCENTIVE"");
+        require(block.timestamp > incentive.startTime && block.timestamp < incentive.endTime, ""TIMED_OUT"");
+        stakes[positionId][incentiveId] = Stake(uint160(pool.rangeSecondsInside(position.lower, position.upper)), true);
+        emit Subscribe(positionId, incentiveId);
+    }
+
+    function claimReward(
+        uint256 positionId,
+        uint256 incentiveId,
+        address recipient,
+        bool unwrapBento
+    ) public {
+        require(ownerOf[positionId] == msg.sender, ""OWNER"");
+        Position memory position = positions[positionId];
+        IConcentratedLiquidityPool pool = position.pool;
+        Incentive storage incentive = incentives[position.pool][positionId];
+        Stake storage stake = stakes[positionId][incentiveId];
+        require(stake.initialized, ""UNINITIALIZED"");
+        uint256 secondsPerLiquidityInside = pool.rangeSecondsInside(position.lower, position.upper) - stake.secondsInsideLast;
+        uint256 secondsInside = secondsPerLiquidityInside * position.liquidity;
+        uint256 maxTime = incentive.endTime < block.timestamp ? block.timestamp : incentive.endTime;
+        uint256 secondsUnclaimed = (maxTime - incentive.startTime) << (128 - incentive.secondsClaimed);
+        uint256 rewards = (incentive.rewardsUnclaimed * secondsInside) / secondsUnclaimed;
+        incentive.rewardsUnclaimed -= rewards;
+        incentive.secondsClaimed += uint160(secondsInside);
+        stake.secondsInsideLast += uint160(secondsPerLiquidityInside);
+        _transfer(incentive.token, address(this), recipient, rewards, unwrapBento);
+        emit ClaimReward(positionId, incentiveId, recipient);
+    }
+
+    function getReward(uint256 positionId, uint256 incentiveId) public view returns (uint256 rewards, uint256 secondsInside) {
+        Position memory position = positions[positionId];
+        IConcentratedLiquidityPool pool = position.pool;
+        Incentive memory incentive = incentives[pool][positionId];
+        Stake memory stake = stakes[positionId][incentiveId];
+        if (stake.initialized) {
+            secondsInside = (pool.rangeSecondsInside(position.lower, position.upper) - stake.secondsInsideLast) * position.liquidity;
+            uint256 maxTime = incentive.endTime < block.timestamp ? block.timestamp : incentive.endTime;
+            uint256 secondsUnclaimed = (maxTime - incentive.startTime) << (128 - incentive.secondsClaimed);
+            rewards = (incentive.rewardsUnclaimed * secondsInside) / secondsUnclaimed;
+        }
+    }
+}",1218.0,3,3,"<think>
+Let's analyze this contract for vulnerabilities:
+
+1. Incorrect Mapping Key Issue in `subscribe` and `claimReward` Functions:
+   In the `subscribe` function, the code accesses `incentives[pool][positionId]` but it should be `incentives[pool][incentiveId]`. This means it's looking up an incorrect incentive.
+
+2. Reentrancy Risk:
+   The contract uses the `_transfer` function which appears to be making external calls. This could potentially lead to reentrancy attacks if the external contract being interacted with is malicious.
+
+3. Integer Overflow/Underflow:
+   Although Solidity 0.8.0+ comes with built-in overflow/underflow checks, there are still calculations that could have logical errors. For instance, the calculation of `secondsUnclaimed` using bit shifting `(maxTime - incentive.startTime) << (128 - incentive.secondsClaimed)` could lead to unexpected results.
+
+4. Missing Input Validation:
+   In functions like `reclaimIncentive`, there's no verification that `amount` is positive and non-zero.
+
+5. Improper Access Control:
+   In the `claimReward` function, the check is `require(ownerOf[positionId] == msg.sender, ""OWNER"")`, but there's a potential issue if the position owner delegates someone else to claim rewards on their behalf.
+
+6. Time Manipulation:
+   The contract relies on `block.timestamp` which can be slightly manipulated by miners (usually within a window of a few seconds). This might not be a major issue for this contract's use case, but it's something to be aware of.
+
+7. Incorrect Data Storage in `subscribe` Function:
+   The function sets `stakes[positionId][incentiveId] = Stake(uint160(pool.rangeSecondsInside(position.lower, position.upper)), true)`, but if the range seconds inside is large, there might be data loss due to the conversion to `uint160`.
+
+8. Division Before Multiplication:
+   In the `claimReward` function, the calculation of rewards involves `(incentive.rewardsUnclaimed * secondsInside) / secondsUnclaimed`. If `secondsUnclaimed` is very large and `incentive.rewardsUnclaimed` or `secondsInside` is relatively small, the result might be rounded down to zero.
+
+9. Unchecked External Calls:
+   The contract interacts with external contracts via the `pool.rangeSecondsInside` method without properly handling any error cases.
+
+10. No Zero Address Check:
+    There's no validation to ensure that addresses (like `receiver` in `reclaimIncentive`) are not the zero address.
+</think># Vulnerabilities in ConcentratedLiquidityPoolManager Contract
+
+## 1. Incorrect Incentive Access in subscribe() and getReward()
+In both functions, the contract incorrectly accesses incentives using `positionId` instead of `incentiveId`:
+solidity
+Incentive memory incentive = incentives[pool][positionId]; // WRONG
+It should be:
+solidity
+Incentive memory incentive = incentives[pool][incentiveId]; // CORRECT
+
+## 2. Array Out of Bounds Vulnerability in subscribe()
+solidity
+require(incentiveId <= incentiveCount[pool], ""NOT_INCENTIVE"");
+This should be `<` instead of `<=` since array indices start at 0. If `incentiveId` equals `incentiveCount[pool]`, it will access an uninitialized array element.
+
+## 3. Incorrect Arithmetic in claimReward()
+The bit shifting operation in calculating `secondsUnclaimed` could lead to unpredictable results:
+solidity
+uint256 secondsUnclaimed = (maxTime - incentive.startTime) << (128 - incentive.secondsClaimed);
+A growing `incentive.secondsClaimed` value could eventually cause this shift operation to overflow.
+
+## 4. Division Before Multiplication Risk
+In both `claimReward()` and `getReward()`:
+solidity
+rewards = (incentive.rewardsUnclaimed * secondsInside) / secondsUnclaimed;
+If `secondsUnclaimed` is large relative to `rewardsUnclaimed`, rewards could be rounded down to zero.
+
+## 5. Missing Access Control in subscribe()
+Anyone can subscribe any position to an incentive, as there's no verification that the caller owns the position.
+
+## 6. Potential Integer Overflow in secondsInsideLast
+Converting `pool.rangeSecondsInside()` to uint160 in `subscribe()` could cause loss of precision or overflow.
+
+## 7. Reentrancy Risk
+The `_transfer` function (called in multiple places) might make external calls to tokens without following the checks-effects-interactions pattern.
+
+## 8. Lack of Expiration Check in subscribe()
+The function doesn't verify that the incentive hasn't expired.
+
+## 9. Missing Zero Address Check
+Functions like `reclaimIncentive()` don't verify that the receiver address isn't the zero address.
+
+## 10. Incentive Identifier Collision
+When an incentive is reclaimed, the contract doesn't update the incentive mapping, allowing the same incentiveId to be reused.
+
+## 11. Incomplete reclaimIncentive() Implementation
+The function doesn't decrease `incentive.rewardsUnclaimed` when rewards are claimed, which could lead to more tokens being withdrawn than were originally deposited.
+
+These vulnerabilities could lead to loss of funds, denial of service, or unexpected behavior in the contract.","### **Analysis of Issues and Responses**
+
+---
+
+#### **[H-02] Wrong usage of `positionId` in ConcentratedLiquidityPoolManager**
+
+**Report Description**:  
+In the `subscribe` function of `ConcentratedLiquidityPoolManager`, the incentive to be subscribed is incorrectly accessed using `positionId` instead of `incentiveId`. This could lead to the wrong incentive being used or the transaction reverting if the incentive is not found. The same issue exists in the `getReward` and `claimReward` functions.
+
+**Match in Response List**:  
+Matches with **""Incorrect Mapping Key Issue in `subscribe` and `claimReward` Functions""** in the response list.
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue with the incorrect use of `positionId` instead of `incentiveId`. It correctly explains the potential consequences of this misalignment, which aligns with the issue report.
+
+---
+
+#### **[H-03] ConcentratedLiquidityPoolManager's incentives can be stolen**
+
+**Report Description**:  
+The `reclaimIncentive` function does not reduce the `incentive.rewardsUnclaimed` field, allowing an attacker to repeatedly claim unclaimed rewards until the token balance is empty. This could lead to the theft of all tokens from all incentives.
+
+**Match in Response List**:  
+Matches with **""Incomplete reclaimIncentive() Implementation""** in the response list.
+
+**Validation**:  
+**Correct**. The response correctly identifies the issue with the `reclaimIncentive` function, specifically the failure to decrease `incentive.rewardsUnclaimed`. This accurately addresses the risk of token theft described in the issue report.
+
+---
+
+#### **[H-16] Possible attacks on Seconds * Liquidity calculation**
+
+**Report Description**:  
+A user with spare capital can mint a liquidity position with a very tight range, set up a bot to frontrun price changes, and repeatedly claim rewards without risking funds or paying fees. This exploits the `claimReward()` function in `ConcentratedLiquidityPoolManager`.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Missed Issue**. The response list does not address this specific attack vector, which involves manipulating liquidity positions and frontrunning price changes to exploit reward calculations.
+
+---
+
+#### **[M-01] Incentive should check that it hasn't started yet**
+
+**Report Description**:  
+The `addIncentive` function in `ConcentratedLiquidityPoolManager` does not verify that the incentive has not already started (i.e., `incentive.secondsClaimed` is zero). This could lead to incorrect incentive tracking.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Missed Issue**. The response list does not address the lack of validation for `incentive.secondsClaimed` in the `addIncentive` function.
+
+---
+
+#### **[M-02] Cannot claim reward**
+
+**Report Description**:  
+The `claimReward` function requires `stake.initialized`, but this field is never set. Additionally, the calculation `128 - incentive.secondsClaimed` will almost always underflow and revert the transaction.
+
+**Match in Response List**:  
+Matches with **""Incorrect Arithmetic in claimReward()""** in the response list.
+
+**Validation**:  
+**Partially Correct**. The response identifies the issue with the arithmetic in `claimReward()` but does not address the missing initialization of `stake.initialized`.
+
+---
+
+#### **[M-06] ConcentratedLiquidityPoolManager.sol `claimReward()` and `reclaimIncentive()` will fail when incentive.token is `token0` or `token1`**
+
+**Report Description**:  
+If `incentive.token` is `token0` or `token1`, the balance in the Bento contract may be consumed to pay fees, leaving insufficient funds for `claimReward()` or `reclaimIncentive()`.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Missed Issue**. The response list does not address the specific issue of token balance depletion when `incentive.token` is `token0` or `token1`.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+
+- **[H-02] Wrong usage of `positionId` in ConcentratedLiquidityPoolManager**
+- **[H-03] ConcentratedLiquidityPoolManager's incentives can be stolen**
+
+**Partially Correct Matches**:
+
+- **[M-02] Cannot claim reward**
+
+**Missed Issues from Issue Report**:
+
+- **[H-16] Possible attacks on Seconds * Liquidity calculation**
+- **[M-01] Incentive should check that it hasn't started yet**
+- **[M-06] ConcentratedLiquidityPoolManager.sol `claimReward()` and `reclaimIncentive()` will fail when incentive.token is `token0` or `token1`**
+
+---
+
+### **Conclusion**
+
+The response list covers some of the critical issues, such as the incorrect use of `positionId` and the incomplete implementation of `reclaimIncentive`. However, it misses several important vulnerabilities, including the attack on liquidity calculations, the lack of validation in `addIncentive`, and the token balance depletion issue. Additionally, the response partially addresses the arithmetic issue in `claimReward` but overlooks the missing initialization of `stake.initialized`. Overall, the response list provides a good starting point but requires further refinement to fully address the reported issues.",2,1,3,11,"```
+1. Incorrect Mapping Key Issue in `subscribe` and `claimReward` Functions
+2. Incomplete reclaimIncentive() Implementation
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the ranks of true positives in the ranked list of predictions**:
+   - **True Positive 1**: ""Incorrect Mapping Key Issue in `subscribe` and `claimReward` Functions"" appears at **Rank 1**.
+   - **True Positive 2**: ""Incomplete reclaimIncentive() Implementation"" appears at **Rank 11**.
+
+2. **Calculate precision at each rank where a true positive appears**:
+   - **Precision at Rank 1 (P@1)**: \( \frac{1}{1} = 1.0 \)
+   - **Precision at Rank 11 (P@11)**: \( \frac{2}{11} \approx 0.1818 \)
+
+3. **Compute the Average Precision (AP)**:
+   \[
+   AP = \frac{1.0 + 0.1818}{2} = 0.5909
+   \]
+
+**Output**:
+```
+0.5909
+```",0.5909,27.654408931732200,3064.0,3.0
+ConcentratedLiquidityPosition.sol,"// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity >=0.8.0;
+
+import ""../../interfaces/IBentoBoxMinimal.sol"";
+import ""../../interfaces/IConcentratedLiquidityPool.sol"";
+import ""../../interfaces/IMasterDeployer.sol"";
+import ""../../interfaces/ITridentRouter.sol"";
+import ""../../libraries/concentratedPool/FullMath.sol"";
+import ""./TridentNFT.sol"";
+import ""hardhat/console.sol"";
+
+/// @notice Trident Concentrated Liquidity Pool periphery contract that combines non-fungible position management and staking.
+abstract contract ConcentratedLiquidityPosition is TridentNFT {
+    event Mint(address indexed pool, address indexed recipient, uint256 indexed positionId);
+    event Burn(address indexed pool, address indexed owner, uint256 indexed positionId);
+
+    address public immutable wETH;
+    IBentoBoxMinimal public immutable bento;
+    IMasterDeployer public immutable masterDeployer;
+
+    mapping(uint256 => Position) public positions;
+
+    struct Position {
+        IConcentratedLiquidityPool pool;
+        uint128 liquidity;
+        int24 lower;
+        int24 upper;
+        uint256 feeGrowthInside0; /// @dev Per unit of liquidity.
+        uint256 feeGrowthInside1;
+    }
+
+    constructor(address _wETH, address _masterDeployer) {
+        wETH = _wETH;
+        masterDeployer = IMasterDeployer(_masterDeployer);
+        bento = IBentoBoxMinimal(IMasterDeployer(_masterDeployer).bento());
+    }
+
+    function positionMintCallback(
+        address recipient,
+        int24 lower,
+        int24 upper,
+        uint128 amount,
+        uint256 feeGrowthInside0,
+        uint256 feeGrowthInside1
+    ) external returns (uint256 positionId) {
+        require(IMasterDeployer(masterDeployer).pools(msg.sender), ""NOT_POOL"");
+        positions[totalSupply] = Position(IConcentratedLiquidityPool(msg.sender), amount, lower, upper, feeGrowthInside0, feeGrowthInside1);
+        positionId = totalSupply;
+        _mint(recipient);
+        emit Mint(msg.sender, recipient, positionId);
+    }
+
+    function burn(
+        uint256 tokenId,
+        uint128 amount,
+        address recipient,
+        bool unwrapBento
+    ) external {
+        require(msg.sender == ownerOf[tokenId], ""NOT_ID_OWNER"");
+        Position storage position = positions[tokenId];
+        if (position.liquidity < amount) amount = position.liquidity;
+
+        position.pool.burn(abi.encode(position.lower, position.upper, amount, recipient, unwrapBento));
+
+        if (amount < position.liquidity) {
+            position.liquidity -= amount;
+        } else {
+            delete positions[tokenId];
+            _burn(tokenId);
+        }
+        emit Burn(address(position.pool), msg.sender, tokenId);
+    }
+
+    function collect(
+        uint256 tokenId,
+        address recipient,
+        bool unwrapBento
+    ) external returns (uint256 token0amount, uint256 token1amount) {
+        require(msg.sender == ownerOf[tokenId], ""NOT_ID_OWNER"");
+
+        Position storage position = positions[tokenId];
+
+        (address token0, address token1) = _getAssets(position.pool);
+
+        {
+            (uint256 feeGrowthInside0, uint256 feeGrowthInside1) = position.pool.rangeFeeGrowth(position.lower, position.upper);
+            token0amount = FullMath.mulDiv(
+                feeGrowthInside0 - position.feeGrowthInside0,
+                position.liquidity,
+                0x100000000000000000000000000000000
+            );
+            token1amount = FullMath.mulDiv(
+                feeGrowthInside1 - position.feeGrowthInside1,
+                position.liquidity,
+                0x100000000000000000000000000000000
+            );
+
+            position.feeGrowthInside0 = feeGrowthInside0;
+            position.feeGrowthInside1 = feeGrowthInside1;
+        }
+
+        uint256 balance0 = bento.balanceOf(token0, address(this));
+        uint256 balance1 = bento.balanceOf(token1, address(this));
+        if (balance0 < token0amount || balance1 < token1amount) {
+            (uint256 amount0fees, uint256 amount1fees) = position.pool.collect(position.lower, position.upper, address(this), false);
+
+            uint256 newBalance0 = amount0fees + balance0;
+            uint256 newBalance1 = amount1fees + balance1;
+
+            /// @dev Rounding errors due to frequent claiming of other users in the same position may cost us some raw
+            if (token0amount > newBalance0) token0amount = newBalance0;
+            if (token1amount > newBalance1) token1amount = newBalance1;
+        }
+        _transfer(token0, address(this), recipient, token0amount, unwrapBento);
+        _transfer(token1, address(this), recipient, token1amount, unwrapBento);
+    }
+
+    function _getAssets(IConcentratedLiquidityPool pool) internal view returns (address token0, address token1) {
+        address[] memory pair = pool.getAssets();
+        token0 = pair[0];
+        token1 = pair[1];
+    }
+
+    function _transfer(
+        address token,
+        address from,
+        address to,
+        uint256 shares,
+        bool unwrapBento
+    ) internal {
+        if (unwrapBento) {
+            bento.withdraw(token, from, to, 0, shares);
+        } else {
+            bento.transfer(token, from, to, shares);
+        }
+    }
+}",1186.0,140.0,"[H-06] ConcentratedLiquidityPosition.sol#collect() Users may get double the amount of yield when they call collect() before burn()
+When a user calls the function `collect()` to collect their yield, it calcuates the yield based on `position.pool.rangeFeeGrowth()` and `position.feeGrowthInside0`, `position.feeGrowthInside1`:
+ConcentratedLiquidityPosition.sol#L75 L101
+When there are enough tokens in `bento.balanceOf`, it will not call `position.pool.collect()` to collect fees from the pool.
+This makes the user who `collect()` their yield when there is enough balance to get double yield when they call `burn()` to remove liquidity. Because burn() will automatically collect fees on the pool contract.
+
+[H-07] ConcentratedLiquidityPosition.sol#burn() Wrong implementation allows attackers to steal yield
+When a user calls the function `burn()` to burn their liquidity, it calls ConcentratedLiquidityPool.sol#burn() -> _updatePosition():
+ConcentratedLiquidityPool.sol#L525 L553
+The `_updatePosition()` function will return `amount0fees` and `amount1fees` of the whole position with the `lower` and `upper` tick and send them to the recipient alongside the burned liquidity amounts.",2.0,"pragma solidity >=0.8.0;
+
+import ""../../interfaces/IBentoBoxMinimal.sol"";
+import ""../../interfaces/IConcentratedLiquidityPool.sol"";
+import ""../../interfaces/IMasterDeployer.sol"";
+import ""../../interfaces/ITridentRouter.sol"";
+import ""../../libraries/concentratedPool/FullMath.sol"";
+import ""./TridentNFT.sol"";
+import ""hardhat/console.sol"";
+
+
+abstract contract ConcentratedLiquidityPosition is TridentNFT {
+    event Mint(address indexed pool, address indexed recipient, uint256 indexed positionId);
+    event Burn(address indexed pool, address indexed owner, uint256 indexed positionId);
+
+    address public immutable wETH;
+    IBentoBoxMinimal public immutable bento;
+    IMasterDeployer public immutable masterDeployer;
+
+    mapping(uint256 => Position) public positions;
+
+    struct Position {
+        IConcentratedLiquidityPool pool;
+        uint128 liquidity;
+        int24 lower;
+        int24 upper;
+        uint256 feeGrowthInside0; 
+        uint256 feeGrowthInside1;
+    }
+
+    constructor(address _wETH, address _masterDeployer) {
+        wETH = _wETH;
+        masterDeployer = IMasterDeployer(_masterDeployer);
+        bento = IBentoBoxMinimal(IMasterDeployer(_masterDeployer).bento());
+    }
+
+    function positionMintCallback(
+        address recipient,
+        int24 lower,
+        int24 upper,
+        uint128 amount,
+        uint256 feeGrowthInside0,
+        uint256 feeGrowthInside1
+    ) external returns (uint256 positionId) {
+        require(IMasterDeployer(masterDeployer).pools(msg.sender), ""NOT_POOL"");
+        positions[totalSupply] = Position(IConcentratedLiquidityPool(msg.sender), amount, lower, upper, feeGrowthInside0, feeGrowthInside1);
+        positionId = totalSupply;
+        _mint(recipient);
+        emit Mint(msg.sender, recipient, positionId);
+    }
+
+    function burn(
+        uint256 tokenId,
+        uint128 amount,
+        address recipient,
+        bool unwrapBento
+    ) external {
+        require(msg.sender == ownerOf[tokenId], ""NOT_ID_OWNER"");
+        Position storage position = positions[tokenId];
+        if (position.liquidity < amount) amount = position.liquidity;
+
+        position.pool.burn(abi.encode(position.lower, position.upper, amount, recipient, unwrapBento));
+
+        if (amount < position.liquidity) {
+            position.liquidity -= amount;
+        } else {
+            delete positions[tokenId];
+            _burn(tokenId);
+        }
+        emit Burn(address(position.pool), msg.sender, tokenId);
+    }
+
+    function collect(
+        uint256 tokenId,
+        address recipient,
+        bool unwrapBento
+    ) external returns (uint256 token0amount, uint256 token1amount) {
+        require(msg.sender == ownerOf[tokenId], ""NOT_ID_OWNER"");
+
+        Position storage position = positions[tokenId];
+
+        (address token0, address token1) = _getAssets(position.pool);
+
+        {
+            (uint256 feeGrowthInside0, uint256 feeGrowthInside1) = position.pool.rangeFeeGrowth(position.lower, position.upper);
+            token0amount = FullMath.mulDiv(
+                feeGrowthInside0 - position.feeGrowthInside0,
+                position.liquidity,
+                0x100000000000000000000000000000000
+            );
+            token1amount = FullMath.mulDiv(
+                feeGrowthInside1 - position.feeGrowthInside1,
+                position.liquidity,
+                0x100000000000000000000000000000000
+            );
+
+            position.feeGrowthInside0 = feeGrowthInside0;
+            position.feeGrowthInside1 = feeGrowthInside1;
+        }
+
+        uint256 balance0 = bento.balanceOf(token0, address(this));
+        uint256 balance1 = bento.balanceOf(token1, address(this));
+        if (balance0 < token0amount || balance1 < token1amount) {
+            (uint256 amount0fees, uint256 amount1fees) = position.pool.collect(position.lower, position.upper, address(this), false);
+
+            uint256 newBalance0 = amount0fees + balance0;
+            uint256 newBalance1 = amount1fees + balance1;
+
+            
+            if (token0amount > newBalance0) token0amount = newBalance0;
+            if (token1amount > newBalance1) token1amount = newBalance1;
+        }
+        _transfer(token0, address(this), recipient, token0amount, unwrapBento);
+        _transfer(token1, address(this), recipient, token1amount, unwrapBento);
+    }
+
+    function _getAssets(IConcentratedLiquidityPool pool) internal view returns (address token0, address token1) {
+        address[] memory pair = pool.getAssets();
+        token0 = pair[0];
+        token1 = pair[1];
+    }
+
+    function _transfer(
+        address token,
+        address from,
+        address to,
+        uint256 shares,
+        bool unwrapBento
+    ) internal {
+        if (unwrapBento) {
+            bento.withdraw(token, from, to, 0, shares);
+        } else {
+            bento.transfer(token, from, to, shares);
+        }
+    }
+}",1118.0,2,0,"<think>
+Let's analyze the ConcentratedLiquidityPosition contract for potential vulnerabilities.
+
+1. Re-entrancy check: No reentrancy guard is used in this contract. The external functions (burn, collect) interact with external contracts (position.pool.burn, position.pool.collect), which could potentially lead to re-entrancy attacks.
+
+2. Access control: The contract checks that msg.sender is the owner of the tokenId in both burn and collect functions, which is good practice.
+
+3. Integer overflow/underflow: The contract uses Solidity 0.8.0 or later which has built-in overflow/underflow protection, so that's safe.
+
+4. Missing return values: The positionMintCallback function is supposed to return a positionId, but it doesn't explicitly return the value, though it does assign it.
+
+5. Lack of input validation: In the positionMintCallback function, there's no validation for the input parameters (recipient, lower, upper, amount). 
+
+6. Storage vs. memory: The Position storage is correctly handled, using storage references when modifying the position.
+
+7. Potential front-running: No specific protection against front-running attacks in token transfers or position operations.
+
+8. Delegation of trust: The contract trusts that the pool contracts behave correctly.
+
+9. Transfer mechanism: The _transfer function handles token transfers through the BentoBox system, which may have its own vulnerabilities.
+
+10. Zero address checks: No checks for zero addresses in constructor or other functions.
+
+11. ERC721 implementation: The contract inherits from TridentNFT which is not shown, so we can't verify its correctness.
+
+12. Unauthorized minting: positionMintCallback allows any pool registered in the masterDeployer to mint tokens, relying solely on the IMasterDeployer(masterDeployer).pools check.
+
+13. Lack of slippage protection: No slippage protection in burn or collect functions, which could lead to frontrunning attacks.
+
+14. Potential rounding errors: The FullMath operations for calculating fees could potentially lead to rounding errors.
+
+15. State updates after external calls: In the collect function, state updates (position.feeGrowthInside0 = feeGrowthInside0) happen before external calls, which is good.
+</think># Vulnerabilities in ConcentratedLiquidityPosition Contract
+
+## 1. Reentrancy Vulnerabilities
+- No reentrancy guards are implemented in the `burn` and `collect` functions which make external calls to `position.pool.burn()` and `position.pool.collect()`.
+- The contract assumes pools will behave correctly, but a malicious pool could reenter these functions.
+
+## 2. Missing Input Validation
+- `positionMintCallback` doesn't validate key parameters such as `lower`, `upper`, and `amount`.
+- No range checks on position bounds that could potentially be manipulated by the external pool.
+
+## 3. Incorrect Return Value Handling
+- `positionMintCallback` is supposed to return a `positionId` but doesn't explicitly include a return statement, relying on the implicit return of the declared return value.
+
+## 4. Unchecked External Calls
+- No try/catch for external calls to handle failures from pool contracts.
+- No verification that external calls to `burn` and `collect` on the pool contract were successful.
+
+## 5. Centralization Risk
+- The `masterDeployer` has significant control over which pools are valid, introducing a centralization risk if that contract is compromised.
+
+## 6. Missing Zero Address Checks
+- Constructor doesn't validate that `_wETH` and `_masterDeployer` are non-zero addresses.
+
+## 7. ERC721 Implementation
+- Depends on unseen `TridentNFT.sol` implementation which may have its own vulnerabilities.
+
+## 8. Integer Overflow Risk in Fee Calculations
+- Although Solidity 0.8.0+ prevents arithmetic overflow/underflow, the `FullMath.mulDiv` calculations for fees could still result in unexpected values if the growth values are very large.
+
+## 9. Frontrunning Vulnerability
+- No protection against price frontrunning when users are burning liquidity or collecting fees.
+
+## 10. Missing Event for Collection
+- There's no event emitted when fees are collected, hindering transparent tracking of fee collection.
+
+## 11. Potential DoS via Gas Limit
+- If a malicious actor creates a large number of positions, the gas needed to process them might exceed block gas limits.
+
+## 12. Increment Logic Issue
+- In `positionMintCallback`, the function uses `totalSupply` directly without incrementing it first, which might lead to incorrect position ID assignment (depending on how `_mint` is implemented in `TridentNFT`).
+
+## 13. No Withdrawal Pattern Implementation
+- The contract transfers tokens directly rather than using the withdrawal pattern, which is considered safer for token transfers.","### **[H-06] ConcentratedLiquidityPosition.sol#collect() Users may get double the amount of yield when they call collect() before burn()**
+
+**Report Description**:  
+When a user calls the `collect()` function to collect their yield, it calculates the yield based on `position.pool.rangeFeeGrowth()` and `position.feeGrowthInside0`, `position.feeGrowthInside1`. If there are enough tokens in `bento.balanceOf`, it will not call `position.pool.collect()` to collect fees from the pool. This allows users who call `collect()` when there is enough balance to get double yield when they later call `burn()` to remove liquidity, as `burn()` will automatically collect fees from the pool contract.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this specific issue of double yield collection. The issue arises from a logical flaw in the interaction between `collect()` and `burn()`, which is not covered in the response list. The response list focuses on general vulnerabilities like reentrancy, input validation, and external calls but misses this specific logic error.
+
+---
+
+### **[H-07] ConcentratedLiquidityPosition.sol#burn() Wrong implementation allows attackers to steal yield**
+
+**Report Description**:  
+When a user calls the `burn()` function to burn their liquidity, it calls `ConcentratedLiquidityPool.sol#burn()` -> `_updatePosition()`. The `_updatePosition()` function returns `amount0fees` and `amount1fees` for the entire position and sends them to the recipient alongside the burned liquidity amounts. This implementation could allow attackers to steal yield by exploiting the fee calculation logic.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this specific issue of yield theft through incorrect fee calculation in the `burn()` function. The response list covers general vulnerabilities like reentrancy, input validation, and external calls but misses this specific logic flaw in the `burn()` function.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- **[H-06] ConcentratedLiquidityPosition.sol#collect() Users may get double the amount of yield when they call collect() before burn()**  
+- **[H-07] ConcentratedLiquidityPosition.sol#burn() Wrong implementation allows attackers to steal yield**
+
+---
+
+### **Analysis of Response List Coverage**
+
+The response list provides a comprehensive analysis of general vulnerabilities in the `ConcentratedLiquidityPosition` contract, such as reentrancy, input validation, unchecked external calls, and centralization risks. However, it fails to address the specific logic errors in the `collect()` and `burn()` functions, which are critical vulnerabilities in the issue report. The response list focuses on broader security concerns but misses the nuanced implementation flaws that could lead to double yield collection or yield theft.
+
+### **Recommendations**
+
+1. **Address Specific Logic Errors**: The response list should include an analysis of the interaction between `collect()` and `burn()` to identify and mitigate the risk of double yield collection and yield theft.  
+2. **Enhance Fee Calculation Validation**: The response list should explicitly address the fee calculation logic in `burn()` to ensure it cannot be exploited.  
+3. **Improve Coverage of Implementation Flaws**: While general vulnerabilities are important, the response list should also focus on specific implementation flaws that could lead to significant financial losses.  
+
+By addressing these gaps, the response list can provide a more complete and accurate assessment of the contract's security posture.",0,0,2,13,"```
+None.
+```",0.0,0,25.928385019302400,2679.0,3.0
+TridentNFT.sol,"// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity >=0.8.0;
+
+/// @notice Trident Concentrated Liquidity Pool ERC-721 implementation with ERC-20/EIP-2612-like extensions,
+// as well as partially, MetaData and Enumerable extensions.
+/// @author Adapted from RariCapital, https://github.com/Rari-Capital/solmate/blob/main/src/erc721/ERC721.sol,
+// License-Identifier: AGPL-3.0-only, and Shoyu, https://github.com/sushiswap/shoyu/blob/master/contracts/base/BaseNFT721.sol,
+// License-Identifier: MIT.
+abstract contract TridentNFT {
+    event Transfer(address indexed sender, address indexed recipient, uint256 indexed tokenId);
+    event Approval(address indexed owner, address indexed spender, uint256 indexed tokenId);
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    string public constant name = ""TridentNFT"";
+    string public constant symbol = ""tNFT"";
+    /// @notice Tracks total liquidity range positions.
+    uint256 public totalSupply;
+    /// @notice 'owner' -> balance mapping.
+    mapping(address => uint256) public balanceOf;
+    /// @notice `tokenId` -> 'owner' mapping.
+    mapping(uint256 => address) public ownerOf;
+    /// @notice `tokenId` -> 'spender' mapping.
+    mapping(uint256 => address) public getApproved;
+    /// @notice 'owner' -> 'operator' status mapping.
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+    /// @notice EIP-712 typehash for this contract's {permit} struct for {approve}.
+    bytes32 public constant PERMIT_TYPEHASH = keccak256(""Permit(address spender,uint256 tokenId,uint256 nonce,uint256 deadline)"");
+    /// @notice EIP-712 typehash for this contract's {permitAll} struct for {setApprovalForAll}.
+    bytes32 public constant PERMIT_ALL_TYPEHASH = keccak256(""Permit(address owner,address spender,uint256 nonce,uint256 deadline)"");
+
+    /// @notice Chain Id at this contract's deployment.
+    uint256 internal immutable DOMAIN_SEPARATOR_CHAIN_ID;
+    /// @notice EIP-712 typehash for this contract's domain at deployment.
+    bytes32 internal immutable _DOMAIN_SEPARATOR;
+    /// @notice 'tokenId' -> `nonce` mapping used in {permit} for {approve}.
+    mapping(uint256 => uint256) public nonces;
+    /// @notice 'owner' -> `tokenId` mapping used in {permitAll} for {setApprovalForAll}.
+    mapping(address => uint256) public noncesForAll;
+
+    constructor() {
+        DOMAIN_SEPARATOR_CHAIN_ID = block.chainid;
+        _DOMAIN_SEPARATOR = _calculateDomainSeparator();
+    }
+
+    function _calculateDomainSeparator() internal view returns (bytes32 domainSeperator) {
+        domainSeperator = keccak256(
+            abi.encode(
+                keccak256(""EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)""),
+                keccak256(bytes(name)),
+                keccak256(bytes(""1"")),
+                block.chainid,
+                address(this)
+            )
+        );
+    }
+
+    /// @notice EIP-712 typehash for this contract's domain.
+    function DOMAIN_SEPARATOR() public view returns (bytes32 domainSeperator) {
+        domainSeperator = block.chainid == DOMAIN_SEPARATOR_CHAIN_ID ? _DOMAIN_SEPARATOR : _calculateDomainSeparator();
+    }
+
+    /// @notice Provides ERC-165-compatible confirmation for ERC-721 interfaces supported by this contract.
+    /// @param interfaceId XOR of all function selectors in the reference interface.
+    /// @return supported Returns 'true' if `interfaceId` is flagged as implemented.
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool supported) {
+        supported = interfaceId == 0x80ac58cd || interfaceId == 0x5b5e139f;
+    }
+
+    /// @notice Approves `tokenId` from `msg.sender` 'owner' or 'operator' to be spent by `spender`.
+    /// @param spender Address of the party that can pull `tokenId` from 'owner''s account.
+    /// @param tokenId The Id to approve for `spender`.
+    function approve(address spender, uint256 tokenId) external {
+        address owner = ownerOf[tokenId];
+        require(msg.sender == owner || isApprovedForAll[owner][msg.sender], ""NOT_APPROVED"");
+        getApproved[tokenId] = spender;
+        emit Approval(owner, spender, tokenId);
+    }
+
+    /// @notice Approves an 'operator' for `msg.sender` 'owner' that can spend or {approve} spends of 'owner''s `tokenId`s.
+    /// @param operator Address of the party that can pull `tokenId`s from 'owner''s account or approve others to do same.
+    /// @param approved The approval status of `operator`.
+    function setApprovalForAll(address operator, bool approved) external {
+        isApprovedForAll[msg.sender][operator] = approved;
+        emit ApprovalForAll(msg.sender, operator, approved);
+    }
+
+    /// @notice Transfers `tokenId` from 'owner' to `recipient`. Caller needs ownership.
+    /// @param recipient The address to move `tokenId` to.
+    /// @param tokenId The Id to move.
+    function transfer(address recipient, uint256 tokenId) external {
+        require(msg.sender == ownerOf[tokenId], ""NOT_OWNER"");
+        /// @dev This is safe from under/overflow -
+        // ownership is checked against decrement,
+        // and sum of all user balances can't reasonably exceed type(uint256).max (see {_mint}).
+        unchecked {
+            balanceOf[msg.sender]--;
+            balanceOf[recipient]++;
+        }
+        delete getApproved[tokenId];
+        ownerOf[tokenId] = recipient;
+        emit Transfer(msg.sender, recipient, tokenId);
+    }
+
+    /// @notice Transfers `tokenId` from 'owner' to `recipient`. Caller needs ownership or approval from 'owner'.
+    /// @param recipient The address to move `tokenId` to.
+    /// @param tokenId The Id to move.
+    function transferFrom(
+        address,
+        address recipient,
+        uint256 tokenId
+    ) public {
+        address owner = ownerOf[tokenId];
+        require(msg.sender == owner || msg.sender == getApproved[tokenId] || isApprovedForAll[owner][msg.sender], ""NOT_APPROVED"");
+        /// @dev This is safe from under/overflow -
+        // ownership is checked against decrement,
+        // and sum of all user balances can't reasonably exceed type(uint256).max (see {_mint}).
+        unchecked {
+            balanceOf[owner]--;
+            balanceOf[recipient]++;
+        }
+        delete getApproved[tokenId];
+        ownerOf[tokenId] = recipient;
+        emit Transfer(owner, recipient, tokenId);
+    }
+
+    /// @notice Transfers `tokenId` from 'owner' to `recipient` with no data. Caller needs ownership or approval from 'owner',
+    /// and `recipient` must have compatible {onERC721Received} function.
+    /// @param recipient The address to move `tokenId` to.
+    /// @param tokenId The Id to move.
+    function safeTransferFrom(
+        address,
+        address recipient,
+        uint256 tokenId
+    ) external {
+        safeTransferFrom(address(0), recipient, tokenId, """");
+    }
+
+    /// @notice Transfers `tokenId` from 'owner' to `recipient` with data. Caller needs ownership or approval from 'owner',
+    /// and `recipient` must have compatible {onERC721Received} function.
+    /// @param recipient The address to move `tokenId` to.
+    /// @param tokenId The Id to move.
+    function safeTransferFrom(
+        address,
+        address recipient,
+        uint256 tokenId,
+        bytes memory data
+    ) public {
+        transferFrom(address(0), recipient, tokenId);
+        if (recipient.code.length != 0) {
+            /// @dev `onERC721Received(address,address,uint,bytes)`.
+            (, bytes memory returned) = recipient.staticcall(abi.encodeWithSelector(0x150b7a02, msg.sender, address(0), tokenId, data));
+            bytes4 selector = abi.decode(returned, (bytes4));
+            require(selector == 0x150b7a02, ""NOT_ERC721_RECEIVER"");
+        }
+    }
+
+    /// @notice Triggers an approval from 'owner' to `spender` for a given `tokenId`.
+    /// @param spender The address to be approved.
+    /// @param tokenId The Id that is approved for `spender`.
+    /// @param deadline The time at which to expire the signature.
+    /// @param v The recovery byte of the signature.
+    /// @param r Half of the ECDSA signature pair.
+    /// @param s Half of the ECDSA signature pair.
+    function permit(
+        address spender,
+        uint256 tokenId,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        require(deadline >= block.timestamp, ""PERMIT_DEADLINE_EXPIRED"");
+        address owner = ownerOf[tokenId];
+        /// @dev This is reasonably safe from overflow - incrementing `nonces` beyond
+        // 'type(uint256).max' is exceedingly unlikely compared to optimization benefits.
+        unchecked {
+            bytes32 digest = keccak256(
+                abi.encodePacked(
+                    ""\x19\x01"",
+                    DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(PERMIT_TYPEHASH, spender, tokenId, nonces[tokenId]++, deadline))
+                )
+            );
+            address recoveredAddress = ecrecover(digest, v, r, s);
+            require(
+                (recoveredAddress != address(0) && recoveredAddress == owner) || isApprovedForAll[owner][recoveredAddress],
+                ""INVALID_PERMIT_SIGNATURE""
+            );
+        }
+        getApproved[tokenId] = spender;
+        emit Approval(owner, spender, tokenId);
+    }
+
+    /// @notice Triggers an approval from 'owner' to `operator` that can spend or {approve} spends of 'owner''s `tokenId`s.
+    /// @param owner The address to be approved.
+    /// @param operator Address of the party that can pull `tokenId`s from 'owner''s account or approve others to do same.
+    /// @param deadline The time at which to expire the signature.
+    /// @param v The recovery byte of the signature.
+    /// @param r Half of the ECDSA signature pair.
+    /// @param s Half of the ECDSA signature pair.
+    function permitAll(
+        address owner,
+        address operator,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        require(deadline >= block.timestamp, ""PERMIT_DEADLINE_EXPIRED"");
+        /// @dev This is reasonably safe from overflow - incrementing `nonces` beyond
+        // 'type(uint256).max' is exceedingly unlikely compared to optimization benefits.
+        unchecked {
+            bytes32 digest = keccak256(
+                abi.encodePacked(
+                    ""\x19\x01"",
+                    DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(PERMIT_ALL_TYPEHASH, owner, operator, noncesForAll[owner]++, deadline))
+                )
+            );
+            address recoveredAddress = ecrecover(digest, v, r, s);
+            require(
+                (recoveredAddress != address(0) && recoveredAddress == owner) || isApprovedForAll[owner][recoveredAddress],
+                ""INVALID_PERMIT_SIGNATURE""
+            );
+        }
+        isApprovedForAll[owner][operator] = true;
+        emit ApprovalForAll(owner, operator, true);
+    }
+
+    function _mint(address recipient) internal {
+        /// @dev This is reasonably safe from overflow - incrementing beyond
+        // 'type(uint256).max' is exceedingly unlikely compared to optimization benefits.
+        unchecked {
+            uint256 tokenId = totalSupply++;
+            require(ownerOf[tokenId] == address(0), ""ALREADY_MINTED"");
+            balanceOf[recipient]++;
+            ownerOf[tokenId] = recipient;
+            emit Transfer(address(0), recipient, tokenId);
+        }
+    }
+
+    function _burn(uint256 tokenId) internal {
+        address owner = ownerOf[tokenId];
+        require(owner != address(0), ""NOT_MINTED"");
+        /// @dev This is safe from underflow - balance of any 'owner' is greater than 0.
+        unchecked {
+            balanceOf[owner]--;
+        }
+        delete ownerOf[tokenId];
+        emit Transfer(owner, address(0), tokenId);
+    }
+}",2621.0,256.0,"***[M-05] TridentNFT.permit should always check recoveredAddress != 0***
+The `TridentNFT.permit` function ignores the `recoveredAddress != 0` check if `isApprovedForAll[owner][recoveredAddress]` is true.
+If a user accidentally set the zero address as the operator, tokens can be stolen by anyone as a wrong signature yield `recoveredAddress == 0`.",1.0,"pragma solidity >=0.8.0;
+
+
+
+
+
+
+abstract contract TridentNFT {
+    event Transfer(address indexed sender, address indexed recipient, uint256 indexed tokenId);
+    event Approval(address indexed owner, address indexed spender, uint256 indexed tokenId);
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    string public constant name = ""TridentNFT"";
+    string public constant symbol = ""tNFT"";
+    
+    uint256 public totalSupply;
+    
+    mapping(address => uint256) public balanceOf;
+    
+    mapping(uint256 => address) public ownerOf;
+    
+    mapping(uint256 => address) public getApproved;
+    
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+    
+    bytes32 public constant PERMIT_TYPEHASH = keccak256(""Permit(address spender,uint256 tokenId,uint256 nonce,uint256 deadline)"");
+    
+    bytes32 public constant PERMIT_ALL_TYPEHASH = keccak256(""Permit(address owner,address spender,uint256 nonce,uint256 deadline)"");
+
+    
+    uint256 internal immutable DOMAIN_SEPARATOR_CHAIN_ID;
+    
+    bytes32 internal immutable _DOMAIN_SEPARATOR;
+    
+    mapping(uint256 => uint256) public nonces;
+    
+    mapping(address => uint256) public noncesForAll;
+
+    constructor() {
+        DOMAIN_SEPARATOR_CHAIN_ID = block.chainid;
+        _DOMAIN_SEPARATOR = _calculateDomainSeparator();
+    }
+
+    function _calculateDomainSeparator() internal view returns (bytes32 domainSeperator) {
+        domainSeperator = keccak256(
+            abi.encode(
+                keccak256(""EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)""),
+                keccak256(bytes(name)),
+                keccak256(bytes(""1"")),
+                block.chainid,
+                address(this)
+            )
+        );
+    }
+
+    
+    function DOMAIN_SEPARATOR() public view returns (bytes32 domainSeperator) {
+        domainSeperator = block.chainid == DOMAIN_SEPARATOR_CHAIN_ID ? _DOMAIN_SEPARATOR : _calculateDomainSeparator();
+    }
+
+    
+    
+    
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool supported) {
+        supported = interfaceId == 0x80ac58cd || interfaceId == 0x5b5e139f;
+    }
+
+    
+    
+    
+    function approve(address spender, uint256 tokenId) external {
+        address owner = ownerOf[tokenId];
+        require(msg.sender == owner || isApprovedForAll[owner][msg.sender], ""NOT_APPROVED"");
+        getApproved[tokenId] = spender;
+        emit Approval(owner, spender, tokenId);
+    }
+
+    
+    
+    
+    function setApprovalForAll(address operator, bool approved) external {
+        isApprovedForAll[msg.sender][operator] = approved;
+        emit ApprovalForAll(msg.sender, operator, approved);
+    }
+
+    
+    
+    
+    function transfer(address recipient, uint256 tokenId) external {
+        require(msg.sender == ownerOf[tokenId], ""NOT_OWNER"");
+        
+        
+        
+        unchecked {
+            balanceOf[msg.sender]--;
+            balanceOf[recipient]++;
+        }
+        delete getApproved[tokenId];
+        ownerOf[tokenId] = recipient;
+        emit Transfer(msg.sender, recipient, tokenId);
+    }
+
+    
+    
+    
+    function transferFrom(
+        address,
+        address recipient,
+        uint256 tokenId
+    ) public {
+        address owner = ownerOf[tokenId];
+        require(msg.sender == owner || msg.sender == getApproved[tokenId] || isApprovedForAll[owner][msg.sender], ""NOT_APPROVED"");
+        
+        
+        
+        unchecked {
+            balanceOf[owner]--;
+            balanceOf[recipient]++;
+        }
+        delete getApproved[tokenId];
+        ownerOf[tokenId] = recipient;
+        emit Transfer(owner, recipient, tokenId);
+    }
+
+    
+    
+    
+    
+    function safeTransferFrom(
+        address,
+        address recipient,
+        uint256 tokenId
+    ) external {
+        safeTransferFrom(address(0), recipient, tokenId, """");
+    }
+
+    
+    
+    
+    
+    function safeTransferFrom(
+        address,
+        address recipient,
+        uint256 tokenId,
+        bytes memory data
+    ) public {
+        transferFrom(address(0), recipient, tokenId);
+        if (recipient.code.length != 0) {
+            
+            (, bytes memory returned) = recipient.staticcall(abi.encodeWithSelector(0x150b7a02, msg.sender, address(0), tokenId, data));
+            bytes4 selector = abi.decode(returned, (bytes4));
+            require(selector == 0x150b7a02, ""NOT_ERC721_RECEIVER"");
+        }
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function permit(
+        address spender,
+        uint256 tokenId,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        require(deadline >= block.timestamp, ""PERMIT_DEADLINE_EXPIRED"");
+        address owner = ownerOf[tokenId];
+        
+        
+        unchecked {
+            bytes32 digest = keccak256(
+                abi.encodePacked(
+                    ""\x19\x01"",
+                    DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(PERMIT_TYPEHASH, spender, tokenId, nonces[tokenId]++, deadline))
+                )
+            );
+            address recoveredAddress = ecrecover(digest, v, r, s);
+            require(
+                (recoveredAddress != address(0) && recoveredAddress == owner) || isApprovedForAll[owner][recoveredAddress],
+                ""INVALID_PERMIT_SIGNATURE""
+            );
+        }
+        getApproved[tokenId] = spender;
+        emit Approval(owner, spender, tokenId);
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function permitAll(
+        address owner,
+        address operator,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        require(deadline >= block.timestamp, ""PERMIT_DEADLINE_EXPIRED"");
+        
+        
+        unchecked {
+            bytes32 digest = keccak256(
+                abi.encodePacked(
+                    ""\x19\x01"",
+                    DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(PERMIT_ALL_TYPEHASH, owner, operator, noncesForAll[owner]++, deadline))
+                )
+            );
+            address recoveredAddress = ecrecover(digest, v, r, s);
+            require(
+                (recoveredAddress != address(0) && recoveredAddress == owner) || isApprovedForAll[owner][recoveredAddress],
+                ""INVALID_PERMIT_SIGNATURE""
+            );
+        }
+        isApprovedForAll[owner][operator] = true;
+        emit ApprovalForAll(owner, operator, true);
+    }
+
+    function _mint(address recipient) internal {
+        
+        
+        unchecked {
+            uint256 tokenId = totalSupply++;
+            require(ownerOf[tokenId] == address(0), ""ALREADY_MINTED"");
+            balanceOf[recipient]++;
+            ownerOf[tokenId] = recipient;
+            emit Transfer(address(0), recipient, tokenId);
+        }
+    }
+
+    function _burn(uint256 tokenId) internal {
+        address owner = ownerOf[tokenId];
+        require(owner != address(0), ""NOT_MINTED"");
+        
+        unchecked {
+            balanceOf[owner]--;
+        }
+        delete ownerOf[tokenId];
+        emit Transfer(owner, address(0), tokenId);
+    }
+}",1441.0,0,1,"<think>
+Let's analyze this contract for potential vulnerabilities.
+
+1. **Lack of Access Control for _mint and _burn**: These functions are internal, so they can only be called by derived contracts. However, without seeing the full implementation of derived contracts, it's unclear if proper access control is implemented. If these functions are exposed without proper checks, unauthorized minting or burning could occur.
+
+2. **transferFrom Parameter Ignores the First Parameter**: In `transferFrom(address, address recipient, uint256 tokenId)`, the first parameter (which should be the 'from' address) is unused. The function always uses `ownerOf[tokenId]` as the owner. This is not a critical vulnerability, but it's a design issue that could lead to unexpected behavior.
+
+3. **safeTransferFrom Has a Similar Issue**: Both versions of `safeTransferFrom` ignore the first parameter and pass `address(0)` to `transferFrom`. This could cause confusion and potential issues in integrations.
+
+4. **Unchecked Block in Permit Functions**: The `permit` and `permitAll` functions use unchecked blocks without proper bounds checking. While it's unlikely to cause overflows in this context (since it's mostly signature verification), it's a pattern that requires scrutiny.
+
+5. **Reentrancy in safeTransferFrom**: The `safeTransferFrom` method calls an external contract after updating state. While it uses staticcall, which doesn't allow state changes, it could still expose the contract to re-entrancy through other vectors.
+
+6. **No Check for Zero Address in Transfer Functions**: The contract doesn't check if the recipient is the zero address in transfer functions, which could lead to tokens being accidentally lost.
+
+7. **Potential Race Condition in Permit**: The permit functions rely on deadline, but in a high throughput environment, there could be race conditions.
+
+Let me check further for more specialized vulnerabilities:
+
+8. **Potential Signature Replay Attacks**: While the contract uses nonces for permit functions, it's important to ensure these are properly incremented.
+
+9. **Missing Tokenomics Controls**: No cap on total supply or minting rate controls, which could lead to inflation if not properly managed in inheriting contracts.
+
+10. **Potential Overflow in Unchecked Blocks**: The unchecked blocks in transfer functions could lead to overflow/underflow if not properly managed, but since the contract requires Solidity 0.8.0+, this is mitigated by default checks.
+
+11. **Possible Frontrunning in Permit Functions**: The permit functions could be vulnerable to frontrunning attacks where an attacker watches the mempool for permit transactions and frontrun them.
+
+12. **Missing Implementation of tokenURI or tokenMetadata**: Standard ERC721 functionality for metadata is missing.
+</think># Vulnerabilities in TridentNFT Contract
+
+## 1. Unused Parameters in Transfer Functions
+- In `transferFrom()` and `safeTransferFrom()`, the first parameter (from address) is ignored. The function uses `ownerOf[tokenId]` instead.
+- This can cause confusion and unexpected behavior when integrating with other contracts.
+
+## 2. Incorrect Implementation of safeTransferFrom
+- Both `safeTransferFrom` implementations call `transferFrom(address(0), recipient, tokenId)` passing zero address as the from parameter.
+- This is not only ignoring the actual sender but is semantically incorrect.
+
+## 3. Missing Zero Address Validation
+- No checks to prevent transfers to the zero address, potentially leading to permanent token loss.
+
+## 4. Deficient ERC721 Compliance
+- Missing essential functions like `tokenURI()` that are required for full ERC721 compliance.
+- `supportsInterface()` claims compatibility with ERC721 but doesn't implement all required functionality.
+
+## 5. Weak Interface Detection
+- The `supportsInterface` function is hardcoded to only recognize specific interfaces (0x80ac58cd and 0x5b5e139f) instead of properly checking all implemented interfaces.
+
+## 6. Potential Token ID Collisions
+- In `_mint()`, the function increments `totalSupply` to generate new token IDs without checking if the specific ID is already in use.
+- The check for `ownerOf[tokenId] == address(0)` comes after incrementing `totalSupply`.
+
+## 7. Potential Signature Replay Across Chains
+- While there is a chain ID check, the permit system could still be vulnerable to replay attacks if multiple contracts with the same address exist across different networks.
+
+## 8. Inadequate Error Handling
+- Error messages are minimal and may not provide sufficient information to diagnose issues when transactions fail.
+
+## 9. Lack of Role-Based Access Control
+- No clear access control system for critical functions like `_mint` and `_burn`, relying entirely on inheriting contracts to implement properly.
+
+## 10. Missing Documentation
+- Limited documentation on function behaviors and security considerations, which can lead to misuse by inheriting contracts.","---
+
+**[M-05] TridentNFT.permit should always check recoveredAddress != 0**
+
+**Report Description**:
+The `TridentNFT.permit` function ignores the `recoveredAddress != 0` check if `isApprovedForAll[owner][recoveredAddress]` is true. If a user accidentally sets the zero address as the operator, tokens can be stolen by anyone because a wrong signature yields `recoveredAddress == 0`. This oversight could lead to unauthorized token transfers and potential theft.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of missing `recoveredAddress != 0` checks in the `permit` function. While the response list covers other vulnerabilities such as unused parameters, missing zero address validation, and potential signature replay attacks, it fails to identify or address the critical issue of not validating the `recoveredAddress` in the `permit` function. This omission leaves the contract vulnerable to token theft, as described in the issue report.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[M-05] TridentNFT.permit should always check recoveredAddress != 0**
+
+--- 
+
+**Analysis**:
+The response list provides a comprehensive analysis of various vulnerabilities in the `TridentNFT` contract, including issues like unused parameters, missing zero address validation, and potential signature replay attacks. However, it fails to address the specific issue of missing `recoveredAddress != 0` checks in the `permit` function, which is a critical security oversight. This gap highlights the importance of thoroughly reviewing all aspects of a contract, especially those involving sensitive operations like token transfers and approvals.",0,0,1,10,"```
+None.
+```",0.0,0,28.73208999633790,3290.0,3.0
+,,,,,,,,15,4,,,2,1,16,44,,,0.5909,,,

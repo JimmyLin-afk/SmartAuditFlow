@@ -1,0 +1,2798 @@
+nameid,code,tokens,loc,issue,vulnumber,code_snippet,processtokens,high_severity_count,medium_severity_count,Findings,Comparison,Correct Matches,Partially Correct,Missed,GPT-generated,matchList,MAP,Score
+UToken.sol,"//SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.4;
+pragma abicoder v1;
+
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""../Controller.sol"";
+import ""../interfaces/IUserManager.sol"";
+import ""../interfaces/IAssetManager.sol"";
+import ""../interfaces/IUErc20.sol"";
+import ""../interfaces/IInterestRateModel.sol"";
+
+/**
+ *  @title UToken Contract
+ *  @dev Union accountBorrows can borrow and repay thru this component.
+ */
+contract UToken is Controller, ReentrancyGuardUpgradeable {
+    using SafeERC20Upgradeable for IUErc20;
+
+    bool public constant IS_UTOKEN = true;
+    uint256 public constant WAD = 1e18;
+    uint256 internal constant BORROW_RATE_MAX_MANTISSA = 0.0005e16; //Maximum borrow rate that can ever be applied (.0005% / block)
+    uint256 internal constant RESERVE_FACTORY_MAX_MANTISSA = 1e18; //Maximum fraction of interest that can be set aside for reserves
+
+    address public underlying;
+    IInterestRateModel public interestRateModel;
+    uint256 internal initialExchangeRateMantissa; //Initial exchange rate used when minting the first UTokens (used when totalSupply = 0)
+    uint256 public reserveFactorMantissa; //Fraction of interest currently set aside for reserves
+    uint256 public accrualBlockNumber; //Block number that interest was last accrued at
+    uint256 public borrowIndex; //Accumulator of the total earned interest rate since the opening of the market
+    uint256 public totalBorrows; //Total amount of outstanding borrows of the underlying in this market
+    uint256 public totalReserves; //Total amount of reserves of the underlying held in this marke
+    uint256 public totalRedeemable; //Calculates the exchange rate from the underlying to the uToken
+    uint256 public overdueBlocks; //overdue duration, based on the number of blocks
+    uint256 public originationFee;
+    uint256 public debtCeiling; //The debt limit for the whole system
+    uint256 public maxBorrow;
+    uint256 public minBorrow;
+    address public assetManager;
+    address public userManager;
+    IUErc20 public uErc20;
+
+    struct BorrowSnapshot {
+        uint256 principal;
+        uint256 interest;
+        uint256 interestIndex;
+        uint256 lastRepay; //Calculate if it is overdue
+    }
+
+    /**
+     * @notice Mapping of account addresses to outstanding borrow balances
+     */
+    mapping(address => BorrowSnapshot) internal accountBorrows;
+
+    /**
+     *  @dev Change of the interest rate model
+     *  @param oldInterestRateModel Old interest rate model address
+     *  @param newInterestRateModel New interest rate model address
+     */
+    event LogNewMarketInterestRateModel(address oldInterestRateModel, address newInterestRateModel);
+
+    event LogMint(address minter, uint256 underlyingAmount, uint256 uTokenAmount);
+
+    event LogRedeem(address redeemer, uint256 redeemTokensIn, uint256 redeemAmountIn, uint256 redeemAmount);
+
+    event LogReservesAdded(address reserver, uint256 actualAddAmount, uint256 totalReservesNew);
+
+    event LogReservesReduced(address receiver, uint256 reduceAmount, uint256 totalReservesNew);
+
+    /**
+     *  @dev Event borrow
+     *  @param account Member address
+     *  @param amount Borrow amount
+     *  @param fee Origination fee
+     */
+    event LogBorrow(address indexed account, uint256 amount, uint256 fee);
+
+    /**
+     *  @dev Event repay
+     *  @param account Member address
+     *  @param amount Repay amount
+     */
+    event LogRepay(address indexed account, uint256 amount);
+
+    /**
+     *  @dev modifier limit member
+     */
+    modifier onlyMember(address account) {
+        require(IUserManager(userManager).checkIsMember(account), ""UToken: caller is not a member"");
+        _;
+    }
+
+    modifier onlyAssetManager() {
+        require(msg.sender == assetManager, ""UToken: caller is not assetManager"");
+        _;
+    }
+
+    modifier onlyUserManager() {
+        require(msg.sender == userManager, ""UToken: caller is not userManager"");
+        _;
+    }
+
+    function __UToken_init(
+        IUErc20 uErc20_,
+        address underlying_,
+        uint256 initialExchangeRateMantissa_,
+        uint256 reserveFactorMantissa_,
+        uint256 originationFee_,
+        uint256 debtCeiling_,
+        uint256 maxBorrow_,
+        uint256 minBorrow_,
+        uint256 overdueBlocks_,
+        address admin_
+    ) public initializer {
+        require(initialExchangeRateMantissa_ > 0, ""initial exchange rate must be greater than zero."");
+        require(address(underlying_) != address(0), ""underlying token is zero"");
+        require(
+            reserveFactorMantissa_ >= 0 && reserveFactorMantissa_ <= RESERVE_FACTORY_MAX_MANTISSA,
+            ""reserveFactorMantissa error""
+        );
+        uErc20 = uErc20_;
+        Controller.__Controller_init(admin_);
+        ReentrancyGuardUpgradeable.__ReentrancyGuard_init();
+        underlying = underlying_;
+        originationFee = originationFee_;
+        debtCeiling = debtCeiling_;
+        maxBorrow = maxBorrow_;
+        minBorrow = minBorrow_;
+        overdueBlocks = overdueBlocks_;
+        initialExchangeRateMantissa = initialExchangeRateMantissa_;
+        reserveFactorMantissa = reserveFactorMantissa_;
+        accrualBlockNumber = getBlockNumber();
+        borrowIndex = WAD;
+    }
+
+    function setAssetManager(address assetManager_) external onlyAdmin {
+        assetManager = assetManager_;
+    }
+
+    function setUserManager(address userManager_) external onlyAdmin {
+        userManager = userManager_;
+    }
+
+    /**
+     *  @dev Change loan origination fee value
+     *  Accept claims only from the admin
+     *  @param originationFee_ Fees deducted for each loan transaction
+     */
+    function setOriginationFee(uint256 originationFee_) external onlyAdmin {
+        originationFee = originationFee_;
+    }
+
+    /**
+     *  @dev Update the market debt ceiling to a fixed amount, for example, 1 billion DAI etc.
+     *  Accept claims only from the admin
+     *  @param debtCeiling_ The debt limit for the whole system
+     */
+    function setDebtCeiling(uint256 debtCeiling_) external onlyAdmin {
+        debtCeiling = debtCeiling_;
+    }
+
+    /**
+     *  @dev Update the minimum loan size
+     *  Accept claims only from the admin
+     *  @param minBorrow_ Minimum loan amount per user
+     */
+    function setMinBorrow(uint256 minBorrow_) external onlyAdmin {
+        minBorrow = minBorrow_;
+    }
+
+    /**
+     *  @dev Update the max loan size
+     *  Accept claims only from the admin
+     *  @param maxBorrow_ Max loan amount per user
+     */
+    function setMaxBorrow(uint256 maxBorrow_) external onlyAdmin {
+        maxBorrow = maxBorrow_;
+    }
+
+    /**
+     *  @dev Change loan overdue duration, based on the number of blocks
+     *  Accept claims only from the admin
+     *  @param overdueBlocks_ Maximum late repayment block. The number of arrivals is a default
+     */
+    function setOverdueBlocks(uint256 overdueBlocks_) external onlyAdmin {
+        overdueBlocks = overdueBlocks_;
+    }
+
+    /**
+     *  @dev Change to a different interest rate model
+     *  Accept claims only from the admin
+     *  @param newInterestRateModel New interest rate model address
+     */
+    function setInterestRateModel(address newInterestRateModel) external onlyAdmin {
+        _setInterestRateModelFresh(newInterestRateModel);
+    }
+
+    function setReserveFactor(uint256 reserveFactorMantissa_) external onlyAdmin {
+        require(
+            reserveFactorMantissa_ >= 0 && reserveFactorMantissa_ <= RESERVE_FACTORY_MAX_MANTISSA,
+            ""reserveFactorMantissa error""
+        );
+        reserveFactorMantissa = reserveFactorMantissa_;
+    }
+
+    /**
+     *  @dev Returns the remaining amount that can be borrowed from the market.
+     *  @return Remaining total amount
+     */
+    function getRemainingLoanSize() public view returns (uint256) {
+        if (debtCeiling >= totalBorrows) {
+            return debtCeiling - totalBorrows;
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     *  @dev Get the last repay block
+     *  @param account Member address
+     *  @return lastRepay
+     */
+    function getLastRepay(address account) public view returns (uint256 lastRepay) {
+        lastRepay = accountBorrows[account].lastRepay;
+    }
+
+    /**
+     *  @dev Get member interest index
+     *  @param account Member address
+     *  @return interestIndex
+     */
+    function getInterestIndex(address account) public view returns (uint256 interestIndex) {
+        interestIndex = accountBorrows[account].interestIndex;
+    }
+
+    /**
+     *  @dev Check if the member's loan is overdue
+     *  @param account Member address
+     *  @return isOverdue
+     */
+    function checkIsOverdue(address account) public view returns (bool isOverdue) {
+        if (getBorrowed(account) == 0) {
+            isOverdue = false;
+        } else {
+            uint256 lastRepay = getLastRepay(account);
+            uint256 diff = getBlockNumber() - lastRepay;
+            isOverdue = (overdueBlocks < diff);
+        }
+    }
+
+    /**
+     *  @dev Get the origination fee
+     *  @param amount Amount to be calculated
+     *  @return Handling fee
+     */
+    function calculatingFee(uint256 amount) public view returns (uint256) {
+        return (originationFee * amount) / WAD;
+    }
+
+    /**
+     *  @dev Get member loan data
+     *  @param member Member address
+     *  @return principal totalBorrowed asset apr limit isOverdue lastRepay
+     */
+    function getLoan(address member)
+        public
+        view
+        returns (
+            uint256 principal,
+            uint256 totalBorrowed,
+            address asset,
+            uint256 apr,
+            int256 limit,
+            bool isOverdue,
+            uint256 lastRepay
+        )
+    {
+        principal = accountBorrows[msg.sender].principal;
+        totalBorrowed = borrowBalanceStoredInternal(member);
+        asset = underlying;
+        apr = borrowRatePerBlock();
+        lastRepay = getLastRepay(member);
+        limit = _getCreditLimit(member);
+        isOverdue = checkIsOverdue(member);
+    }
+
+    /**
+     *  @dev Get the borrowed principle
+     *  @param account Member address
+     *  @return borrowed
+     */
+    function getBorrowed(address account) public view returns (uint256 borrowed) {
+        borrowed = accountBorrows[account].principal;
+    }
+
+    /**
+     *  @dev Get a member's current owed balance, including the principle and interest but without updating the user's states.
+     *  @param account Member address
+     *  @return Borrowed amount
+     */
+    function borrowBalanceView(address account) public view returns (uint256) {
+        return accountBorrows[account].principal + calculatingInterest(account);
+    }
+
+    /**
+     *  @dev Get a member's total owed, including the principle and the interest calculated based on the interest index.
+     *  @param account Member address
+     *  @return Borrowed amount
+     */
+    function borrowBalanceStoredInternal(address account) internal view returns (uint256) {
+        BorrowSnapshot memory loan = accountBorrows[account];
+
+        /* If borrowBalance = 0 then borrowIndex is likely also 0.
+         * Rather than failing the calculation with a division by 0, we immediately return 0 in this case.
+         */
+        if (loan.principal == 0) {
+            return 0;
+        }
+
+        uint256 principalTimesIndex = (loan.principal + loan.interest) * borrowIndex;
+        return principalTimesIndex / loan.interestIndex;
+    }
+
+    /**
+     *  @dev Get the borrowing interest rate per block
+     *  @return Borrow rate
+     */
+    function borrowRatePerBlock() public view returns (uint256) {
+        uint256 borrowRateMantissa = interestRateModel.getBorrowRate();
+        require(borrowRateMantissa <= BORROW_RATE_MAX_MANTISSA, ""borrow rate is absurdly high"");
+        return borrowRateMantissa;
+    }
+
+    /**
+     * @notice Returns the current per-block supply interest rate for this UToken
+     * @return The supply interest rate per block, scaled by 1e18
+     */
+    function supplyRatePerBlock() public view returns (uint256) {
+        return interestRateModel.getSupplyRate(reserveFactorMantissa);
+    }
+
+    /**
+     * @notice Accrue interest then return the up-to-date exchange rate
+     * @return Calculated exchange rate scaled by 1e18
+     */
+    function exchangeRateCurrent() public nonReentrant returns (uint256) {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        return exchangeRateStored();
+    }
+
+    /**
+     * @notice Calculates the exchange rate from the underlying to the UToken
+     * @dev This function does not accrue interest before calculating the exchange rate
+     * @return Calculated exchange rate scaled by 1e18
+     */
+    function exchangeRateStored() public view returns (uint256) {
+        uint256 totalSupply_ = uErc20.totalSupply();
+        if (totalSupply_ == 0) {
+            return initialExchangeRateMantissa;
+        } else {
+            return (totalRedeemable * WAD) / totalSupply_;
+        }
+    }
+
+    /**
+     *  @dev Calculating member's borrowed interest
+     *  @param account Member address
+     *  @return Interest amount
+     */
+    function calculatingInterest(address account) public view returns (uint256) {
+        BorrowSnapshot memory loan = accountBorrows[account];
+
+        if (loan.principal == 0) {
+            return 0;
+        }
+
+        uint256 borrowRate = borrowRatePerBlock();
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 blockDelta = currentBlockNumber - accrualBlockNumber;
+        uint256 simpleInterestFactor = borrowRate * blockDelta;
+        uint256 borrowIndexNew = (simpleInterestFactor * borrowIndex) / WAD + borrowIndex;
+
+        uint256 principalTimesIndex = (loan.principal + loan.interest) * borrowIndexNew;
+        uint256 balance = principalTimesIndex / loan.interestIndex;
+
+        return balance - accountBorrows[account].principal;
+    }
+
+    /**
+     *  @dev Borrowing from the market
+     *  Accept claims only from the member
+     *  Borrow amount must in the range of creditLimit, minBorrow, maxBorrow, debtCeiling and not overdue
+     *  @param amount Borrow amount
+     */
+    function borrow(uint256 amount) external onlyMember(msg.sender) whenNotPaused nonReentrant {
+        IAssetManager assetManagerContract = IAssetManager(assetManager);
+        require(amount >= minBorrow, ""UToken: amount less than loan size min"");
+
+        require(amount <= getRemainingLoanSize(), ""UToken: amount more than loan global size max"");
+
+        uint256 fee = calculatingFee(amount);
+        require(borrowBalanceView(msg.sender) + amount + fee <= maxBorrow, ""UToken: amount large than borrow size max"");
+
+        require(!checkIsOverdue(msg.sender), ""UToken: Member has loans overdue"");
+
+        require(amount <= assetManagerContract.getLoanableAmount(underlying), ""UToken: Not enough to lend out"");
+        require(
+            uint256(_getCreditLimit(msg.sender)) >= amount + fee,
+            ""UToken: The loan amount plus fee is greater than credit limit""
+        );
+
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+
+        uint256 borrowedAmount = borrowBalanceStoredInternal(msg.sender);
+
+        //Set lastRepay init data
+        if (accountBorrows[msg.sender].lastRepay == 0) {
+            accountBorrows[msg.sender].lastRepay = getBlockNumber();
+        }
+
+        uint256 accountBorrowsNew = borrowedAmount + amount + fee;
+        uint256 totalBorrowsNew = totalBorrows + amount + fee;
+        uint256 oldPrincipal = accountBorrows[msg.sender].principal;
+
+        accountBorrows[msg.sender].principal += amount + fee;
+        uint256 newPrincipal = accountBorrows[msg.sender].principal;
+        IUserManager(userManager).updateLockedData(msg.sender, newPrincipal - oldPrincipal, true);
+        accountBorrows[msg.sender].interest = accountBorrowsNew - accountBorrows[msg.sender].principal;
+        accountBorrows[msg.sender].interestIndex = borrowIndex;
+        totalBorrows = totalBorrowsNew;
+        // The origination fees contribute to the reserve
+        totalReserves += fee;
+
+        require(assetManagerContract.withdraw(underlying, msg.sender, amount), ""UToken: Failed to withdraw"");
+
+        emit LogBorrow(msg.sender, amount, fee);
+    }
+
+    function repayBorrow(uint256 repayAmount) external whenNotPaused nonReentrant {
+        _repayBorrowFresh(msg.sender, msg.sender, repayAmount);
+    }
+
+    function repayBorrowBehalf(address borrower, uint256 repayAmount) external whenNotPaused nonReentrant {
+        _repayBorrowFresh(msg.sender, borrower, repayAmount);
+    }
+
+    /**
+     *  @dev Repay the loan
+     *  Accept claims only from the member
+     *  Updated member lastPaymentEpoch only when the repayment amount is greater than interest
+     *  @param payer Payer address
+     *  @param borrower Borrower address
+     *  @param amount Repay amount
+     */
+    function _repayBorrowFresh(
+        address payer,
+        address borrower,
+        uint256 amount
+    ) private {
+        IUErc20 assetToken = IUErc20(underlying);
+        //In order to prevent the state from being changed, put the value at the top
+        bool isOverdue = checkIsOverdue(borrower);
+        uint256 oldPrincipal = accountBorrows[borrower].principal;
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        require(accrualBlockNumber == getBlockNumber(), ""UToken: market not fresh"");
+
+        uint256 interest = calculatingInterest(borrower);
+        uint256 borrowedAmount = borrowBalanceStoredInternal(borrower);
+
+        uint256 repayAmount;
+        if (amount > borrowedAmount) {
+            repayAmount = borrowedAmount;
+        } else {
+            repayAmount = amount;
+        }
+
+        require(repayAmount > 0, ""UToken: repay amount or owed amount is zero"");
+
+        require(assetToken.allowance(payer, address(this)) >= repayAmount, ""UToken: Not enough allowance to repay"");
+
+        uint256 toReserveAmount;
+        uint256 toRedeemableAmount;
+        if (repayAmount >= interest) {
+            toReserveAmount = (interest * reserveFactorMantissa) / WAD;
+            toRedeemableAmount = interest - toReserveAmount;
+
+            if (isOverdue) {
+                IUserManager(userManager).updateTotalFrozen(borrower, false);
+                IUserManager(userManager).repayLoanOverdue(borrower, underlying, accountBorrows[borrower].lastRepay);
+            }
+            accountBorrows[borrower].principal = borrowedAmount - repayAmount;
+            accountBorrows[borrower].interest = 0;
+
+            if (accountBorrows[borrower].principal == 0) {
+                //LastRepay is cleared when the arrears are paid off, and reinitialized the next time the loan is borrowed
+                accountBorrows[borrower].lastRepay = 0;
+            } else {
+                accountBorrows[borrower].lastRepay = getBlockNumber();
+            }
+        } else {
+            toReserveAmount = (repayAmount * reserveFactorMantissa) / WAD;
+            toRedeemableAmount = repayAmount - toReserveAmount;
+            accountBorrows[borrower].interest = interest - repayAmount;
+        }
+
+        totalReserves += toReserveAmount;
+        totalRedeemable += toRedeemableAmount;
+
+        uint256 newPrincipal = accountBorrows[borrower].principal;
+        accountBorrows[borrower].interestIndex = borrowIndex;
+        totalBorrows -= repayAmount;
+
+        IUserManager(userManager).updateLockedData(borrower, oldPrincipal - newPrincipal, false);
+
+        assetToken.safeTransferFrom(payer, address(this), repayAmount);
+
+        assetToken.safeApprove(assetManager, 0);
+        assetToken.safeApprove(assetManager, repayAmount);
+
+        require(IAssetManager(assetManager).deposit(underlying, repayAmount), ""UToken: Deposit failed"");
+
+        emit LogRepay(borrower, repayAmount);
+    }
+
+    function repayBorrowWithPermit(
+        address borrower,
+        uint256 amount,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public whenNotPaused {
+        IUErc20 erc20Token = IUErc20(underlying);
+        erc20Token.permit(msg.sender, address(this), nonce, expiry, true, v, r, s);
+
+        _repayBorrowFresh(msg.sender, borrower, amount);
+    }
+
+    /**
+     *  @dev Accrue interest
+     *  @return Accrue interest finished
+     */
+    function accrueInterest() public returns (bool) {
+        uint256 borrowRate = borrowRatePerBlock();
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 blockDelta = currentBlockNumber - accrualBlockNumber;
+
+        uint256 simpleInterestFactor = borrowRate * blockDelta;
+        uint256 interestAccumulated = (simpleInterestFactor * totalBorrows) / WAD;
+        uint256 totalBorrowsNew = interestAccumulated + totalBorrows;
+        uint256 borrowIndexNew = (simpleInterestFactor * borrowIndex) / WAD + borrowIndex;
+
+        accrualBlockNumber = currentBlockNumber;
+        borrowIndex = borrowIndexNew;
+        totalBorrows = totalBorrowsNew;
+
+        return true;
+    }
+
+    /**
+     * @notice Get the underlying balance of the `owner`
+     * @dev This also accrues interest in a transaction
+     * @param owner The address of the account to query
+     * @return The amount of underlying owned by `owner`
+     */
+    function balanceOfUnderlying(address owner) external returns (uint256) {
+        return exchangeRateCurrent() * uErc20.balanceOf(owner);
+    }
+
+    function mint(uint256 mintAmount) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        uint256 exchangeRate = exchangeRateStored();
+        IUErc20 assetToken = IUErc20(underlying);
+        uint256 balanceBefore = assetToken.balanceOf(address(this));
+        require(assetToken.allowance(msg.sender, address(this)) >= mintAmount, ""UToken: Not enough allowance"");
+        assetToken.safeTransferFrom(msg.sender, address(this), mintAmount);
+        uint256 balanceAfter = assetToken.balanceOf(address(this));
+        uint256 actualMintAmount = balanceAfter - balanceBefore;
+        totalRedeemable += actualMintAmount;
+        uint256 mintTokens = (actualMintAmount * WAD) / exchangeRate;
+        uErc20.mint(msg.sender, mintTokens);
+
+        assetToken.safeApprove(assetManager, 0);
+        assetToken.safeApprove(assetManager, actualMintAmount);
+
+        require(IAssetManager(assetManager).deposit(underlying, actualMintAmount), ""UToken: Deposit failed"");
+
+        emit LogMint(msg.sender, actualMintAmount, mintTokens);
+    }
+
+    /**
+     * @notice Sender redeems uTokens in exchange for the underlying asset
+     * @dev Accrues interest whether or not the operation succeeds, unless reverted
+     * @param redeemTokens The number of uTokens to redeem into underlying
+     */
+    function redeem(uint256 redeemTokens) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        _redeemFresh(payable(msg.sender), redeemTokens, 0);
+    }
+
+    /**
+     * @notice Sender redeems uTokens in exchange for a specified amount of underlying asset
+     * @dev Accrues interest whether or not the operation succeeds, unless reverted
+     * @param redeemAmount The amount of underlying to receive from redeeming uTokens
+     */
+    function redeemUnderlying(uint256 redeemAmount) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        _redeemFresh(payable(msg.sender), 0, redeemAmount);
+    }
+
+    /**
+     * @notice User redeems uTokens in exchange for the underlying asset
+     * @dev Assumes interest has already been accrued up to the current block
+     * @param redeemer The address of the account which is redeeming the tokens
+     * @param redeemTokensIn The number of uTokens to redeem into underlying (only one of redeemTokensIn or redeemAmountIn may be non-zero)
+     * @param redeemAmountIn The number of underlying tokens to receive from redeeming uTokens (only one of redeemTokensIn or redeemAmountIn may be non-zero)
+     */
+    function _redeemFresh(
+        address payable redeemer,
+        uint256 redeemTokensIn,
+        uint256 redeemAmountIn
+    ) internal {
+        require(redeemTokensIn == 0 || redeemAmountIn == 0, ""one of redeemTokensIn or redeemAmountIn must be zero"");
+
+        IAssetManager assetManagerContract = IAssetManager(assetManager);
+
+        uint256 exchangeRate = exchangeRateStored();
+
+        uint256 redeemTokens;
+        uint256 redeemAmount;
+
+        if (redeemTokensIn > 0) {
+            /*
+             * We calculate the exchange rate and the amount of underlying to be redeemed:
+             *  redeemTokens = redeemTokensIn
+             *  redeemAmount = redeemTokensIn x exchangeRateCurrent
+             */
+            redeemTokens = redeemTokensIn;
+            redeemAmount = (redeemTokensIn * exchangeRate) / WAD;
+        } else {
+            /*
+             * We get the current exchange rate and calculate the amount to be redeemed:
+             *  redeemTokens = redeemAmountIn / exchangeRate
+             *  redeemAmount = redeemAmountIn
+             */
+            redeemTokens = (redeemAmountIn * WAD) / exchangeRate;
+            redeemAmount = redeemAmountIn;
+        }
+
+        require(totalRedeemable >= redeemAmount, ""redeem amount error"");
+        totalRedeemable -= redeemAmount;
+        uErc20.burn(redeemer, redeemTokens);
+
+        require(assetManagerContract.withdraw(underlying, redeemer, redeemAmount), ""UToken: Failed to withdraw"");
+
+        emit LogRedeem(redeemer, redeemTokensIn, redeemAmountIn, redeemAmount);
+    }
+
+    function addReserves(uint256 addAmount) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        IUErc20 assetToken = IUErc20(underlying);
+        uint256 balanceBefore = assetToken.balanceOf(address(this));
+        require(assetToken.allowance(msg.sender, address(this)) >= addAmount, ""UToken: Not enough allowance"");
+        assetToken.safeTransferFrom(msg.sender, address(this), addAmount);
+        uint256 balanceAfter = assetToken.balanceOf(address(this));
+        uint256 actualAddAmount = balanceAfter - balanceBefore;
+
+        uint256 totalReservesNew = totalReserves + actualAddAmount;
+        /* Revert on overflow */
+        require(totalReservesNew >= totalReserves, ""add reserves unexpected overflow"");
+        totalReserves = totalReservesNew;
+
+        assetToken.safeApprove(assetManager, 0);
+        assetToken.safeApprove(assetManager, balanceAfter);
+
+        require(IAssetManager(assetManager).deposit(underlying, balanceAfter), ""UToken: Deposit failed"");
+
+        emit LogReservesAdded(msg.sender, actualAddAmount, totalReservesNew);
+    }
+
+    function removeReserves(address receiver, uint256 reduceAmount) external whenNotPaused nonReentrant onlyAdmin {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        require(reduceAmount <= totalReserves, ""amount is large than totalReserves"");
+
+        IAssetManager assetManagerContract = IAssetManager(assetManager);
+
+        uint256 totalReservesNew = totalReserves - reduceAmount;
+        // We checked reduceAmount <= totalReserves above, so this should never revert.
+        require(totalReservesNew <= totalReserves, ""reduce reserves unexpected underflow"");
+
+        totalReserves = totalReservesNew;
+
+        require(assetManagerContract.withdraw(underlying, receiver, reduceAmount), ""UToken: Failed to withdraw"");
+
+        emit LogReservesReduced(receiver, reduceAmount, totalReservesNew);
+    }
+
+    function debtWriteOff(address borrower, uint256 amount) external whenNotPaused onlyUserManager {
+        uint256 oldPrincipal = accountBorrows[borrower].principal;
+        uint256 repayAmount;
+        if (amount > oldPrincipal) {
+            repayAmount = oldPrincipal;
+        } else {
+            repayAmount = amount;
+        }
+
+        accountBorrows[borrower].principal = oldPrincipal - repayAmount;
+        totalBorrows -= repayAmount;
+    }
+
+    /**
+     * @dev Function to simply retrieve block number
+     *  This exists mainly for inheriting test contracts to stub this result.
+     */
+    function getBlockNumber() internal view returns (uint256) {
+        return block.number;
+    }
+
+    function _setInterestRateModelFresh(address newInterestRateModel_) private {
+        address oldInterestRateModel = address(interestRateModel);
+        address newInterestRateModel = newInterestRateModel_;
+        require(
+            IInterestRateModel(newInterestRateModel).isInterestRateModel(),
+            ""UToken: new model is not a interestRateModel""
+        );
+        interestRateModel = IInterestRateModel(newInterestRateModel);
+
+        emit LogNewMarketInterestRateModel(oldInterestRateModel, newInterestRateModel);
+    }
+
+    /**
+     *  @dev Update borrower overdue info
+     *  @param account Borrower address
+     */
+    function updateOverdueInfo(address account) external whenNotPaused {
+        if (checkIsOverdue(account)) {
+            IUserManager(userManager).updateTotalFrozen(account, true);
+        }
+    }
+
+    /**
+     *  @dev Batch update borrower overdue info
+     *  @param accounts Borrowers address
+     */
+    function batchUpdateOverdueInfos(address[] calldata accounts) external whenNotPaused {
+        address[] memory overdueAccounts = new address[](accounts.length);
+        bool[] memory isOverdues = new bool[](accounts.length);
+        for (uint256 i = 0; i < accounts.length; i++) {
+            if (checkIsOverdue(accounts[i])) {
+                overdueAccounts[i] = accounts[i];
+                isOverdues[i] = true;
+            }
+        }
+        IUserManager(userManager).batchUpdateTotalFrozen(overdueAccounts, isOverdues);
+    }
+
+    /**
+     *  @dev Get a member's available credit limit
+     *  @param account Member address
+     *  @return Member credit limit
+     */
+    function _getCreditLimit(address account) private view returns (int256) {
+        return IUserManager(userManager).getCreditLimit(account);
+    }
+}",6882.0,769.0,"***[H-01] borrow must accrueInterest first***
+The `UToken.borrow` function first checks the borrowed balance and the old credit limit before accruing the actual interest on the market:
+// @audit this uses the old value
+require(borrowBalanceView(msg.sender) + amount + fee <= maxBorrow, ""UToken: amount large than borrow size max"");
+
+require(
+    // @audit this calls uToken.calculateInterest(account) which returns old value
+    uint256(_getCreditLimit(msg.sender)) >= amount + fee,
+    ""UToken: The loan amount plus fee is greater than credit limit""
+);
+
+// @audit accrual only happens here
+require(accrueInterest(), ""UToken: accrue interest failed"");
+Thus the borrowed balance of the user does not include the latest interest as it uses the old global borrowIndex but the new borrowIndex is only set in accrueInterest.",1.0,"pragma solidity ^0.8.4;
+pragma abicoder v1;
+
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""../Controller.sol"";
+import ""../interfaces/IUserManager.sol"";
+import ""../interfaces/IAssetManager.sol"";
+import ""../interfaces/IUErc20.sol"";
+import ""../interfaces/IInterestRateModel.sol"";
+
+
+contract UToken is Controller, ReentrancyGuardUpgradeable {
+    using SafeERC20Upgradeable for IUErc20;
+
+    bool public constant IS_UTOKEN = true;
+    uint256 public constant WAD = 1e18;
+    uint256 internal constant BORROW_RATE_MAX_MANTISSA = 0.0005e16; 
+    uint256 internal constant RESERVE_FACTORY_MAX_MANTISSA = 1e18; 
+
+    address public underlying;
+    IInterestRateModel public interestRateModel;
+    uint256 internal initialExchangeRateMantissa; 
+    uint256 public reserveFactorMantissa; 
+    uint256 public accrualBlockNumber; 
+    uint256 public borrowIndex; 
+    uint256 public totalBorrows; 
+    uint256 public totalReserves; 
+    uint256 public totalRedeemable; 
+    uint256 public overdueBlocks; 
+    uint256 public originationFee;
+    uint256 public debtCeiling; 
+    uint256 public maxBorrow;
+    uint256 public minBorrow;
+    address public assetManager;
+    address public userManager;
+    IUErc20 public uErc20;
+
+    struct BorrowSnapshot {
+        uint256 principal;
+        uint256 interest;
+        uint256 interestIndex;
+        uint256 lastRepay; 
+    }
+
+    
+    mapping(address => BorrowSnapshot) internal accountBorrows;
+
+    
+    event LogNewMarketInterestRateModel(address oldInterestRateModel, address newInterestRateModel);
+
+    event LogMint(address minter, uint256 underlyingAmount, uint256 uTokenAmount);
+
+    event LogRedeem(address redeemer, uint256 redeemTokensIn, uint256 redeemAmountIn, uint256 redeemAmount);
+
+    event LogReservesAdded(address reserver, uint256 actualAddAmount, uint256 totalReservesNew);
+
+    event LogReservesReduced(address receiver, uint256 reduceAmount, uint256 totalReservesNew);
+
+    
+    event LogBorrow(address indexed account, uint256 amount, uint256 fee);
+
+    
+    event LogRepay(address indexed account, uint256 amount);
+
+    
+    modifier onlyMember(address account) {
+        require(IUserManager(userManager).checkIsMember(account), ""UToken: caller is not a member"");
+        _;
+    }
+
+    modifier onlyAssetManager() {
+        require(msg.sender == assetManager, ""UToken: caller is not assetManager"");
+        _;
+    }
+
+    modifier onlyUserManager() {
+        require(msg.sender == userManager, ""UToken: caller is not userManager"");
+        _;
+    }
+
+    function __UToken_init(
+        IUErc20 uErc20_,
+        address underlying_,
+        uint256 initialExchangeRateMantissa_,
+        uint256 reserveFactorMantissa_,
+        uint256 originationFee_,
+        uint256 debtCeiling_,
+        uint256 maxBorrow_,
+        uint256 minBorrow_,
+        uint256 overdueBlocks_,
+        address admin_
+    ) public initializer {
+        require(initialExchangeRateMantissa_ > 0, ""initial exchange rate must be greater than zero."");
+        require(address(underlying_) != address(0), ""underlying token is zero"");
+        require(
+            reserveFactorMantissa_ >= 0 && reserveFactorMantissa_ <= RESERVE_FACTORY_MAX_MANTISSA,
+            ""reserveFactorMantissa error""
+        );
+        uErc20 = uErc20_;
+        Controller.__Controller_init(admin_);
+        ReentrancyGuardUpgradeable.__ReentrancyGuard_init();
+        underlying = underlying_;
+        originationFee = originationFee_;
+        debtCeiling = debtCeiling_;
+        maxBorrow = maxBorrow_;
+        minBorrow = minBorrow_;
+        overdueBlocks = overdueBlocks_;
+        initialExchangeRateMantissa = initialExchangeRateMantissa_;
+        reserveFactorMantissa = reserveFactorMantissa_;
+        accrualBlockNumber = getBlockNumber();
+        borrowIndex = WAD;
+    }
+
+    function setAssetManager(address assetManager_) external onlyAdmin {
+        assetManager = assetManager_;
+    }
+
+    function setUserManager(address userManager_) external onlyAdmin {
+        userManager = userManager_;
+    }
+
+    
+    function setOriginationFee(uint256 originationFee_) external onlyAdmin {
+        originationFee = originationFee_;
+    }
+
+    
+    function setDebtCeiling(uint256 debtCeiling_) external onlyAdmin {
+        debtCeiling = debtCeiling_;
+    }
+
+    
+    function setMinBorrow(uint256 minBorrow_) external onlyAdmin {
+        minBorrow = minBorrow_;
+    }
+
+    
+    function setMaxBorrow(uint256 maxBorrow_) external onlyAdmin {
+        maxBorrow = maxBorrow_;
+    }
+
+    
+    function setOverdueBlocks(uint256 overdueBlocks_) external onlyAdmin {
+        overdueBlocks = overdueBlocks_;
+    }
+
+    
+    function setInterestRateModel(address newInterestRateModel) external onlyAdmin {
+        _setInterestRateModelFresh(newInterestRateModel);
+    }
+
+    function setReserveFactor(uint256 reserveFactorMantissa_) external onlyAdmin {
+        require(
+            reserveFactorMantissa_ >= 0 && reserveFactorMantissa_ <= RESERVE_FACTORY_MAX_MANTISSA,
+            ""reserveFactorMantissa error""
+        );
+        reserveFactorMantissa = reserveFactorMantissa_;
+    }
+
+    
+    function getRemainingLoanSize() public view returns (uint256) {
+        if (debtCeiling >= totalBorrows) {
+            return debtCeiling - totalBorrows;
+        } else {
+            return 0;
+        }
+    }
+
+    
+    function getLastRepay(address account) public view returns (uint256 lastRepay) {
+        lastRepay = accountBorrows[account].lastRepay;
+    }
+
+    
+    function getInterestIndex(address account) public view returns (uint256 interestIndex) {
+        interestIndex = accountBorrows[account].interestIndex;
+    }
+
+    
+    function checkIsOverdue(address account) public view returns (bool isOverdue) {
+        if (getBorrowed(account) == 0) {
+            isOverdue = false;
+        } else {
+            uint256 lastRepay = getLastRepay(account);
+            uint256 diff = getBlockNumber() - lastRepay;
+            isOverdue = (overdueBlocks < diff);
+        }
+    }
+
+    
+    function calculatingFee(uint256 amount) public view returns (uint256) {
+        return (originationFee * amount) / WAD;
+    }
+
+    
+    function getLoan(address member)
+        public
+        view
+        returns (
+            uint256 principal,
+            uint256 totalBorrowed,
+            address asset,
+            uint256 apr,
+            int256 limit,
+            bool isOverdue,
+            uint256 lastRepay
+        )
+    {
+        principal = accountBorrows[msg.sender].principal;
+        totalBorrowed = borrowBalanceStoredInternal(member);
+        asset = underlying;
+        apr = borrowRatePerBlock();
+        lastRepay = getLastRepay(member);
+        limit = _getCreditLimit(member);
+        isOverdue = checkIsOverdue(member);
+    }
+
+    
+    function getBorrowed(address account) public view returns (uint256 borrowed) {
+        borrowed = accountBorrows[account].principal;
+    }
+
+    
+    function borrowBalanceView(address account) public view returns (uint256) {
+        return accountBorrows[account].principal + calculatingInterest(account);
+    }
+
+    
+    function borrowBalanceStoredInternal(address account) internal view returns (uint256) {
+        BorrowSnapshot memory loan = accountBorrows[account];
+
+        
+        if (loan.principal == 0) {
+            return 0;
+        }
+
+        uint256 principalTimesIndex = (loan.principal + loan.interest) * borrowIndex;
+        return principalTimesIndex / loan.interestIndex;
+    }
+
+    
+    function borrowRatePerBlock() public view returns (uint256) {
+        uint256 borrowRateMantissa = interestRateModel.getBorrowRate();
+        require(borrowRateMantissa <= BORROW_RATE_MAX_MANTISSA, ""borrow rate is absurdly high"");
+        return borrowRateMantissa;
+    }
+
+    
+    function supplyRatePerBlock() public view returns (uint256) {
+        return interestRateModel.getSupplyRate(reserveFactorMantissa);
+    }
+
+    
+    function exchangeRateCurrent() public nonReentrant returns (uint256) {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        return exchangeRateStored();
+    }
+
+    
+    function exchangeRateStored() public view returns (uint256) {
+        uint256 totalSupply_ = uErc20.totalSupply();
+        if (totalSupply_ == 0) {
+            return initialExchangeRateMantissa;
+        } else {
+            return (totalRedeemable * WAD) / totalSupply_;
+        }
+    }
+
+    
+    function calculatingInterest(address account) public view returns (uint256) {
+        BorrowSnapshot memory loan = accountBorrows[account];
+
+        if (loan.principal == 0) {
+            return 0;
+        }
+
+        uint256 borrowRate = borrowRatePerBlock();
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 blockDelta = currentBlockNumber - accrualBlockNumber;
+        uint256 simpleInterestFactor = borrowRate * blockDelta;
+        uint256 borrowIndexNew = (simpleInterestFactor * borrowIndex) / WAD + borrowIndex;
+
+        uint256 principalTimesIndex = (loan.principal + loan.interest) * borrowIndexNew;
+        uint256 balance = principalTimesIndex / loan.interestIndex;
+
+        return balance - accountBorrows[account].principal;
+    }
+
+    
+    function borrow(uint256 amount) external onlyMember(msg.sender) whenNotPaused nonReentrant {
+        IAssetManager assetManagerContract = IAssetManager(assetManager);
+        require(amount >= minBorrow, ""UToken: amount less than loan size min"");
+
+        require(amount <= getRemainingLoanSize(), ""UToken: amount more than loan global size max"");
+
+        uint256 fee = calculatingFee(amount);
+        require(borrowBalanceView(msg.sender) + amount + fee <= maxBorrow, ""UToken: amount large than borrow size max"");
+
+        require(!checkIsOverdue(msg.sender), ""UToken: Member has loans overdue"");
+
+        require(amount <= assetManagerContract.getLoanableAmount(underlying), ""UToken: Not enough to lend out"");
+        require(
+            uint256(_getCreditLimit(msg.sender)) >= amount + fee,
+            ""UToken: The loan amount plus fee is greater than credit limit""
+        );
+
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+
+        uint256 borrowedAmount = borrowBalanceStoredInternal(msg.sender);
+
+        
+        if (accountBorrows[msg.sender].lastRepay == 0) {
+            accountBorrows[msg.sender].lastRepay = getBlockNumber();
+        }
+
+        uint256 accountBorrowsNew = borrowedAmount + amount + fee;
+        uint256 totalBorrowsNew = totalBorrows + amount + fee;
+        uint256 oldPrincipal = accountBorrows[msg.sender].principal;
+
+        accountBorrows[msg.sender].principal += amount + fee;
+        uint256 newPrincipal = accountBorrows[msg.sender].principal;
+        IUserManager(userManager).updateLockedData(msg.sender, newPrincipal - oldPrincipal, true);
+        accountBorrows[msg.sender].interest = accountBorrowsNew - accountBorrows[msg.sender].principal;
+        accountBorrows[msg.sender].interestIndex = borrowIndex;
+        totalBorrows = totalBorrowsNew;
+        
+        totalReserves += fee;
+
+        require(assetManagerContract.withdraw(underlying, msg.sender, amount), ""UToken: Failed to withdraw"");
+
+        emit LogBorrow(msg.sender, amount, fee);
+    }
+
+    function repayBorrow(uint256 repayAmount) external whenNotPaused nonReentrant {
+        _repayBorrowFresh(msg.sender, msg.sender, repayAmount);
+    }
+
+    function repayBorrowBehalf(address borrower, uint256 repayAmount) external whenNotPaused nonReentrant {
+        _repayBorrowFresh(msg.sender, borrower, repayAmount);
+    }
+
+    
+    function _repayBorrowFresh(
+        address payer,
+        address borrower,
+        uint256 amount
+    ) private {
+        IUErc20 assetToken = IUErc20(underlying);
+        
+        bool isOverdue = checkIsOverdue(borrower);
+        uint256 oldPrincipal = accountBorrows[borrower].principal;
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        require(accrualBlockNumber == getBlockNumber(), ""UToken: market not fresh"");
+
+        uint256 interest = calculatingInterest(borrower);
+        uint256 borrowedAmount = borrowBalanceStoredInternal(borrower);
+
+        uint256 repayAmount;
+        if (amount > borrowedAmount) {
+            repayAmount = borrowedAmount;
+        } else {
+            repayAmount = amount;
+        }
+
+        require(repayAmount > 0, ""UToken: repay amount or owed amount is zero"");
+
+        require(assetToken.allowance(payer, address(this)) >= repayAmount, ""UToken: Not enough allowance to repay"");
+
+        uint256 toReserveAmount;
+        uint256 toRedeemableAmount;
+        if (repayAmount >= interest) {
+            toReserveAmount = (interest * reserveFactorMantissa) / WAD;
+            toRedeemableAmount = interest - toReserveAmount;
+
+            if (isOverdue) {
+                IUserManager(userManager).updateTotalFrozen(borrower, false);
+                IUserManager(userManager).repayLoanOverdue(borrower, underlying, accountBorrows[borrower].lastRepay);
+            }
+            accountBorrows[borrower].principal = borrowedAmount - repayAmount;
+            accountBorrows[borrower].interest = 0;
+
+            if (accountBorrows[borrower].principal == 0) {
+                
+                accountBorrows[borrower].lastRepay = 0;
+            } else {
+                accountBorrows[borrower].lastRepay = getBlockNumber();
+            }
+        } else {
+            toReserveAmount = (repayAmount * reserveFactorMantissa) / WAD;
+            toRedeemableAmount = repayAmount - toReserveAmount;
+            accountBorrows[borrower].interest = interest - repayAmount;
+        }
+
+        totalReserves += toReserveAmount;
+        totalRedeemable += toRedeemableAmount;
+
+        uint256 newPrincipal = accountBorrows[borrower].principal;
+        accountBorrows[borrower].interestIndex = borrowIndex;
+        totalBorrows -= repayAmount;
+
+        IUserManager(userManager).updateLockedData(borrower, oldPrincipal - newPrincipal, false);
+
+        assetToken.safeTransferFrom(payer, address(this), repayAmount);
+
+        assetToken.safeApprove(assetManager, 0);
+        assetToken.safeApprove(assetManager, repayAmount);
+
+        require(IAssetManager(assetManager).deposit(underlying, repayAmount), ""UToken: Deposit failed"");
+
+        emit LogRepay(borrower, repayAmount);
+    }
+
+    function repayBorrowWithPermit(
+        address borrower,
+        uint256 amount,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public whenNotPaused {
+        IUErc20 erc20Token = IUErc20(underlying);
+        erc20Token.permit(msg.sender, address(this), nonce, expiry, true, v, r, s);
+
+        _repayBorrowFresh(msg.sender, borrower, amount);
+    }
+
+    
+    function accrueInterest() public returns (bool) {
+        uint256 borrowRate = borrowRatePerBlock();
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 blockDelta = currentBlockNumber - accrualBlockNumber;
+
+        uint256 simpleInterestFactor = borrowRate * blockDelta;
+        uint256 interestAccumulated = (simpleInterestFactor * totalBorrows) / WAD;
+        uint256 totalBorrowsNew = interestAccumulated + totalBorrows;
+        uint256 borrowIndexNew = (simpleInterestFactor * borrowIndex) / WAD + borrowIndex;
+
+        accrualBlockNumber = currentBlockNumber;
+        borrowIndex = borrowIndexNew;
+        totalBorrows = totalBorrowsNew;
+
+        return true;
+    }
+
+    
+    function balanceOfUnderlying(address owner) external returns (uint256) {
+        return exchangeRateCurrent() * uErc20.balanceOf(owner);
+    }
+
+    function mint(uint256 mintAmount) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        uint256 exchangeRate = exchangeRateStored();
+        IUErc20 assetToken = IUErc20(underlying);
+        uint256 balanceBefore = assetToken.balanceOf(address(this));
+        require(assetToken.allowance(msg.sender, address(this)) >= mintAmount, ""UToken: Not enough allowance"");
+        assetToken.safeTransferFrom(msg.sender, address(this), mintAmount);
+        uint256 balanceAfter = assetToken.balanceOf(address(this));
+        uint256 actualMintAmount = balanceAfter - balanceBefore;
+        totalRedeemable += actualMintAmount;
+        uint256 mintTokens = (actualMintAmount * WAD) / exchangeRate;
+        uErc20.mint(msg.sender, mintTokens);
+
+        assetToken.safeApprove(assetManager, 0);
+        assetToken.safeApprove(assetManager, actualMintAmount);
+
+        require(IAssetManager(assetManager).deposit(underlying, actualMintAmount), ""UToken: Deposit failed"");
+
+        emit LogMint(msg.sender, actualMintAmount, mintTokens);
+    }
+
+    
+    function redeem(uint256 redeemTokens) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        _redeemFresh(payable(msg.sender), redeemTokens, 0);
+    }
+
+    
+    function redeemUnderlying(uint256 redeemAmount) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        _redeemFresh(payable(msg.sender), 0, redeemAmount);
+    }
+
+    
+    function _redeemFresh(
+        address payable redeemer,
+        uint256 redeemTokensIn,
+        uint256 redeemAmountIn
+    ) internal {
+        require(redeemTokensIn == 0 || redeemAmountIn == 0, ""one of redeemTokensIn or redeemAmountIn must be zero"");
+
+        IAssetManager assetManagerContract = IAssetManager(assetManager);
+
+        uint256 exchangeRate = exchangeRateStored();
+
+        uint256 redeemTokens;
+        uint256 redeemAmount;
+
+        if (redeemTokensIn > 0) {
+            
+            redeemTokens = redeemTokensIn;
+            redeemAmount = (redeemTokensIn * exchangeRate) / WAD;
+        } else {
+            
+            redeemTokens = (redeemAmountIn * WAD) / exchangeRate;
+            redeemAmount = redeemAmountIn;
+        }
+
+        require(totalRedeemable >= redeemAmount, ""redeem amount error"");
+        totalRedeemable -= redeemAmount;
+        uErc20.burn(redeemer, redeemTokens);
+
+        require(assetManagerContract.withdraw(underlying, redeemer, redeemAmount), ""UToken: Failed to withdraw"");
+
+        emit LogRedeem(redeemer, redeemTokensIn, redeemAmountIn, redeemAmount);
+    }
+
+    function addReserves(uint256 addAmount) external whenNotPaused nonReentrant {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        IUErc20 assetToken = IUErc20(underlying);
+        uint256 balanceBefore = assetToken.balanceOf(address(this));
+        require(assetToken.allowance(msg.sender, address(this)) >= addAmount, ""UToken: Not enough allowance"");
+        assetToken.safeTransferFrom(msg.sender, address(this), addAmount);
+        uint256 balanceAfter = assetToken.balanceOf(address(this));
+        uint256 actualAddAmount = balanceAfter - balanceBefore;
+
+        uint256 totalReservesNew = totalReserves + actualAddAmount;
+        
+        require(totalReservesNew >= totalReserves, ""add reserves unexpected overflow"");
+        totalReserves = totalReservesNew;
+
+        assetToken.safeApprove(assetManager, 0);
+        assetToken.safeApprove(assetManager, balanceAfter);
+
+        require(IAssetManager(assetManager).deposit(underlying, balanceAfter), ""UToken: Deposit failed"");
+
+        emit LogReservesAdded(msg.sender, actualAddAmount, totalReservesNew);
+    }
+
+    function removeReserves(address receiver, uint256 reduceAmount) external whenNotPaused nonReentrant onlyAdmin {
+        require(accrueInterest(), ""UToken: accrue interest failed"");
+        require(reduceAmount <= totalReserves, ""amount is large than totalReserves"");
+
+        IAssetManager assetManagerContract = IAssetManager(assetManager);
+
+        uint256 totalReservesNew = totalReserves - reduceAmount;
+        
+        require(totalReservesNew <= totalReserves, ""reduce reserves unexpected underflow"");
+
+        totalReserves = totalReservesNew;
+
+        require(assetManagerContract.withdraw(underlying, receiver, reduceAmount), ""UToken: Failed to withdraw"");
+
+        emit LogReservesReduced(receiver, reduceAmount, totalReservesNew);
+    }
+
+    function debtWriteOff(address borrower, uint256 amount) external whenNotPaused onlyUserManager {
+        uint256 oldPrincipal = accountBorrows[borrower].principal;
+        uint256 repayAmount;
+        if (amount > oldPrincipal) {
+            repayAmount = oldPrincipal;
+        } else {
+            repayAmount = amount;
+        }
+
+        accountBorrows[borrower].principal = oldPrincipal - repayAmount;
+        totalBorrows -= repayAmount;
+    }
+
+    
+    function getBlockNumber() internal view returns (uint256) {
+        return block.number;
+    }
+
+    function _setInterestRateModelFresh(address newInterestRateModel_) private {
+        address oldInterestRateModel = address(interestRateModel);
+        address newInterestRateModel = newInterestRateModel_;
+        require(
+            IInterestRateModel(newInterestRateModel).isInterestRateModel(),
+            ""UToken: new model is not a interestRateModel""
+        );
+        interestRateModel = IInterestRateModel(newInterestRateModel);
+
+        emit LogNewMarketInterestRateModel(oldInterestRateModel, newInterestRateModel);
+    }
+
+    
+    function updateOverdueInfo(address account) external whenNotPaused {
+        if (checkIsOverdue(account)) {
+            IUserManager(userManager).updateTotalFrozen(account, true);
+        }
+    }
+
+    
+    function batchUpdateOverdueInfos(address[] calldata accounts) external whenNotPaused {
+        address[] memory overdueAccounts = new address[](accounts.length);
+        bool[] memory isOverdues = new bool[](accounts.length);
+        for (uint256 i = 0; i < accounts.length; i++) {
+            if (checkIsOverdue(accounts[i])) {
+                overdueAccounts[i] = accounts[i];
+                isOverdues[i] = true;
+            }
+        }
+        IUserManager(userManager).batchUpdateTotalFrozen(overdueAccounts, isOverdues);
+    }
+
+    
+    function _getCreditLimit(address account) private view returns (int256) {
+        return IUserManager(userManager).getCreditLimit(account);
+    }
+}",5025.0,1,0,"Here are the potential vulnerabilities in the provided smart contract:
+
+1. **Reentrancy Risk in _repayBorrowFresh**:
+   - Despite having ReentrancyGuard, there are external calls after state changes
+   - The function makes external calls to `safeTransferFrom` and `deposit` after modifying state variables
+
+2. **Precision Loss in Calculations**:
+   - Multiple divisions using WAD (1e18) could lead to precision loss
+   - Particularly in functions like `exchangeRateStored` and `calculatingInterest`
+
+3. **Potential Integer Overflow/Underflow**:
+   - Despite using Solidity 0.8.4 which has built-in overflow checks
+   - Complex interest calculations could still potentially overflow in extreme cases
+
+4. **Missing Zero Address Checks**:
+   - Some functions like `setAssetManager` and `setUserManager` don't check for zero addresses
+
+5. **Centralization Risks**:
+   - Admin has significant control through multiple admin-only functions
+   - Can change critical parameters like interest rates, debt ceiling, etc.
+
+6. **Block Number Manipulation Risk**:
+   - Uses block.number for interest calculations
+   - Miners could potentially manipulate timestamps to affect interest rates
+
+7. **Unchecked Return Values**:
+   - Some external calls don't verify their return values
+   - Could lead to silent failures
+
+8. **Front-Running Vulnerability**:
+   - Functions like `mint` and `redeem` could be front-run
+   - No slippage protection mechanisms
+
+9. **Missing Event Emissions**:
+   - Some state-changing functions don't emit events
+   - Makes it harder to track contract state changes off-chain
+
+10. **Potential DOS Risk**:
+    - `batchUpdateOverdueInfos` could run out of gas with large arrays
+    - No limit on array size
+
+11. **Interest Rate Model Dependency**:
+    - Heavy reliance on external interest rate model
+    - If the model contract is compromised, it affects this contract
+
+12. **Missing Input Validation**:
+    - Some functions don't thoroughly validate input parameters
+    - Could lead to unexpected states
+
+13. **Time-based Attack Surface**:
+    - Overdueblocks parameter could be manipulated
+    - Time-based calculations might be exploited
+
+14. **State Variable Visibility**:
+    - Some state variables could be more restricted in visibility
+    - Potential for unintended access
+
+To mitigate these vulnerabilities:
+- Add comprehensive input validation
+- Implement more event emissions
+- Add slippage protection
+- Limit array sizes in batch operations
+- Add more zero-address checks
+- Consider using a more manipulation-resistant time source
+- Add more checks for return values
+- Consider implementing emergency pause mechanisms for critical functions
+- Add more thorough testing for edge cases
+- Consider implementing rate limiting","### **[H-01] borrow must accrueInterest first**
+
+**Report Description**:
+The `UToken.borrow` function in the smart contract checks the borrowed balance and the old credit limit **before** accruing the actual interest on the market. This means the borrowed balance of the user does not include the latest interest, as it uses the old `borrowIndex`. The new `borrowIndex` is only set in `accrueInterest`, which is called after these checks. This could lead to incorrect calculations of the user's borrowing capacity and potential discrepancies in the contract's financial state.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of incorrect interest accrual timing in the `borrow` function. While the response list covers various vulnerabilities such as reentrancy, precision loss, and integer overflow, it misses the critical issue of **incorrect interest calculation timing**, which is a significant financial risk in the contract. This oversight means the response list does not adequately address the reported issue.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[H-01] borrow must accrueInterest first**
+
+---
+
+### **Analysis of Gaps**:
+The response list fails to address the specific issue of **incorrect interest accrual timing** in the `borrow` function. This is a critical vulnerability that could lead to financial discrepancies and incorrect borrowing capacity calculations. The response list focuses on general vulnerabilities (e.g., reentrancy, precision loss, and integer overflow) but does not cover this specific issue, which is a significant oversight. To improve the response list, it should include a detailed analysis of **interest accrual timing** and its impact on contract functionality.",0,0,1,14,"```
+None.
+```",0.0,0
+CreditLimitByMedian.sol,"//SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.4;
+
+import ""@openzeppelin/contracts/utils/math/Math.sol"";
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+
+import ""../interfaces/ICreditLimitModel.sol"";
+
+contract CreditLimitByMedian is Ownable, ICreditLimitModel {
+    using Math for uint256;
+
+    bool public constant override isCreditLimitModel = true;
+    uint256 public override effectiveNumber;
+
+    constructor(uint256 effectiveNumber_) {
+        effectiveNumber = effectiveNumber_;
+    }
+
+    function getCreditLimit(uint256[] memory vouchs) public view override returns (uint256) {
+        if (vouchs.length >= effectiveNumber) {
+            return _findMedian(vouchs);
+        } else {
+            return 0;
+        }
+    }
+
+    function getLockedAmount(
+        LockedInfo[] memory array,
+        address account,
+        uint256 amount,
+        bool isIncrease
+    ) public pure override returns (uint256) {
+        if (array.length == 0) return 0;
+
+        uint256 newLockedAmount;
+        if (isIncrease) {
+            for (uint256 i = 0; i < array.length; i++) {
+                uint256 remainingVouchingAmount;
+                if (array[i].vouchingAmount > array[i].lockedAmount) {
+                    remainingVouchingAmount = array[i].vouchingAmount - array[i].lockedAmount;
+                } else {
+                    remainingVouchingAmount = 0;
+                }
+
+                if (remainingVouchingAmount > array[i].availableStakingAmount) {
+                    if (array[i].availableStakingAmount > amount) {
+                        newLockedAmount = array[i].lockedAmount + amount;
+                    } else {
+                        newLockedAmount = array[i].lockedAmount + array[i].availableStakingAmount;
+                    }
+                } else {
+                    if (remainingVouchingAmount > amount) {
+                        newLockedAmount = array[i].lockedAmount + amount;
+                    } else {
+                        newLockedAmount = array[i].lockedAmount + remainingVouchingAmount;
+                    }
+                }
+
+                if (account == array[i].staker) {
+                    return newLockedAmount;
+                }
+            }
+        } else {
+            for (uint256 i = 0; i < array.length; i++) {
+                if (array[i].lockedAmount > amount) {
+                    newLockedAmount = array[i].lockedAmount - 1;
+                } else {
+                    newLockedAmount = 0;
+                }
+
+                if (account == array[i].staker) {
+                    return newLockedAmount;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    function setEffectNumber(uint256 number) external onlyOwner {
+        effectiveNumber = number;
+    }
+
+    /**
+     *  @dev Find median from uint array
+     *  @param array array
+     *  @return uint256
+     */
+    function _findMedian(uint256[] memory array) private pure returns (uint256) {
+        uint256[] memory arr = _sortArray(array);
+        if (arr.length == 0) return 0;
+
+        if (arr.length % 2 == 0) {
+            uint256 num1 = arr[arr.length >> 1];
+            uint256 num2 = arr[(arr.length >> 1) - 1];
+            return num1.average(num2);
+        } else {
+            return arr[arr.length >> 1];
+        }
+    }
+
+    /**
+     *  @dev Sort uint array
+     *  @param arr array
+     *  @return uint256 array
+     */
+    function _sortArray(uint256[] memory arr) private pure returns (uint256[] memory) {
+        uint256 length = arr.length;
+
+        for (uint256 i = 0; i < length; i++) {
+            for (uint256 j = i + 1; j < length; j++) {
+                if (arr[i] < arr[j]) {
+                    uint256 temp = arr[j];
+                    arr[j] = arr[i];
+                    arr[i] = temp;
+                }
+            }
+        }
+
+        return arr;
+    }
+}",861.0,122.0,"[H-02] Wrong implementation of `CreditLimitByMedian.sol#getLockedAmount()` makes it unable to unlock `lockedAmount` in CreditLimitByMedian model
+`getLockedAmount()` is used by `UserManager.sol#updateLockedData()` to update locked amounts.
+Based on the context, at L66, `newLockedAmount = array[i].lockedAmount - 1;` should be newLockedAmount = array[i].lockedAmount - amount;.
+The current implementation is wrong and makes it impossible to unlock `lockedAmount` in CreditLimitByMedian model
+
+[M-01] Wrong implementation of CreditLimitByMedian.sol#getLockedAmount() will lock a much bigger total amount of staked tokens than expected
+`getLockedAmount()` is used by `UserManager.sol#updateLockedData()` to update locked amounts.
+The current implementation is wrong and locks every staker for the amount of the borrowed amount or all the `vouchingAmount` if the `vouchingAmount` is smaller than the borrowed amount in CreditLimitByMedian model.",2.0,"pragma solidity ^0.8.4;
+
+import ""@openzeppelin/contracts/utils/math/Math.sol"";
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+
+import ""../interfaces/ICreditLimitModel.sol"";
+
+contract CreditLimitByMedian is Ownable, ICreditLimitModel {
+    using Math for uint256;
+
+    bool public constant override isCreditLimitModel = true;
+    uint256 public override effectiveNumber;
+
+    constructor(uint256 effectiveNumber_) {
+        effectiveNumber = effectiveNumber_;
+    }
+
+    function getCreditLimit(uint256[] memory vouchs) public view override returns (uint256) {
+        if (vouchs.length >= effectiveNumber) {
+            return _findMedian(vouchs);
+        } else {
+            return 0;
+        }
+    }
+
+    function getLockedAmount(
+        LockedInfo[] memory array,
+        address account,
+        uint256 amount,
+        bool isIncrease
+    ) public pure override returns (uint256) {
+        if (array.length == 0) return 0;
+
+        uint256 newLockedAmount;
+        if (isIncrease) {
+            for (uint256 i = 0; i < array.length; i++) {
+                uint256 remainingVouchingAmount;
+                if (array[i].vouchingAmount > array[i].lockedAmount) {
+                    remainingVouchingAmount = array[i].vouchingAmount - array[i].lockedAmount;
+                } else {
+                    remainingVouchingAmount = 0;
+                }
+
+                if (remainingVouchingAmount > array[i].availableStakingAmount) {
+                    if (array[i].availableStakingAmount > amount) {
+                        newLockedAmount = array[i].lockedAmount + amount;
+                    } else {
+                        newLockedAmount = array[i].lockedAmount + array[i].availableStakingAmount;
+                    }
+                } else {
+                    if (remainingVouchingAmount > amount) {
+                        newLockedAmount = array[i].lockedAmount + amount;
+                    } else {
+                        newLockedAmount = array[i].lockedAmount + remainingVouchingAmount;
+                    }
+                }
+
+                if (account == array[i].staker) {
+                    return newLockedAmount;
+                }
+            }
+        } else {
+            for (uint256 i = 0; i < array.length; i++) {
+                if (array[i].lockedAmount > amount) {
+                    newLockedAmount = array[i].lockedAmount - 1;
+                } else {
+                    newLockedAmount = 0;
+                }
+
+                if (account == array[i].staker) {
+                    return newLockedAmount;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    function setEffectNumber(uint256 number) external onlyOwner {
+        effectiveNumber = number;
+    }
+
+    
+    function _findMedian(uint256[] memory array) private pure returns (uint256) {
+        uint256[] memory arr = _sortArray(array);
+        if (arr.length == 0) return 0;
+
+        if (arr.length % 2 == 0) {
+            uint256 num1 = arr[arr.length >> 1];
+            uint256 num2 = arr[(arr.length >> 1) - 1];
+            return num1.average(num2);
+        } else {
+            return arr[arr.length >> 1];
+        }
+    }
+
+    
+    function _sortArray(uint256[] memory arr) private pure returns (uint256[] memory) {
+        uint256 length = arr.length;
+
+        for (uint256 i = 0; i < length; i++) {
+            for (uint256 j = i + 1; j < length; j++) {
+                if (arr[i] < arr[j]) {
+                    uint256 temp = arr[j];
+                    arr[j] = arr[i];
+                    arr[i] = temp;
+                }
+            }
+        }
+
+        return arr;
+    }
+}",792.0,1,1,"Here are the potential vulnerabilities and issues in the provided smart contract:
+
+1. **Gas Limit Issues**:
+   - The `_sortArray` function uses bubble sort which has O(n²) complexity. For large arrays, this could hit the block gas limit or make transactions very expensive.
+   - The nested loops in `getLockedAmount` could also be gas intensive for large arrays.
+
+2. **Arithmetic Overflow/Underflow**:
+   - Although Solidity 0.8.4+ includes built-in overflow checks, the contract performs several arithmetic operations that could potentially overflow in extreme cases.
+   - In `getLockedAmount`, subtractions like `array[i].vouchingAmount - array[i].lockedAmount` could underflow if not properly validated.
+
+3. **Array Bounds**:
+   - The contract doesn't validate the maximum length of input arrays, which could lead to DOS attacks if extremely large arrays are passed to `getCreditLimit` or `getLockedAmount`.
+
+4. **Owner Privileges**:
+   - The `setEffectNumber` function allows the owner to change the `effectiveNumber` without any restrictions, which could potentially break the system's logic or manipulate credit limits.
+
+5. **Lack of Input Validation**:
+   - No validation on the `effectiveNumber_` in the constructor
+   - No validation for zero addresses in the `getLockedAmount` function
+
+6. **Precision Loss**:
+   - The median calculation in `_findMedian` could potentially lose precision when calculating averages for even-length arrays.
+
+7. **Logic Vulnerability in getLockedAmount**:
+   - When `isIncrease` is false, the function subtracts 1 from `lockedAmount` instead of the actual `amount` parameter, which seems incorrect.
+
+8. **Return Value Consistency**:
+   - The `getLockedAmount` function might return 0 if the account is not found in the array, which could be misleading.
+
+9. **Missing Events**:
+   - No events are emitted for important state changes like `setEffectNumber`, making it difficult to track changes off-chain.
+
+10. **Immutable Checks**:
+    - The `isCreditLimitModel` constant could be made immutable instead of constant to save gas.
+
+11. **Data Privacy**:
+    - All data in the contract is publicly visible, which might not be ideal for sensitive credit information.
+
+Recommendations:
+1. Add input validation for all parameters
+2. Implement events for state changes
+3. Consider using a more efficient sorting algorithm
+4. Add upper bounds for array lengths
+5. Add proper documentation for functions
+6. Consider implementing emergency pause functionality
+7. Add more precise error messages for failures
+8. Consider implementing rate limiting for operations
+9. Add proper access control mechanisms beyond just owner
+10. Consider implementing upgrade mechanisms for future improvements","### **[H-02] Wrong implementation of `CreditLimitByMedian.sol#getLockedAmount()` makes it unable to unlock `lockedAmount` in CreditLimitByMedian model**
+
+**Report Description**:  
+The `getLockedAmount()` function in `CreditLimitByMedian.sol` is incorrectly implemented. Specifically, at line 66, the calculation `newLockedAmount = array[i].lockedAmount - 1;` should be `newLockedAmount = array[i].lockedAmount - amount;`. This error prevents the proper unlocking of `lockedAmount` in the `CreditLimitByMedian` model, leading to incorrect updates in the `UserManager.sol#updateLockedData()` function.
+
+**Match in Response List**:  
+Matches with the issue titled **""Logic Vulnerability in getLockedAmount""**.
+
+**Validation**:  
+**Correct**. The response accurately identifies the logic vulnerability in the `getLockedAmount` function, specifically pointing out that the function subtracts `1` instead of the `amount` parameter when `isIncrease` is false. This aligns with the issue description and correctly highlights the core problem.
+
+---
+
+### **[M-01] Wrong implementation of `CreditLimitByMedian.sol#getLockedAmount()` will lock a much bigger total amount of staked tokens than expected**
+
+**Report Description**:  
+The `getLockedAmount()` function in `CreditLimitByMedian.sol` is incorrectly implemented, leading to the locking of a much larger total amount of staked tokens than expected. The function locks every staker for the borrowed amount or the `vouchingAmount` if the `vouchingAmount` is smaller than the borrowed amount. This incorrect implementation can result in excessive locking of staked tokens, potentially disrupting the system's intended behavior.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this specific issue. While it identifies a logic vulnerability in `getLockedAmount`, it does not cover the broader impact of excessive locking of staked tokens, which is the core concern of this issue.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+
+- **[H-02] Wrong implementation of `CreditLimitByMedian.sol#getLockedAmount()` makes it unable to unlock `lockedAmount` in CreditLimitByMedian model**
+
+**Partially Correct Matches**:
+
+- *None*
+
+**Missed Issues from Issue Report**:
+
+- **[M-01] Wrong implementation of `CreditLimitByMedian.sol#getLockedAmount()` will lock a much bigger total amount of staked tokens than expected**
+
+---
+
+### **Overall Evaluation**
+
+The response list does a good job of identifying some of the vulnerabilities in the smart contract, particularly the logic error in `getLockedAmount`. However, it misses the broader impact of the incorrect implementation, which leads to excessive locking of staked tokens. This gap indicates a need for more comprehensive analysis of the potential risks and impacts of vulnerabilities in the contract.",1,0,1,11,"```
+1. Logic Vulnerability in getLockedAmount
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the rank of the true positive**:
+   - The true positive is ""Logic Vulnerability in getLockedAmount"".
+   - This appears at rank 7 in the ranked list of predictions.
+
+2. **Calculate the precision at rank 7 (\( P@7 \))**:
+   - Precision at rank \( k \) is calculated as the number of true positives up to rank \( k \) divided by \( k \).
+   - Since there is only one true positive up to rank 7, \( P@7 = \frac{1}{7} \approx 0.1429 \).
+
+3. **Compute the Average Precision (AP)**:
+   - Since there is only one true positive, the AP is simply the precision at the rank where the true positive appears.
+   - Therefore, \( AP = 0.1429 \).
+
+**Output**:
+```
+0.1429
+```",0.1429
+AssetManager.sol,"//SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.4;
+pragma abicoder v1;
+
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""../Controller.sol"";
+import ""../interfaces/IMarketRegistry.sol"";
+import ""../interfaces/IMoneyMarketAdapter.sol"";
+import ""../interfaces/IAssetManager.sol"";
+
+/**
+ *  @title AssetManager
+ *  @dev Manage the token assets deposited by components and admins, and invest tokens to the integrated underlying lending protocols.
+ */
+contract AssetManager is Controller, ReentrancyGuardUpgradeable, IAssetManager {
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+    using AddressUpgradeable for address;
+
+    IMoneyMarketAdapter[] public moneyMarkets;
+    mapping(address => Market) public supportedMarkets;
+    address[] public supportedTokensList;
+    //record admin or userManager balance
+    mapping(address => mapping(address => uint256)) public balances; //1 user 2 token
+    mapping(address => uint256) public totalPrincipal; //total stake amount
+    address public marketRegistry;
+    // slither-disable-next-line uninitialized-state
+    uint256[] public withdrawSeq; // Priority sequence of money market indices for processing withdraws
+
+    struct Market {
+        bool isSupported;
+    }
+
+    modifier checkMarketSupported(address token) {
+        require(isMarketSupported(token), ""AssetManager: token not support"");
+        _;
+    }
+
+    modifier onlyAuth(address token) {
+        require(
+            _isUToken(msg.sender, token) || _isUserManager(msg.sender, token),
+            ""AssetManager: sender must uToken or userManager""
+        );
+        _;
+    }
+
+    /**
+     *  @dev Emit when making a deposit
+     *  @param token Depositing token address
+     *  @param account Account address
+     *  @param amount Deposit amount, in wei
+     */
+    event LogDeposit(address indexed token, address indexed account, uint256 amount);
+    /**
+     *  @dev Emit when withdrawing from AssetManager
+     *  @param token Depositing token address
+     *  @param account Account address
+     *  @param amount Withdraw amount, in wei
+     *  @param remaining The amount cannot be withdrawn
+     */
+    event LogWithdraw(address indexed token, address indexed account, uint256 amount, uint256 remaining);
+    /**
+     *  @dev Emit when rebalancing among the integrated money markets
+     *  @param tokenAddress The address of the token to be rebalanced
+     *  @param percentages Array of the percentages of the tokens to deposit to the money markets
+     */
+    event LogRebalance(address tokenAddress, uint256[] percentages);
+
+    function __AssetManager_init(address _marketRegistry) public initializer {
+        Controller.__Controller_init(msg.sender);
+        ReentrancyGuardUpgradeable.__ReentrancyGuard_init();
+        marketRegistry = _marketRegistry;
+    }
+
+    function setMarketRegistry(address _marketRegistry) external onlyAdmin {
+        marketRegistry = _marketRegistry;
+    }
+
+    /**
+     *  @dev Get the balance of asset manager, plus the total amount of tokens deposited to all the underlying lending protocols
+     *  @param tokenAddress ERC20 token address
+     *  @return Pool balance
+     */
+    function getPoolBalance(address tokenAddress) public view override returns (uint256) {
+        IERC20Upgradeable poolToken = IERC20Upgradeable(tokenAddress);
+        uint256 balance = poolToken.balanceOf(address(this));
+        if (isMarketSupported(tokenAddress)) {
+            return totalSupplyView(tokenAddress) + balance;
+        } else {
+            return balance;
+        }
+    }
+
+    /**
+     *  @dev Returns the amount of the lending pool balance minus the amount of total staked.
+     *  @param tokenAddress ERC20 token address
+     *  @return Amount can be borrowed
+     */
+    function getLoanableAmount(address tokenAddress) public view override returns (uint256) {
+        uint256 poolBalance = getPoolBalance(tokenAddress);
+        if (poolBalance > totalPrincipal[tokenAddress]) return poolBalance - totalPrincipal[tokenAddress];
+        return 0;
+    }
+
+    /**
+     *  @dev Get the total amount of tokens deposited to all the integrated underlying protocols without side effects.
+     *  @param tokenAddress ERC20 token address
+     *  @return Total market balance
+     */
+    function totalSupply(address tokenAddress) public override returns (uint256) {
+        if (isMarketSupported(tokenAddress)) {
+            uint256 tokenSupply = 0;
+            for (uint256 i = 0; i < moneyMarkets.length; i++) {
+                if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                    continue;
+                }
+                tokenSupply += moneyMarkets[i].getSupply(tokenAddress);
+            }
+
+            return tokenSupply;
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     *  @dev Get the total amount of tokens deposited to all the integrated underlying protocols, but without side effects. Safe to call anytime, but may not get the most updated number for the current block. Call totalSupply() for that purpose.
+     *  @param tokenAddress ERC20 token address
+     *  @return Total market balance
+     */
+    function totalSupplyView(address tokenAddress) public view override returns (uint256) {
+        if (isMarketSupported(tokenAddress)) {
+            uint256 tokenSupply = 0;
+            for (uint256 i = 0; i < moneyMarkets.length; i++) {
+                if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                    continue;
+                }
+                tokenSupply += moneyMarkets[i].getSupplyView(tokenAddress);
+            }
+
+            return tokenSupply;
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     *  @dev Check if there is an underlying protocol available for the given ERC20 token.
+     *  @param tokenAddress ERC20 token address
+     *  @return Whether is supported
+     */
+    function isMarketSupported(address tokenAddress) public view override returns (bool) {
+        return supportedMarkets[tokenAddress].isSupported;
+    }
+
+    /**
+     *  @dev Deposit tokens to AssetManager, and those tokens will be passed along to adapters to deposit to integrated asset protocols if any is available.
+     *  @param token ERC20 token address
+     *  @param amount ERC20 token address
+     *  @return Deposited amount
+     */
+    function deposit(address token, uint256 amount)
+        external
+        override
+        whenNotPaused
+        onlyAuth(token)
+        nonReentrant
+        returns (bool)
+    {
+        IERC20Upgradeable poolToken = IERC20Upgradeable(token);
+        require(amount > 0, ""AssetManager: amount can not be zero"");
+
+        if (!_isUToken(msg.sender, token)) {
+            balances[msg.sender][token] += amount;
+            totalPrincipal[token] += amount;
+        }
+
+        bool remaining = true;
+        if (isMarketSupported(token)) {
+            // assumption: markets are arranged in order of decreasing liquidity
+            // iterate markets till floors are filled
+            // floors define minimum amount to maintain confidence in liquidity
+            for (uint256 i = 0; i < moneyMarkets.length && remaining; i++) {
+                IMoneyMarketAdapter moneyMarket = moneyMarkets[i];
+
+                if (!moneyMarket.supportsToken(token)) continue;
+                if (moneyMarket.floorMap(token) <= moneyMarket.getSupply(token)) continue;
+
+                poolToken.safeTransferFrom(msg.sender, address(moneyMarket), amount);
+                moneyMarket.deposit(token);
+                remaining = false;
+            }
+
+            // assumption: less liquid markets provide more yield
+            // iterate markets in reverse to optimize for yield
+            // do this only if floors are filled i.e. min liquidity satisfied
+            // dposit in the market where ceiling is not being exceeded
+            for (uint256 j = moneyMarkets.length; j > 0 && remaining; j--) {
+                IMoneyMarketAdapter moneyMarket = moneyMarkets[j - 1];
+                if (!moneyMarket.supportsToken(token)) continue;
+
+                uint256 supply = moneyMarket.getSupply(token);
+                uint256 ceiling = moneyMarket.ceilingMap(token);
+                if (ceiling <= supply) continue;
+                if (supply + amount > ceiling) continue;
+
+                poolToken.safeTransferFrom(msg.sender, address(moneyMarket), amount);
+                moneyMarket.deposit(token);
+                remaining = false;
+            }
+        }
+
+        if (remaining) {
+            poolToken.safeTransferFrom(msg.sender, address(this), amount);
+        }
+
+        emit LogDeposit(token, msg.sender, amount);
+
+        return true;
+    }
+
+    /**
+     *  @dev Withdraw from AssetManager
+     *  @param token ERC20 token address
+     *  @param account User address
+     *  @param amount ERC20 token address
+     *  @return Withdraw amount
+     */
+    function withdraw(
+        address token,
+        address account,
+        uint256 amount
+    ) external override whenNotPaused nonReentrant onlyAuth(token) returns (bool) {
+        require(_checkSenderBalance(msg.sender, token, amount), ""AssetManager: balance not enough to withdraw"");
+
+        uint256 remaining = amount;
+
+        // If there are tokens in Asset Manager then transfer them on priority
+        uint256 selfBalance = IERC20Upgradeable(token).balanceOf(address(this));
+        if (selfBalance > 0) {
+            uint256 withdrawAmount = selfBalance < remaining ? selfBalance : remaining;
+            remaining -= withdrawAmount;
+            IERC20Upgradeable(token).safeTransfer(account, withdrawAmount);
+        }
+
+        if (isMarketSupported(token)) {
+            // iterate markets according to defined sequence and withdraw
+            for (uint256 i = 0; i < withdrawSeq.length && remaining > 0; i++) {
+                IMoneyMarketAdapter moneyMarket = moneyMarkets[withdrawSeq[i]];
+                if (!moneyMarket.supportsToken(token)) continue;
+
+                uint256 supply = moneyMarket.getSupply(token);
+                if (supply == 0) continue;
+
+                uint256 withdrawAmount = supply < remaining ? supply : remaining;
+                remaining -= withdrawAmount;
+                moneyMarket.withdraw(token, account, withdrawAmount);
+            }
+        }
+
+        if (!_isUToken(msg.sender, token)) {
+            balances[msg.sender][token] = balances[msg.sender][token] - amount + remaining;
+            totalPrincipal[token] = totalPrincipal[token] - amount + remaining;
+        }
+
+        emit LogWithdraw(token, account, amount, remaining);
+
+        return true;
+    }
+
+    function debtWriteOff(address token, uint256 amount) external override {
+        require(balances[msg.sender][token] >= amount, ""AssetManager: balance not enough"");
+        balances[msg.sender][token] -= amount;
+        totalPrincipal[token] -= amount;
+    }
+
+    /**
+     *  @dev Add a new ERC20 token to support in AssetManager
+     *  @param tokenAddress ERC20 token address
+     */
+    function addToken(address tokenAddress) external override onlyAdmin {
+        require(!supportedMarkets[tokenAddress].isSupported, ""AssetManager: token is exist"");
+        supportedTokensList.push(tokenAddress);
+        supportedMarkets[tokenAddress].isSupported = true;
+
+        approveAllMarketsMax(tokenAddress);
+    }
+
+    /**
+     *  @dev For a give token set allowance for all integrated money markets
+     *  @param tokenAddress ERC20 token address
+     */
+    function approveAllMarketsMax(address tokenAddress) public override onlyAdmin {
+        IERC20Upgradeable poolToken = IERC20Upgradeable(tokenAddress);
+        for (uint256 i = 0; i < moneyMarkets.length; i++) {
+            poolToken.safeApprove(address(moneyMarkets[i]), 0);
+            poolToken.safeApprove(address(moneyMarkets[i]), type(uint256).max);
+        }
+    }
+
+    /**
+     *  @dev Add a new adapter for the underlying lending protocol
+     *  @param adapterAddress adapter address
+     */
+    function addAdapter(address adapterAddress) external override onlyAdmin {
+        bool isExist = false;
+        for (uint256 i = 0; i < moneyMarkets.length; i++) {
+            if (adapterAddress == address(moneyMarkets[i])) isExist = true;
+        }
+
+        if (!isExist) moneyMarkets.push(IMoneyMarketAdapter(adapterAddress));
+
+        approveAllTokensMax(adapterAddress);
+    }
+
+    function overwriteAdapters(address[] calldata adapters) external onlyAdmin {
+        moneyMarkets = new IMoneyMarketAdapter[](adapters.length);
+        for (uint256 i = 0; i < adapters.length; i++) {
+            moneyMarkets[i] = IMoneyMarketAdapter(adapters[i]);
+        }
+    }
+
+    /**
+     *  @dev For a give moeny market set allowance for all underlying tokens
+     *  @param adapterAddress Address of adaptor for money market
+     */
+    function approveAllTokensMax(address adapterAddress) public override onlyAdmin {
+        for (uint256 i = 0; i < supportedTokensList.length; i++) {
+            IERC20Upgradeable poolToken = IERC20Upgradeable(supportedTokensList[i]);
+            poolToken.safeApprove(adapterAddress, 0);
+            poolToken.safeApprove(adapterAddress, type(uint256).max);
+        }
+    }
+
+    /**
+     *  @dev Set withdraw sequence
+     *  @param newSeq priority sequence of money market indices to be used while withdrawing
+     */
+    function changeWithdrawSequence(uint256[] calldata newSeq) external override onlyAdmin {
+        withdrawSeq = newSeq;
+    }
+
+    /**
+     * @dev Take all the supply of `tokenAddress` and redistribute it according to `percentages`.
+     *
+     * Rejects if the token is not supported.
+     *
+     * @param tokenAddress Address of the token that is going to be rebalanced
+     * @param percentages A list of percentages, expressed as units in 10000, indicating how to deposit the tokens in
+     * each underlying money market. The length of this array is one less than the amount of money markets: the last
+     * money market will receive the remaining tokens. For example, if there are 3 money markets, and you want to
+     * rebalance so that the first one has 10.5% of the tokens, the second one 55%, and the third one 34.5%, this param
+     * will be [1050, 5500].
+     */
+    function rebalance(address tokenAddress, uint256[] calldata percentages)
+        external
+        override
+        checkMarketSupported(tokenAddress)
+        onlyAdmin
+    {
+        IERC20Upgradeable token = IERC20Upgradeable(tokenAddress);
+        require(percentages.length + 1 == moneyMarkets.length, ""AssetManager: percentages error"");
+
+        for (uint256 i = 0; i < moneyMarkets.length; i++) {
+            if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                continue;
+            }
+            moneyMarkets[i].withdrawAll(tokenAddress, address(this));
+        }
+
+        uint256 tokenSupply = token.balanceOf(address(this));
+
+        for (uint256 i = 0; i < percentages.length; i++) {
+            if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                continue;
+            }
+            uint256 amountToDeposit = (tokenSupply * percentages[i]) / 10000;
+            if (amountToDeposit == 0) {
+                continue;
+            }
+            token.safeTransfer(address(moneyMarkets[i]), amountToDeposit);
+            moneyMarkets[i].deposit(tokenAddress);
+        }
+
+        uint256 remainingTokens = token.balanceOf(address(this));
+        if (moneyMarkets[moneyMarkets.length - 1].supportsToken(tokenAddress) && remainingTokens > 0) {
+            token.safeTransfer(address(moneyMarkets[moneyMarkets.length - 1]), remainingTokens);
+            moneyMarkets[moneyMarkets.length - 1].deposit(tokenAddress);
+        }
+
+        require(token.balanceOf(address(this)) == 0, ""AssetManager: there are remaining funds in the fund pool"");
+
+        emit LogRebalance(tokenAddress, percentages);
+    }
+
+    /**
+     *  @dev Claim the tokens left on AssetManager balance, in case there are tokens get stuck here.
+     *  @param tokenAddress ERC20 token address
+     *  @param recipient Recipient address
+     */
+    function claimTokens(address tokenAddress, address recipient) external override onlyAdmin {
+        require(recipient != address(0), ""AsstManager: recipient can not be zero"");
+        IERC20Upgradeable token = IERC20Upgradeable(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        token.safeTransfer(recipient, balance);
+    }
+
+    /**
+     *  @dev Claim the tokens stuck in the integrated adapters
+     *  @param index MoneyMarkets array index
+     *  @param tokenAddress ERC20 token address
+     *  @param recipient Recipient address
+     */
+    function claimTokensFromAdapter(
+        uint256 index,
+        address tokenAddress,
+        address recipient
+    ) external override onlyAdmin {
+        IMoneyMarketAdapter moneyMarket = moneyMarkets[index];
+        moneyMarket.claimTokens(tokenAddress, recipient);
+    }
+
+    /**
+     *  @dev Get the number of supported underlying protocols.
+     *  @return MoneyMarkets length
+     */
+    function moneyMarketsCount() external view override returns (uint256) {
+        return moneyMarkets.length;
+    }
+
+    /**
+     *  @dev Get the count of supported tokens
+     *  @return Number of supported tokens
+     */
+    function supportedTokensCount() external view override returns (uint256) {
+        return supportedTokensList.length;
+    }
+
+    /**
+     *  @dev Get the supported lending protocol
+     *  @param tokenAddress ERC20 token address
+     *  @param marketId MoneyMarkets array index
+     *  @return rate tokenSupply, rate(compound is supplyRatePerBlock 1e18, aave is supplyRatePerYear 1e27)
+     */
+    function getMoneyMarket(address tokenAddress, uint256 marketId)
+        external
+        view
+        override
+        returns (uint256 rate, uint256 tokenSupply)
+    {
+        rate = moneyMarkets[marketId].getRate(tokenAddress);
+        tokenSupply += moneyMarkets[marketId].getSupplyView(tokenAddress);
+    }
+
+    function _checkSenderBalance(
+        address sender,
+        address tokenAddress,
+        uint256 amount
+    ) private view returns (bool) {
+        if (_isUToken(sender, tokenAddress)) {
+            // For all the lending markets, which have no deposits, return the tokens from the pool
+            return getLoanableAmount(tokenAddress) >= amount;
+        } else {
+            return balances[sender][tokenAddress] >= amount;
+        }
+    }
+
+    function _isUToken(address sender, address token) private view returns (bool) {
+        (address uTokenAddress, ) = IMarketRegistry(marketRegistry).tokens(token);
+        return uTokenAddress == sender;
+    }
+
+    function _isUserManager(address sender, address token) private view returns (bool) {
+        (, address userManagerAddress) = IMarketRegistry(marketRegistry).tokens(token);
+        return userManagerAddress == sender;
+    }
+}",4121.0,481.0,"***[M-02] Rebalance will fail due to low precision of percentages***
+The `AssetManager.rebalance` function has a check at the end to ensure that all tokens are deposited again:
+“require(token.balanceOf(address(this)) == 0, ""AssetManager: there are remaining funds in the fund pool”);""
+The idea is that the last market deposits all `remainingTokens` but the last market does not have to support the token in which case the transaction will fail, or the `percentages` parameter needs to be chosen to distribute all tokens before the last one (they need to add up to 1e4). However, these percentages have a low precision as they are in base points, i.e, the lowest unit is `1 = 0.01%`. This will leave dust in the contract in most cases as the tokens have much higher precision.",1.0,"pragma solidity ^0.8.4;
+pragma abicoder v1;
+
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""../Controller.sol"";
+import ""../interfaces/IMarketRegistry.sol"";
+import ""../interfaces/IMoneyMarketAdapter.sol"";
+import ""../interfaces/IAssetManager.sol"";
+
+
+contract AssetManager is Controller, ReentrancyGuardUpgradeable, IAssetManager {
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+    using AddressUpgradeable for address;
+
+    IMoneyMarketAdapter[] public moneyMarkets;
+    mapping(address => Market) public supportedMarkets;
+    address[] public supportedTokensList;
+    
+    mapping(address => mapping(address => uint256)) public balances; 
+    mapping(address => uint256) public totalPrincipal; 
+    address public marketRegistry;
+    
+    uint256[] public withdrawSeq; 
+
+    struct Market {
+        bool isSupported;
+    }
+
+    modifier checkMarketSupported(address token) {
+        require(isMarketSupported(token), ""AssetManager: token not support"");
+        _;
+    }
+
+    modifier onlyAuth(address token) {
+        require(
+            _isUToken(msg.sender, token) || _isUserManager(msg.sender, token),
+            ""AssetManager: sender must uToken or userManager""
+        );
+        _;
+    }
+
+    
+    event LogDeposit(address indexed token, address indexed account, uint256 amount);
+    
+    event LogWithdraw(address indexed token, address indexed account, uint256 amount, uint256 remaining);
+    
+    event LogRebalance(address tokenAddress, uint256[] percentages);
+
+    function __AssetManager_init(address _marketRegistry) public initializer {
+        Controller.__Controller_init(msg.sender);
+        ReentrancyGuardUpgradeable.__ReentrancyGuard_init();
+        marketRegistry = _marketRegistry;
+    }
+
+    function setMarketRegistry(address _marketRegistry) external onlyAdmin {
+        marketRegistry = _marketRegistry;
+    }
+
+    
+    function getPoolBalance(address tokenAddress) public view override returns (uint256) {
+        IERC20Upgradeable poolToken = IERC20Upgradeable(tokenAddress);
+        uint256 balance = poolToken.balanceOf(address(this));
+        if (isMarketSupported(tokenAddress)) {
+            return totalSupplyView(tokenAddress) + balance;
+        } else {
+            return balance;
+        }
+    }
+
+    
+    function getLoanableAmount(address tokenAddress) public view override returns (uint256) {
+        uint256 poolBalance = getPoolBalance(tokenAddress);
+        if (poolBalance > totalPrincipal[tokenAddress]) return poolBalance - totalPrincipal[tokenAddress];
+        return 0;
+    }
+
+    
+    function totalSupply(address tokenAddress) public override returns (uint256) {
+        if (isMarketSupported(tokenAddress)) {
+            uint256 tokenSupply = 0;
+            for (uint256 i = 0; i < moneyMarkets.length; i++) {
+                if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                    continue;
+                }
+                tokenSupply += moneyMarkets[i].getSupply(tokenAddress);
+            }
+
+            return tokenSupply;
+        } else {
+            return 0;
+        }
+    }
+
+    
+    function totalSupplyView(address tokenAddress) public view override returns (uint256) {
+        if (isMarketSupported(tokenAddress)) {
+            uint256 tokenSupply = 0;
+            for (uint256 i = 0; i < moneyMarkets.length; i++) {
+                if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                    continue;
+                }
+                tokenSupply += moneyMarkets[i].getSupplyView(tokenAddress);
+            }
+
+            return tokenSupply;
+        } else {
+            return 0;
+        }
+    }
+
+    
+    function isMarketSupported(address tokenAddress) public view override returns (bool) {
+        return supportedMarkets[tokenAddress].isSupported;
+    }
+
+    
+    function deposit(address token, uint256 amount)
+        external
+        override
+        whenNotPaused
+        onlyAuth(token)
+        nonReentrant
+        returns (bool)
+    {
+        IERC20Upgradeable poolToken = IERC20Upgradeable(token);
+        require(amount > 0, ""AssetManager: amount can not be zero"");
+
+        if (!_isUToken(msg.sender, token)) {
+            balances[msg.sender][token] += amount;
+            totalPrincipal[token] += amount;
+        }
+
+        bool remaining = true;
+        if (isMarketSupported(token)) {
+            
+            
+            
+            for (uint256 i = 0; i < moneyMarkets.length && remaining; i++) {
+                IMoneyMarketAdapter moneyMarket = moneyMarkets[i];
+
+                if (!moneyMarket.supportsToken(token)) continue;
+                if (moneyMarket.floorMap(token) <= moneyMarket.getSupply(token)) continue;
+
+                poolToken.safeTransferFrom(msg.sender, address(moneyMarket), amount);
+                moneyMarket.deposit(token);
+                remaining = false;
+            }
+
+            
+            
+            
+            
+            for (uint256 j = moneyMarkets.length; j > 0 && remaining; j--) {
+                IMoneyMarketAdapter moneyMarket = moneyMarkets[j - 1];
+                if (!moneyMarket.supportsToken(token)) continue;
+
+                uint256 supply = moneyMarket.getSupply(token);
+                uint256 ceiling = moneyMarket.ceilingMap(token);
+                if (ceiling <= supply) continue;
+                if (supply + amount > ceiling) continue;
+
+                poolToken.safeTransferFrom(msg.sender, address(moneyMarket), amount);
+                moneyMarket.deposit(token);
+                remaining = false;
+            }
+        }
+
+        if (remaining) {
+            poolToken.safeTransferFrom(msg.sender, address(this), amount);
+        }
+
+        emit LogDeposit(token, msg.sender, amount);
+
+        return true;
+    }
+
+    
+    function withdraw(
+        address token,
+        address account,
+        uint256 amount
+    ) external override whenNotPaused nonReentrant onlyAuth(token) returns (bool) {
+        require(_checkSenderBalance(msg.sender, token, amount), ""AssetManager: balance not enough to withdraw"");
+
+        uint256 remaining = amount;
+
+        
+        uint256 selfBalance = IERC20Upgradeable(token).balanceOf(address(this));
+        if (selfBalance > 0) {
+            uint256 withdrawAmount = selfBalance < remaining ? selfBalance : remaining;
+            remaining -= withdrawAmount;
+            IERC20Upgradeable(token).safeTransfer(account, withdrawAmount);
+        }
+
+        if (isMarketSupported(token)) {
+            
+            for (uint256 i = 0; i < withdrawSeq.length && remaining > 0; i++) {
+                IMoneyMarketAdapter moneyMarket = moneyMarkets[withdrawSeq[i]];
+                if (!moneyMarket.supportsToken(token)) continue;
+
+                uint256 supply = moneyMarket.getSupply(token);
+                if (supply == 0) continue;
+
+                uint256 withdrawAmount = supply < remaining ? supply : remaining;
+                remaining -= withdrawAmount;
+                moneyMarket.withdraw(token, account, withdrawAmount);
+            }
+        }
+
+        if (!_isUToken(msg.sender, token)) {
+            balances[msg.sender][token] = balances[msg.sender][token] - amount + remaining;
+            totalPrincipal[token] = totalPrincipal[token] - amount + remaining;
+        }
+
+        emit LogWithdraw(token, account, amount, remaining);
+
+        return true;
+    }
+
+    function debtWriteOff(address token, uint256 amount) external override {
+        require(balances[msg.sender][token] >= amount, ""AssetManager: balance not enough"");
+        balances[msg.sender][token] -= amount;
+        totalPrincipal[token] -= amount;
+    }
+
+    
+    function addToken(address tokenAddress) external override onlyAdmin {
+        require(!supportedMarkets[tokenAddress].isSupported, ""AssetManager: token is exist"");
+        supportedTokensList.push(tokenAddress);
+        supportedMarkets[tokenAddress].isSupported = true;
+
+        approveAllMarketsMax(tokenAddress);
+    }
+
+    
+    function approveAllMarketsMax(address tokenAddress) public override onlyAdmin {
+        IERC20Upgradeable poolToken = IERC20Upgradeable(tokenAddress);
+        for (uint256 i = 0; i < moneyMarkets.length; i++) {
+            poolToken.safeApprove(address(moneyMarkets[i]), 0);
+            poolToken.safeApprove(address(moneyMarkets[i]), type(uint256).max);
+        }
+    }
+
+    
+    function addAdapter(address adapterAddress) external override onlyAdmin {
+        bool isExist = false;
+        for (uint256 i = 0; i < moneyMarkets.length; i++) {
+            if (adapterAddress == address(moneyMarkets[i])) isExist = true;
+        }
+
+        if (!isExist) moneyMarkets.push(IMoneyMarketAdapter(adapterAddress));
+
+        approveAllTokensMax(adapterAddress);
+    }
+
+    function overwriteAdapters(address[] calldata adapters) external onlyAdmin {
+        moneyMarkets = new IMoneyMarketAdapter[](adapters.length);
+        for (uint256 i = 0; i < adapters.length; i++) {
+            moneyMarkets[i] = IMoneyMarketAdapter(adapters[i]);
+        }
+    }
+
+    
+    function approveAllTokensMax(address adapterAddress) public override onlyAdmin {
+        for (uint256 i = 0; i < supportedTokensList.length; i++) {
+            IERC20Upgradeable poolToken = IERC20Upgradeable(supportedTokensList[i]);
+            poolToken.safeApprove(adapterAddress, 0);
+            poolToken.safeApprove(adapterAddress, type(uint256).max);
+        }
+    }
+
+    
+    function changeWithdrawSequence(uint256[] calldata newSeq) external override onlyAdmin {
+        withdrawSeq = newSeq;
+    }
+
+    
+    function rebalance(address tokenAddress, uint256[] calldata percentages)
+        external
+        override
+        checkMarketSupported(tokenAddress)
+        onlyAdmin
+    {
+        IERC20Upgradeable token = IERC20Upgradeable(tokenAddress);
+        require(percentages.length + 1 == moneyMarkets.length, ""AssetManager: percentages error"");
+
+        for (uint256 i = 0; i < moneyMarkets.length; i++) {
+            if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                continue;
+            }
+            moneyMarkets[i].withdrawAll(tokenAddress, address(this));
+        }
+
+        uint256 tokenSupply = token.balanceOf(address(this));
+
+        for (uint256 i = 0; i < percentages.length; i++) {
+            if (!moneyMarkets[i].supportsToken(tokenAddress)) {
+                continue;
+            }
+            uint256 amountToDeposit = (tokenSupply * percentages[i]) / 10000;
+            if (amountToDeposit == 0) {
+                continue;
+            }
+            token.safeTransfer(address(moneyMarkets[i]), amountToDeposit);
+            moneyMarkets[i].deposit(tokenAddress);
+        }
+
+        uint256 remainingTokens = token.balanceOf(address(this));
+        if (moneyMarkets[moneyMarkets.length - 1].supportsToken(tokenAddress) && remainingTokens > 0) {
+            token.safeTransfer(address(moneyMarkets[moneyMarkets.length - 1]), remainingTokens);
+            moneyMarkets[moneyMarkets.length - 1].deposit(tokenAddress);
+        }
+
+        require(token.balanceOf(address(this)) == 0, ""AssetManager: there are remaining funds in the fund pool"");
+
+        emit LogRebalance(tokenAddress, percentages);
+    }
+
+    
+    function claimTokens(address tokenAddress, address recipient) external override onlyAdmin {
+        require(recipient != address(0), ""AsstManager: recipient can not be zero"");
+        IERC20Upgradeable token = IERC20Upgradeable(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        token.safeTransfer(recipient, balance);
+    }
+
+    
+    function claimTokensFromAdapter(
+        uint256 index,
+        address tokenAddress,
+        address recipient
+    ) external override onlyAdmin {
+        IMoneyMarketAdapter moneyMarket = moneyMarkets[index];
+        moneyMarket.claimTokens(tokenAddress, recipient);
+    }
+
+    
+    function moneyMarketsCount() external view override returns (uint256) {
+        return moneyMarkets.length;
+    }
+
+    
+    function supportedTokensCount() external view override returns (uint256) {
+        return supportedTokensList.length;
+    }
+
+    
+    function getMoneyMarket(address tokenAddress, uint256 marketId)
+        external
+        view
+        override
+        returns (uint256 rate, uint256 tokenSupply)
+    {
+        rate = moneyMarkets[marketId].getRate(tokenAddress);
+        tokenSupply += moneyMarkets[marketId].getSupplyView(tokenAddress);
+    }
+
+    function _checkSenderBalance(
+        address sender,
+        address tokenAddress,
+        uint256 amount
+    ) private view returns (bool) {
+        if (_isUToken(sender, tokenAddress)) {
+            
+            return getLoanableAmount(tokenAddress) >= amount;
+        } else {
+            return balances[sender][tokenAddress] >= amount;
+        }
+    }
+
+    function _isUToken(address sender, address token) private view returns (bool) {
+        (address uTokenAddress, ) = IMarketRegistry(marketRegistry).tokens(token);
+        return uTokenAddress == sender;
+    }
+
+    function _isUserManager(address sender, address token) private view returns (bool) {
+        (, address userManagerAddress) = IMarketRegistry(marketRegistry).tokens(token);
+        return userManagerAddress == sender;
+    }
+}",2812.0,0,1,"Here are the potential vulnerabilities in the provided smart contract:
+
+1. **Front-Running Vulnerability**:
+   - The `deposit` and `withdraw` functions could be susceptible to front-running attacks, where attackers could manipulate transaction ordering for their benefit.
+
+2. **Unlimited Token Approvals**:
+   - `approveAllMarketsMax` and `approveAllTokensMax` functions approve unlimited (type(uint256).max) token amounts, which could be risky if any of the money market adapters are compromised.
+
+3. **Centralization Risks**:
+   - Many critical functions are controlled by admin (`onlyAdmin` modifier), creating centralization risks:
+     - `setMarketRegistry`
+     - `addToken`
+     - `addAdapter`
+     - `overwriteAdapters`
+     - `claimTokens`
+     - `claimTokensFromAdapter`
+
+4. **Integer Overflow/Underflow**:
+   - While Solidity 0.8.4 includes built-in overflow checks, complex calculations in `rebalance` function with percentages could potentially cause issues.
+
+5. **Missing Input Validation**:
+   - `changeWithdrawSequence` doesn't validate if the sequence indices are within bounds
+   - `rebalance` function's percentages aren't validated to sum to 100% (10000 basis points)
+
+6. **Reentrancy Risks in External Calls**:
+   - While the contract uses ReentrancyGuard, there are still external calls to potentially untrusted contracts (moneyMarkets[i])
+
+7. **Missing Zero-Address Checks**:
+   - `setMarketRegistry` doesn't check for zero address
+   - `addAdapter` doesn't validate the adapter address
+
+8. **State Changes After External Calls**:
+   - In the `withdraw` function, state changes occur after external calls, which could be risky
+
+9. **Precision Loss**:
+   - Calculations involving percentages in `rebalance` function might lead to precision loss due to integer division
+
+10. **Missing Events**:
+    - Several admin functions lack event emissions for important state changes
+
+11. **Dependency Risks**:
+    - Heavy reliance on external money market adapters which could be vulnerable or malicious
+
+12. **DOS Potential**:
+    - Loops in `deposit`, `withdraw`, and `rebalance` functions could hit gas limits with many adapters
+
+13. **Missing Emergency Stop**:
+    - While there's a `whenNotPaused` modifier, some critical admin functions aren't pausable
+
+14. **Token Approval Race Condition**:
+    - The pattern of setting approval to 0 before setting to max value might still be vulnerable to race conditions
+
+To mitigate these vulnerabilities:
+- Add comprehensive input validation
+- Implement emergency stop mechanisms for all critical functions
+- Add events for all important state changes
+- Consider implementing limits on adapter count
+- Add more granular access controls
+- Implement proper bounds checking
+- Consider using a more secure token approval pattern
+- Add thorough zero-address checks
+- Consider implementing maximum caps on deposits/withdrawals","### **[M-02] Rebalance will fail due to low precision of percentages**
+
+**Report Description**:
+The `AssetManager.rebalance` function includes a check to ensure all tokens are deposited again:  
+`require(token.balanceOf(address(this)) == 0, ""AssetManager: there are remaining funds in the fund pool"");`  
+The function attempts to distribute all tokens by depositing them into markets. However, the `percentages` parameter, which is in basis points (1 = 0.01%), has low precision. This can result in ""dust"" (small leftover amounts) remaining in the contract because tokens typically have much higher precision. Additionally, if the last market does not support the token, the transaction will fail unless the percentages are carefully chosen to sum exactly to `1e4` (100%). This issue can lead to failed transactions or unintended token balances in the contract.
+
+**Match in Response List**:
+Matches with the issue titled **""Precision Loss""**.
+
+**Validation**:
+**Partially Correct**. The response identifies the issue of precision loss in calculations involving percentages in the `rebalance` function, which aligns with the core problem described in the issue report. However, the response does not explicitly address the specific risk of dust remaining in the contract due to the low precision of basis points or the potential for transaction failure if the percentages do not sum to `1e4`. These critical details are missing, making the response partially correct.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- **[M-02] Rebalance will fail due to low precision of percentages**
+
+**Missed Issues from Issue Report**:
+- *None*
+
+---
+
+### **Analysis of Gaps**
+The response list covers a broad range of vulnerabilities but lacks depth in addressing the specific nuances of the `rebalance` function's precision issue. While the ""Precision Loss"" item correctly identifies the general problem, it does not fully capture the risks of dust accumulation or transaction failure due to the low precision of basis points. This highlights a gap in the response list's coverage of this particular issue.",0,1,0,14,"```
+None.
+```",0.0,0
+,,,,,,,,2,2,,,1,1,2,39,,,0.1429

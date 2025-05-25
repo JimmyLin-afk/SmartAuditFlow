@@ -1,0 +1,3934 @@
+nameid,code,tokens,loc,issue,vulnumber,code_snippet,processtokens,high_severity_count,medium_severity_count,Findings,Comparison,Correct Matches,Partially Correct,Missed,GPT-generated,matchList,MAP,Score,execution_time,total_tokens,total_steps
+Exposure.sol,"// SPDX-License-Identifier: AGPLv3
+pragma solidity >=0.6.0 <0.7.0;
+pragma experimental ABIEncoderV2;
+
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""../common/StructDefinitions.sol"";
+import ""../common/Constants.sol"";
+import ""../common/Controllable.sol"";
+import ""../common/Whitelist.sol"";
+import ""../interfaces/IERC20Detailed.sol"";
+import ""../interfaces/ILifeGuard.sol"";
+import ""../interfaces/IExposure.sol"";
+import ""../interfaces/IVault.sol"";
+import ""../interfaces/IBuoy.sol"";
+
+/// @notice Contract for calculating current protocol exposures on a stablecoin and
+///     protocol level. This contract can be upgraded if the systems underlying protocols
+///     or tokens have changed. Protocol exposure are calculated at a high level, as any
+///     additional exposures from underlying protocol exposures should at most be equal to
+///     the high level exposure.
+///     For example: harvest finance stablecoin vaults (fTokens)
+///         - High level exposure
+///             - Harvest finance
+///         - Low level exposures (from fToken investments):
+///             - Compound
+///             - Idle finance
+///     Neither of these two low level exposures should matter as long as there arent
+///     additional exposure to these protocol elsewhere. So by desing, the protocols
+///     are given indexes based on the strategies in the stablecoin vaults, which need
+///     to be symetrical for this to work - e.g. all vaults needs to have the same exposure
+///     profile, and non of these exposure profiles can overlap. In the case where the
+///     additional exposure needs to be taken into account (maker has USDC collateral,
+///     Curve adds exposure to all stablecoins in a liquidity pool), they will be calculated
+///     and added ontop of the base exposure from vaults and strategies.
+///
+///     --------------------------------------------------------
+///     Current protocol setup:
+///     --------------------------------------------------------
+///     Stablecoins: DAI, USDC, USDT
+///     LP tokens: 3Crv
+///     Vaults: DAIVault, USDCVault, USDTVault, 3Crv vault
+///     Strategy (exposures):
+///         - Compound
+///         - Idle finance
+///         - Yearn Generic Lender:
+///             - Cream
+///         - CurveXpool:
+///             - Curve3Pool
+///             - CurveMetaPool
+///             - Yearn
+contract Exposure is Constants, Controllable, Whitelist, IExposure {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    uint256 public protocolCount;
+    uint256 public makerUSDCExposure;
+
+    event LogNewProtocolCount(uint256 count);
+    event LogNewMakerExposure(uint256 exposure);
+
+    /// @notice Add protocol for the exposure calculations
+    /// @dev Currently set to:
+    ///     1 - Harvest finance
+    ///     2 - Cream
+    ///     Curve exposure is calculated separately as it has wider system impact
+    function setProtocolCount(uint256 _protocolCount) external onlyOwner {
+        protocolCount = _protocolCount;
+        emit LogNewProtocolCount(_protocolCount);
+    }
+
+    /// @notice Specify additional USDC exposure to Maker
+    /// @param _makerUSDCExposure Exposure amount to Maker
+    function setMakerUSDCExposure(uint256 _makerUSDCExposure) external onlyOwner {
+        makerUSDCExposure = _makerUSDCExposure;
+        emit LogNewMakerExposure(_makerUSDCExposure);
+    }
+
+    function getExactRiskExposure(SystemState calldata sysState)
+        external
+        view
+        override
+        returns (ExposureState memory expState)
+    {
+        expState = _calcRiskExposure(sysState, false);
+        ILifeGuard lifeguard = ILifeGuard(_controller().lifeGuard());
+        IBuoy buoy = IBuoy(_controller().buoy());
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 assets = lifeguard.assets(i);
+            uint256 assetsUsd = buoy.singleStableToUsd(assets, i);
+            expState.stablecoinExposure[i] = expState.stablecoinExposure[i].add(
+                assetsUsd.mul(PERCENTAGE_DECIMAL_FACTOR).div(sysState.totalCurrentAssetsUsd)
+            );
+        }
+    }
+
+    /// @notice Calculate stablecoin and protocol level risk exposure
+    /// @param sysState Struct holding info about systems current state
+    /// @dev This loops through all the vaults, checks the amount of assets in them
+    ///     and their underlying strategies to understand stablecoin exposure
+    ///     - Any assets invested in Curve or similar AMM will have additional stablecoin exposure.
+    ///     The protocol exposure is calculated by assessing the amount of assets each
+    ///     vault has invested in a strategy.
+    function calcRiskExposure(SystemState calldata sysState)
+        external
+        view
+        override
+        returns (ExposureState memory expState)
+    {
+        expState = _calcRiskExposure(sysState, true);
+
+        // Establish if any stablecoin/protocol is over exposed
+        (expState.stablecoinExposed, expState.protocolExposed) = isExposed(
+            sysState.rebalanceThreshold,
+            expState.stablecoinExposure,
+            expState.protocolExposure,
+            expState.curveExposure
+        );
+    }
+
+    /// @notice Do a rough USD dollar calculation by treating every stablecoin as
+    ///     worth 1 USD and set all Decimals to 18
+    function getUnifiedAssets(address[N_COINS] calldata vaults)
+        public
+        view
+        override
+        returns (uint256 unifiedTotalAssets, uint256[N_COINS] memory unifiedAssets)
+    {
+        // unify all assets to 18 decimals, treat each stablecoin as being worth 1 USD
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 assets = IVault(vaults[i]).totalAssets();
+            unifiedAssets[i] = assets.mul(DEFAULT_DECIMALS_FACTOR).div(
+                uint256(10)**IERC20Detailed(IVault(vaults[i]).token()).decimals()
+            );
+            unifiedTotalAssets = unifiedTotalAssets.add(unifiedAssets[i]);
+        }
+    }
+
+    /// @notice Rough delta calculation - assumes each stablecoin is priced at 1 USD,
+    ///     and looks at differences between current allocations and target allocations
+    /// @param targets Stable coin allocation targest
+    /// @param vaults Stablecoin vaults
+    /// @param withdrawUsd USD value of withdrawals
+    function calcRoughDelta(
+        uint256[N_COINS] calldata targets,
+        address[N_COINS] calldata vaults,
+        uint256 withdrawUsd
+    ) external view override returns (uint256[N_COINS] memory delta) {
+        (uint256 totalAssets, uint256[N_COINS] memory vaultTotalAssets) = getUnifiedAssets(vaults);
+
+        require(totalAssets > withdrawUsd, ""totalAssets < withdrawalUsd"");
+        totalAssets = totalAssets.sub(withdrawUsd);
+        uint256 totalDelta;
+        for (uint256 i; i < N_COINS; i++) {
+            uint256 target = totalAssets.mul(targets[i]).div(PERCENTAGE_DECIMAL_FACTOR);
+            if (vaultTotalAssets[i] > target) {
+                delta[i] = vaultTotalAssets[i].sub(target);
+                totalDelta = totalDelta.add(delta[i]);
+            }
+        }
+        uint256 percent = PERCENTAGE_DECIMAL_FACTOR;
+        for (uint256 i; i < N_COINS - 1; i++) {
+            if (delta[i] > 0) {
+                delta[i] = delta[i].mul(PERCENTAGE_DECIMAL_FACTOR).div(totalDelta);
+                percent = percent.sub(delta[i]);
+            }
+        }
+        delta[N_COINS - 1] = percent;
+        return delta;
+    }
+
+    /// @notice Sort vaults by the delta of target asset - current asset,
+    ///     only support 3 vaults now
+    /// @param bigFirst Return array order most exposed -> least exposed
+    /// @param unifiedTotalAssets Estimated system USD assets
+    /// @param unifiedAssets Estimated vault USD assets
+    /// @param targetPercents Vault target percent array
+    function sortVaultsByDelta(
+        bool bigFirst,
+        uint256 unifiedTotalAssets,
+        uint256[N_COINS] calldata unifiedAssets,
+        uint256[N_COINS] calldata targetPercents
+    ) external pure override returns (uint256[N_COINS] memory vaultIndexes) {
+        uint256 maxIndex;
+        uint256 minIndex;
+        int256 maxDelta;
+        int256 minDelta;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            // Get difference between vault current assets and vault target
+            int256 delta = int256(
+                unifiedAssets[i] - unifiedTotalAssets.mul(targetPercents[i]).div(PERCENTAGE_DECIMAL_FACTOR)
+            );
+            // Establish order
+            if (delta > maxDelta) {
+                maxDelta = delta;
+                maxIndex = i;
+            } else if (delta < minDelta) {
+                minDelta = delta;
+                minIndex = i;
+            }
+        }
+        if (bigFirst) {
+            vaultIndexes[0] = maxIndex;
+            vaultIndexes[2] = minIndex;
+        } else {
+            vaultIndexes[0] = minIndex;
+            vaultIndexes[2] = maxIndex;
+        }
+        vaultIndexes[1] = N_COINS - maxIndex - minIndex;
+    }
+
+    /// @notice Calculate what percentage of system total assets the assets in a strategy make up
+    /// @param vault Address of target vault that holds the strategy
+    /// @param index Index of strategy
+    /// @param vaultAssetsPercent Percentage of system assets
+    /// @param vaultAssets Total assets in vaults
+    function calculatePercentOfSystem(
+        address vault,
+        uint256 index,
+        uint256 vaultAssetsPercent,
+        uint256 vaultAssets
+    ) private view returns (uint256 percentOfSystem) {
+        if (vaultAssets == 0) return 0;
+        uint256 strategyAssetsPercent = IVault(vault).getStrategyAssets(index).mul(PERCENTAGE_DECIMAL_FACTOR).div(
+            vaultAssets
+        );
+
+        percentOfSystem = vaultAssetsPercent.mul(strategyAssetsPercent).div(PERCENTAGE_DECIMAL_FACTOR);
+    }
+
+    /// @notice Calculate the net stablecoin exposure
+    /// @param directlyExposure Amount of stablecoin in vault+strategies
+    /// @param curveExposure Percent of assets in Curve
+    function calculateStableCoinExposure(uint256[N_COINS] memory directlyExposure, uint256 curveExposure)
+        private
+        view
+        returns (uint256[N_COINS] memory stableCoinExposure)
+    {
+        uint256 maker = directlyExposure[0].mul(makerUSDCExposure).div(PERCENTAGE_DECIMAL_FACTOR);
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 indirectExposure = curveExposure;
+            if (i == 1) {
+                indirectExposure = indirectExposure.add(maker);
+            }
+            stableCoinExposure[i] = directlyExposure[i].add(indirectExposure);
+        }
+    }
+
+    /// @notice Determine if an assets or protocol is overexposed
+    /// @param rebalanceThreshold Threshold for triggering a rebalance due to overexposure
+    /// @param stableCoinExposure Current stable coin exposures
+    /// @param protocolExposure Current prtocol exposures
+    /// @param curveExposure Current Curve exposure
+    function isExposed(
+        uint256 rebalanceThreshold,
+        uint256[N_COINS] memory stableCoinExposure,
+        uint256[] memory protocolExposure,
+        uint256 curveExposure
+    ) private pure returns (bool stablecoinExposed, bool protocolExposed) {
+        for (uint256 i = 0; i < N_COINS; i++) {
+            if (stableCoinExposure[i] > rebalanceThreshold) {
+                stablecoinExposed = true;
+                break;
+            }
+        }
+        for (uint256 i = 0; i < protocolExposure.length; i++) {
+            if (protocolExposure[i] > rebalanceThreshold) {
+                protocolExposed = true;
+                break;
+            }
+        }
+        if (!protocolExposed && curveExposure > rebalanceThreshold) protocolExposed = true;
+        return (stablecoinExposed, protocolExposed);
+    }
+
+    function _calcRiskExposure(SystemState memory sysState, bool treatLifeguardAsCurve)
+        private
+        view
+        returns (ExposureState memory expState)
+    {
+        address[N_COINS] memory vaults = _controller().vaults();
+        uint256 pCount = protocolCount;
+        expState.protocolExposure = new uint256[](pCount);
+        if (sysState.totalCurrentAssetsUsd == 0) {
+            return expState;
+        }
+        // Stablecoin exposure
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 vaultAssetsPercent = sysState.vaultCurrentAssetsUsd[i].mul(PERCENTAGE_DECIMAL_FACTOR).div(
+                sysState.totalCurrentAssetsUsd
+            );
+            expState.stablecoinExposure[i] = vaultAssetsPercent;
+            // Protocol exposure
+            for (uint256 j = 0; j < pCount; j++) {
+                uint256 percentOfSystem = calculatePercentOfSystem(
+                    vaults[i],
+                    j,
+                    vaultAssetsPercent,
+                    sysState.vaultCurrentAssets[i]
+                );
+                expState.protocolExposure[j] = expState.protocolExposure[j].add(percentOfSystem);
+            }
+        }
+        if (treatLifeguardAsCurve) {
+            // Curve exposure is calculated by adding the Curve vaults total assets and any
+            // assets in the lifeguard which are poised to be invested into the Curve vault
+            expState.curveExposure = sysState.curveCurrentAssetsUsd.add(sysState.lifeguardCurrentAssetsUsd);
+        } else {
+            expState.curveExposure = sysState.curveCurrentAssetsUsd;
+        }
+        expState.curveExposure = expState.curveExposure.mul(PERCENTAGE_DECIMAL_FACTOR).div(
+            sysState.totalCurrentAssetsUsd
+        );
+
+        // Calculate stablecoin exposures
+        expState.stablecoinExposure = calculateStableCoinExposure(expState.stablecoinExposure, expState.curveExposure);
+    }
+}",3117.0,318.0,"[H-01] implicit underflows
+Function `sortVaultsByDelta()`There are a few underflows that are converted via a typecast afterwards to the expected value. If solidity 0.8.x would be used, then the code would revert.
+- int256(a-b) where a and b are uint: For example, if a=1 and b=2, then the intermediate result would be uint(-1) == 2**256-1
+- int256(-x) where x is a uint. For example, if x=1, then the intermediate result would be uint(-1) == 2**256-1
+It's better not to have underflows by using the appropriate typecasts. This is especially relevant when moving to solidity 0.8.x.```function sortVaultsByDelta(..)
+..
+    for (uint256 i = 0; i < N_COINS; i++) {
+        // Get difference between vault current assets and vault target
+        int256 delta = int256(unifiedAssets[i] - unifiedTotalAssets.mul(targetPercents[i]).div(PERCENTAGE_DECIMAL_FACTOR)); // underflow in intermediate result```
+
+
+[H-04] sortVaultsByDelta doesn't work as expected
+The function `sortVaultsByDelta` doesn't always work as expected.
+Suppose all the delta's are positive, and delta1 >= delta2 >= delta3 > 0. Then `maxIndex = 0. And (delta < minDelta (==0) `) is never true, so `minIndex = 0`.
+Then (assuming bigFirst==true):
+```vaultIndexes[0] = maxIndex = 0
+vaultIndexes[2] = minIndex = 0
+vaultIndexes[1] = N_COINS - maxIndex - minIndex = 3-0-0 = 3
+```
+This is clearly not what is wanted, all `vaultIndexes` should be different and should be in the range [0..2]. This is due to the fact that `maxDelta` and `minDelta` are initialized with the value 0. This all could results in withdrawing from the wrong vaults and reverts (because vaultIndexes[1] is out of range).",2.0,"pragma solidity >=0.6.0 <0.7.0;
+pragma experimental ABIEncoderV2;
+
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""../common/StructDefinitions.sol"";
+import ""../common/Constants.sol"";
+import ""../common/Controllable.sol"";
+import ""../common/Whitelist.sol"";
+import ""../interfaces/IERC20Detailed.sol"";
+import ""../interfaces/ILifeGuard.sol"";
+import ""../interfaces/IExposure.sol"";
+import ""../interfaces/IVault.sol"";
+import ""../interfaces/IBuoy.sol"";
+
+
+contract Exposure is Constants, Controllable, Whitelist, IExposure {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    uint256 public protocolCount;
+    uint256 public makerUSDCExposure;
+
+    event LogNewProtocolCount(uint256 count);
+    event LogNewMakerExposure(uint256 exposure);
+
+
+    function setProtocolCount(uint256 _protocolCount) external onlyOwner {
+        protocolCount = _protocolCount;
+        emit LogNewProtocolCount(_protocolCount);
+    }
+
+    
+    
+    function setMakerUSDCExposure(uint256 _makerUSDCExposure) external onlyOwner {
+        makerUSDCExposure = _makerUSDCExposure;
+        emit LogNewMakerExposure(_makerUSDCExposure);
+    }
+
+    function getExactRiskExposure(SystemState calldata sysState)
+        external
+        view
+        override
+        returns (ExposureState memory expState)
+    {
+        expState = _calcRiskExposure(sysState, false);
+        ILifeGuard lifeguard = ILifeGuard(_controller().lifeGuard());
+        IBuoy buoy = IBuoy(_controller().buoy());
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 assets = lifeguard.assets(i);
+            uint256 assetsUsd = buoy.singleStableToUsd(assets, i);
+            expState.stablecoinExposure[i] = expState.stablecoinExposure[i].add(
+                assetsUsd.mul(PERCENTAGE_DECIMAL_FACTOR).div(sysState.totalCurrentAssetsUsd)
+            );
+        }
+    }
+
+
+    function calcRiskExposure(SystemState calldata sysState)
+        external
+        view
+        override
+        returns (ExposureState memory expState)
+    {
+        expState = _calcRiskExposure(sysState, true);
+
+        
+        (expState.stablecoinExposed, expState.protocolExposed) = isExposed(
+            sysState.rebalanceThreshold,
+            expState.stablecoinExposure,
+            expState.protocolExposure,
+            expState.curveExposure
+        );
+    }
+
+    
+    
+    function getUnifiedAssets(address[N_COINS] calldata vaults)
+        public
+        view
+        override
+        returns (uint256 unifiedTotalAssets, uint256[N_COINS] memory unifiedAssets)
+    {
+        
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 assets = IVault(vaults[i]).totalAssets();
+            unifiedAssets[i] = assets.mul(DEFAULT_DECIMALS_FACTOR).div(
+                uint256(10)**IERC20Detailed(IVault(vaults[i]).token()).decimals()
+            );
+            unifiedTotalAssets = unifiedTotalAssets.add(unifiedAssets[i]);
+        }
+    }
+
+
+    
+    function calcRoughDelta(
+        uint256[N_COINS] calldata targets,
+        address[N_COINS] calldata vaults,
+        uint256 withdrawUsd
+    ) external view override returns (uint256[N_COINS] memory delta) {
+        (uint256 totalAssets, uint256[N_COINS] memory vaultTotalAssets) = getUnifiedAssets(vaults);
+
+        require(totalAssets > withdrawUsd, ""totalAssets < withdrawalUsd"");
+        totalAssets = totalAssets.sub(withdrawUsd);
+        uint256 totalDelta;
+        for (uint256 i; i < N_COINS; i++) {
+            uint256 target = totalAssets.mul(targets[i]).div(PERCENTAGE_DECIMAL_FACTOR);
+            if (vaultTotalAssets[i] > target) {
+                delta[i] = vaultTotalAssets[i].sub(target);
+                totalDelta = totalDelta.add(delta[i]);
+            }
+        }
+        uint256 percent = PERCENTAGE_DECIMAL_FACTOR;
+        for (uint256 i; i < N_COINS - 1; i++) {
+            if (delta[i] > 0) {
+                delta[i] = delta[i].mul(PERCENTAGE_DECIMAL_FACTOR).div(totalDelta);
+                percent = percent.sub(delta[i]);
+            }
+        }
+        delta[N_COINS - 1] = percent;
+        return delta;
+    }
+
+
+    
+    function sortVaultsByDelta(
+        bool bigFirst,
+        uint256 unifiedTotalAssets,
+        uint256[N_COINS] calldata unifiedAssets,
+        uint256[N_COINS] calldata targetPercents
+    ) external pure override returns (uint256[N_COINS] memory vaultIndexes) {
+        uint256 maxIndex;
+        uint256 minIndex;
+        int256 maxDelta;
+        int256 minDelta;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            
+            int256 delta = int256(
+                unifiedAssets[i] - unifiedTotalAssets.mul(targetPercents[i]).div(PERCENTAGE_DECIMAL_FACTOR)
+            );
+            
+            if (delta > maxDelta) {
+                maxDelta = delta;
+                maxIndex = i;
+            } else if (delta < minDelta) {
+                minDelta = delta;
+                minIndex = i;
+            }
+        }
+        if (bigFirst) {
+            vaultIndexes[0] = maxIndex;
+            vaultIndexes[2] = minIndex;
+        } else {
+            vaultIndexes[0] = minIndex;
+            vaultIndexes[2] = maxIndex;
+        }
+        vaultIndexes[1] = N_COINS - maxIndex - minIndex;
+    }
+
+
+    
+    function calculatePercentOfSystem(
+        address vault,
+        uint256 index,
+        uint256 vaultAssetsPercent,
+        uint256 vaultAssets
+    ) private view returns (uint256 percentOfSystem) {
+        if (vaultAssets == 0) return 0;
+        uint256 strategyAssetsPercent = IVault(vault).getStrategyAssets(index).mul(PERCENTAGE_DECIMAL_FACTOR).div(
+            vaultAssets
+        );
+
+        percentOfSystem = vaultAssetsPercent.mul(strategyAssetsPercent).div(PERCENTAGE_DECIMAL_FACTOR);
+    }
+
+
+    function calculateStableCoinExposure(uint256[N_COINS] memory directlyExposure, uint256 curveExposure)
+        private
+        view
+        returns (uint256[N_COINS] memory stableCoinExposure)
+    {
+        uint256 maker = directlyExposure[0].mul(makerUSDCExposure).div(PERCENTAGE_DECIMAL_FACTOR);
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 indirectExposure = curveExposure;
+            if (i == 1) {
+                indirectExposure = indirectExposure.add(maker);
+            }
+            stableCoinExposure[i] = directlyExposure[i].add(indirectExposure);
+        }
+    }
+
+    
+    
+    
+    
+    
+    function isExposed(
+        uint256 rebalanceThreshold,
+        uint256[N_COINS] memory stableCoinExposure,
+        uint256[] memory protocolExposure,
+        uint256 curveExposure
+    ) private pure returns (bool stablecoinExposed, bool protocolExposed) {
+        for (uint256 i = 0; i < N_COINS; i++) {
+            if (stableCoinExposure[i] > rebalanceThreshold) {
+                stablecoinExposed = true;
+                break;
+            }
+        }
+        for (uint256 i = 0; i < protocolExposure.length; i++) {
+            if (protocolExposure[i] > rebalanceThreshold) {
+                protocolExposed = true;
+                break;
+            }
+        }
+        if (!protocolExposed && curveExposure > rebalanceThreshold) protocolExposed = true;
+        return (stablecoinExposed, protocolExposed);
+    }
+
+    function _calcRiskExposure(SystemState memory sysState, bool treatLifeguardAsCurve)
+        private
+        view
+        returns (ExposureState memory expState)
+    {
+        address[N_COINS] memory vaults = _controller().vaults();
+        uint256 pCount = protocolCount;
+        expState.protocolExposure = new uint256[](pCount);
+        if (sysState.totalCurrentAssetsUsd == 0) {
+            return expState;
+        }
+        
+        for (uint256 i = 0; i < N_COINS; i++) {
+            uint256 vaultAssetsPercent = sysState.vaultCurrentAssetsUsd[i].mul(PERCENTAGE_DECIMAL_FACTOR).div(
+                sysState.totalCurrentAssetsUsd
+            );
+            expState.stablecoinExposure[i] = vaultAssetsPercent;
+            
+            for (uint256 j = 0; j < pCount; j++) {
+                uint256 percentOfSystem = calculatePercentOfSystem(
+                    vaults[i],
+                    j,
+                    vaultAssetsPercent,
+                    sysState.vaultCurrentAssets[i]
+                );
+                expState.protocolExposure[j] = expState.protocolExposure[j].add(percentOfSystem);
+            }
+        }
+        if (treatLifeguardAsCurve) {
+            
+            
+            expState.curveExposure = sysState.curveCurrentAssetsUsd.add(sysState.lifeguardCurrentAssetsUsd);
+        } else {
+            expState.curveExposure = sysState.curveCurrentAssetsUsd;
+        }
+        expState.curveExposure = expState.curveExposure.mul(PERCENTAGE_DECIMAL_FACTOR).div(
+            sysState.totalCurrentAssetsUsd
+        );
+
+        
+        expState.stablecoinExposure = calculateStableCoinExposure(expState.stablecoinExposure, expState.curveExposure);
+    }
+}",2094.0,2,0,"<think>
+Let me analyze this contract for potential vulnerabilities. I'll check for:
+
+1. Reentrancy vulnerabilities
+2. Integer overflow/underflow (though SafeMath is used)
+3. Access control issues
+4. Logic errors
+5. Missing validation
+6. Other security concerns
+
+Let's go through the contract methodically:
+
+1. The contract uses SafeMath, which is good for preventing overflow/underflow issues.
+2. It inherits from Controllable, Whitelist - implying there's access control in place.
+
+Potential vulnerabilities I see:
+
+1. **Access Control Issues**:
+   - `setProtocolCount` and `setMakerUSDCExposure` are only callable by the owner, which is fine.
+   - Other functions don't have explicit access control but may be protected by inherited contracts.
+
+2. **Missing Validation**:
+   - `setProtocolCount` doesn't validate if the new count matches the existing system state, which could lead to array access errors.
+   - There's no check if `_makerUSDCExposure` in `setMakerUSDCExposure` exceeds 100%.
+
+3. **Calculation Issues**:
+   - In `sortVaultsByDelta`, `minDelta` is initialized to 0, which means negative deltas might not be properly captured.
+   - Complex calculations across multiple functions could introduce logic errors.
+
+4. **No Zero Address Checks**:
+   - When getting addresses from the controller, there are no checks if returned addresses are valid.
+
+5. **Array Boundaries and Logic**:
+   - In `sortVaultsByDelta`, there's a complex calculation for the third index: `vaultIndexes[1] = N_COINS - maxIndex - minIndex`. This assumes N_COINS = 3, and if maxIndex and minIndex are the same, it could lead to unexpected behavior.
+
+6. **Function Visibility and External Call Risks**:
+   - Multiple external calls are made to other contracts like `ILifeGuard`, `IBuoy`, etc., which increases the attack surface.
+</think># Vulnerabilities in the Exposure Contract
+
+After analyzing the Exposure contract, I've identified several security issues that could impact the system's integrity and functionality:
+
+## 1. Initialization Issues
+- `minDelta` in `sortVaultsByDelta()` is initialized to 0, which won't correctly identify negative deltas as it starts comparison from zero. This could lead to incorrect sorting.
+
+## 2. Validation Issues
+- `setProtocolCount()` has no validation that the new count is reasonable or matches the existing system state, which could cause array access errors in functions that depend on this value.
+- `setMakerUSDCExposure()` has no bounds checking to ensure the exposure percentage is reasonable (e.g., not exceeding 100%).
+
+## 3. Calculation Vulnerabilities
+- In `sortVaultsByDelta()`, only max and min indices are properly set, but there's no guarantee that `N_COINS - maxIndex - minIndex` correctly identifies the middle index, especially if maxIndex and minIndex are equal or if N_COINS != 3.
+- The function assumes three coins, but doesn't validate this assumption.
+
+## 4. External Call Risks
+- Multiple external calls to contracts like `ILifeGuard`, `IBuoy`, and `IVault` without proper checks for success or failure could lead to unexpected behavior.
+- No validation that addresses retrieved from the controller are valid (non-zero).
+
+## 5. Array Out-of-Bounds Risk
+- If `protocolCount` is set incorrectly, functions like `_calcRiskExposure()` could attempt to access non-existent array elements.
+
+## 6. Logic Vulnerabilities
+- The complex calculation of exposure percentages across multiple stablecoins and protocols could have edge cases that are not properly handled.
+- In `calculateStableCoinExposure()`, the special handling for index 1 (adding maker exposure) assumes a specific ordering that isn't validated.
+
+## 7. Precision Loss
+- Multiple division operations after multiplication could result in precision loss, especially in percentage calculations.
+
+## 8. Missing View Function Modifiers
+- Some functions like `calculatePercentOfSystem()` could be marked as `view` but aren't, which might lead to higher gas costs.
+
+The most critical issues are related to the lack of proper validation on key parameters and the assumption of specific system configurations without validation.","### **[H-01] Implicit Underflows in `sortVaultsByDelta()`**
+
+**Report Description**:
+The function `sortVaultsByDelta()` contains implicit underflows that are converted via typecasting. For example, `int256(a - b)` where `a` and `b` are `uint` values can result in an intermediate underflow if `b > a`. Similarly, `int256(-x)` where `x` is a `uint` can lead to unexpected behavior. These issues would cause reverts if Solidity 0.8.x is used, as it includes built-in overflow/underflow checks. The code should avoid such underflows by using appropriate typecasts or logic adjustments.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of implicit underflows in `sortVaultsByDelta()`. While the response mentions ""Calculation Issues"" and ""Logic Vulnerabilities,"" it does not specifically identify the underflow problem or its implications when moving to Solidity 0.8.x. This is a critical oversight, as the issue directly impacts the contract's functionality and security.
+
+---
+
+### **[H-04] `sortVaultsByDelta` Doesn't Work as Expected**
+
+**Report Description**:
+The function `sortVaultsByDelta()` fails to work correctly in certain scenarios. For example, if all deltas are positive and `delta1 >= delta2 >= delta3 > 0`, the function incorrectly sets `maxIndex` and `minIndex` to 0. This leads to invalid calculations for `vaultIndexes`, such as `vaultIndexes[1] = 3`, which is out of range. This issue arises because `maxDelta` and `minDelta` are initialized to 0, causing incorrect sorting and potentially leading to withdrawals from the wrong vaults or reverts.
+
+**Match in Response List**:
+Matches with the issue titled **""Initialization Issues""** and **""Calculation Vulnerabilities""**.
+
+**Validation**:
+**Partially Correct**. The response identifies that `minDelta` is initialized to 0, which could lead to incorrect sorting, and mentions the risk of unexpected behavior in `sortVaultsByDelta()`. However, it does not fully capture the specific scenario described in the issue report, where all deltas are positive and the function fails to assign distinct indices. The response also misses the critical impact of this issue, such as withdrawals from the wrong vaults or reverts due to out-of-range indices.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- **[H-04] `sortVaultsByDelta` Doesn't Work as Expected**
+
+**Missed Issues from Issue Report**:
+- **[H-01] Implicit Underflows in `sortVaultsByDelta()`**
+
+---
+
+### **Overall Assessment**
+The response list partially addresses one of the issues ([H-04]) but misses the critical issue of implicit underflows ([H-01]). The response focuses on general vulnerabilities like access control, validation, and external call risks but does not adequately cover the specific mathematical and logical flaws in `sortVaultsByDelta()`. To improve, the response should include a detailed analysis of underflow risks and the specific scenarios where the function fails to work as expected.",0,1,1,8,"```
+None.
+```","Since there are no true positives in the ranked list of predictions, the **Average Precision (AP)** is:
+
+**0.0**",0,20.347432851791400,3952.0,3.0
+Pnl.sol,"// SPDX-License-Identifier: AGPLv3
+pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""../interfaces/IPnL.sol"";
+import ""../common/Controllable.sol"";
+import ""../interfaces/IPnL.sol"";
+import ""../common/Constants.sol"";
+import {FixedGTokens} from ""../common/FixedContracts.sol"";
+
+/// @notice Contract for calculating protocol profit and loss. The PnL contract stores snapshots
+///     of total assets in pwrd and gvt, which are used to calculate utilisation ratio and establish
+///     changes in underling pwrd and gvt factors. The protocol will allow these values to drift as long
+///     as they stay within a certain threshold of protocol actuals, or large amounts of assets are being
+///     deposited or withdrawn from the protocol. The PnL contract ensures that any profits are distributed
+///     between pwrd and gvt based on the utilisation ratio - as this ratio movese towards 1, a larger
+///     amount of the pwrd profit is shifted to gvt. Protocol losses are on the other hand soaked up
+///     by gvt, ensuring that pwrd never lose value.
+///
+///     ###############################################
+///     PnL variables and calculations
+///     ###############################################
+///
+///     yield - system gains and losses from assets invested into strategies are realised once
+///         a harvest is run. Yield is ditributed to pwrd and gvt based on the utilisation ratio of the
+///         two tokens (see _calcProfit).
+///
+///     PerformanceFee - The performance fee is deducted from any yield profits, and is used to
+///         buy back and distribute governance tokens to users.
+///
+///     hodler Fee - Withdrawals experience a hodler fee that is socialized to all other holders.
+///         Like other gains, this isn't realised on withdrawal, but rather when a critical amount
+///         has amassed in the system (totalAssetsPercentThreshold).
+///
+///     ###############################################
+///     PnL Actions
+///     ###############################################
+///
+///     Pnl has two trigger mechanisms:
+///         - Harvest:
+///             - It will realize any loss/profit from the strategy
+///             - It will atempt to update lastest cached curve stable coin dy
+///                 - if successfull, it will try to realize any price changes (pre tvl vs current)
+///         - Withdrawals
+///             - Any user withdrawals are distributing the holder fee to the other users
+contract PnL is Controllable, Constants, FixedGTokens, IPnL {
+    using SafeMath for uint256;
+
+    uint256 public override lastGvtAssets;
+    uint256 public override lastPwrdAssets;
+    bool public rebase = true;
+
+    uint256 public performanceFee; // Amount of gains to use to buy back and distribute gov tokens
+
+    event LogRebaseSwitch(bool status);
+    event LogNewPerfromanceFee(uint256 fee);
+    event LogNewGtokenChange(bool pwrd, int256 change);
+    event LogPnLExecution(
+        uint256 deductedAssets,
+        int256 totalPnL,
+        int256 investPnL,
+        int256 pricePnL,
+        uint256 withdrawalBonus,
+        uint256 performanceBonus,
+        uint256 beforeGvtAssets,
+        uint256 beforePwrdAssets,
+        uint256 afterGvtAssets,
+        uint256 afterPwrdAssets
+    );
+
+    constructor(
+        address pwrd,
+        address gvt,
+        uint256 pwrdAssets,
+        uint256 gvtAssets
+    ) public FixedGTokens(pwrd, gvt) {
+        lastPwrdAssets = pwrdAssets;
+        lastGvtAssets = gvtAssets;
+    }
+
+    /// @notice Turn pwrd rebasing on/off - This stops yield/ hodler bonuses to be distributed to the pwrd
+    ///     token, which effectively stops it from rebasing any further.
+    function setRebase(bool _rebase) external onlyOwner {
+        rebase = _rebase;
+        emit LogRebaseSwitch(_rebase);
+    }
+
+    /// @notice Fee taken from gains to be redistributed to users who stake their tokens
+    /// @param _performanceFee Amount to remove from gains (%BP)
+    function setPerformanceFee(uint256 _performanceFee) external onlyOwner {
+        performanceFee = _performanceFee;
+        emit LogNewPerfromanceFee(_performanceFee);
+    }
+
+    /// @notice Increase previously recorded GToken assets by specific amount
+    /// @param pwrd pwrd/gvt
+    /// @param dollarAmount Amount to increase by
+    function increaseGTokenLastAmount(bool pwrd, uint256 dollarAmount) external override {
+        require(msg.sender == controller, ""increaseGTokenLastAmount: !controller"");
+        if (!pwrd) {
+            lastGvtAssets = lastGvtAssets.add(dollarAmount);
+        } else {
+            lastPwrdAssets = lastPwrdAssets.add(dollarAmount);
+        }
+        emit LogNewGtokenChange(pwrd, int256(dollarAmount));
+    }
+
+    /// @notice Decrease previously recorded GToken assets by specific amount
+    /// @param pwrd pwrd/gvt
+    /// @param dollarAmount Amount to decrease by
+    /// @param bonus hodler bonus
+    function decreaseGTokenLastAmount(
+        bool pwrd,
+        uint256 dollarAmount,
+        uint256 bonus
+    ) external override {
+        require(msg.sender == controller, ""decreaseGTokenLastAmount: !controller"");
+        uint256 lastGA = lastGvtAssets;
+        uint256 lastPA = lastPwrdAssets;
+        if (!pwrd) {
+            lastGA = dollarAmount > lastGA ? 0 : lastGA.sub(dollarAmount);
+        } else {
+            lastPA = dollarAmount > lastPA ? 0 : lastPA.sub(dollarAmount);
+        }
+        if (bonus > 0) {
+            uint256 preGABeforeBonus = lastGA;
+            uint256 prePABeforeBonus = lastPA;
+            uint256 preTABeforeBonus = preGABeforeBonus.add(prePABeforeBonus);
+            if (rebase) {
+                lastGA = preGABeforeBonus.add(bonus.mul(preGABeforeBonus).div(preTABeforeBonus));
+                lastPA = prePABeforeBonus.add(bonus.mul(prePABeforeBonus).div(preTABeforeBonus));
+            } else {
+                lastGA = preGABeforeBonus.add(bonus);
+            }
+            emit LogPnLExecution(0, int256(bonus), 0, 0, bonus, 0, preGABeforeBonus, prePABeforeBonus, lastGA, lastPA);
+        }
+
+        lastGvtAssets = lastGA;
+        lastPwrdAssets = lastPA;
+        emit LogNewGtokenChange(pwrd, int256(-dollarAmount));
+    }
+
+    /// @notice Return latest system asset states
+    function calcPnL() external view override returns (uint256, uint256) {
+        return (lastGvtAssets, lastPwrdAssets);
+    }
+
+    /// @notice Calculate utilisation ratio between gvt and pwrd
+    function utilisationRatio() external view override returns (uint256) {
+        return lastGvtAssets != 0 ? lastPwrdAssets.mul(PERCENTAGE_DECIMAL_FACTOR).div(lastGvtAssets) : 0;
+    }
+
+    /// @notice Update assets after entering emergency state
+    function emergencyPnL() external override {
+        require(msg.sender == controller, ""emergencyPnL: !controller"");
+        forceDistribute();
+    }
+
+    /// @notice Recover system from emergency state
+    function recover() external override {
+        require(msg.sender == controller, ""recover: !controller"");
+        forceDistribute();
+    }
+
+    /// @notice Distribute yield based on utilisation ratio
+    /// @param gvtAssets Total gvt assets
+    /// @param pwrdAssets Total pwrd assets
+    /// @param profit Amount of profit to distribute
+    /// @param reward Rewards contract
+    function handleInvestGain(
+        uint256 gvtAssets,
+        uint256 pwrdAssets,
+        uint256 profit,
+        address reward
+    )
+        private
+        view
+        returns (
+            uint256,
+            uint256,
+            uint256
+        )
+    {
+        uint256 performanceBonus;
+        if (performanceFee > 0 && reward != address(0)) {
+            performanceBonus = profit.mul(performanceFee).div(PERCENTAGE_DECIMAL_FACTOR);
+            profit = profit.sub(performanceBonus);
+        }
+        if (rebase) {
+            uint256 totalAssets = gvtAssets.add(pwrdAssets);
+            uint256 gvtProfit = profit.mul(gvtAssets).div(totalAssets);
+            uint256 pwrdProfit = profit.mul(pwrdAssets).div(totalAssets);
+
+            uint256 factor = pwrdAssets.mul(10000).div(gvtAssets);
+            if (factor > 10000) factor = 10000;
+            if (factor < 8000) {
+                factor = factor.mul(3).div(8).add(3000);
+            } else {
+                factor = factor.sub(8000).mul(2).add(6000);
+            }
+
+            uint256 portionFromPwrdProfit = pwrdProfit.mul(factor).div(10000);
+            gvtAssets = gvtAssets.add(gvtProfit.add(portionFromPwrdProfit));
+            pwrdAssets = pwrdAssets.add(pwrdProfit.sub(portionFromPwrdProfit));
+        } else {
+            gvtAssets = gvtAssets.add(profit);
+        }
+        return (gvtAssets, pwrdAssets, performanceBonus);
+    }
+
+    /// @notice Distribute losses
+    /// @param gvtAssets Total gvt assets
+    /// @param pwrdAssets Total pwrd assets
+    /// @param loss Amount of loss to distribute
+    function handleLoss(
+        uint256 gvtAssets,
+        uint256 pwrdAssets,
+        uint256 loss
+    ) private pure returns (uint256, uint256) {
+        uint256 maxGvtLoss = gvtAssets.sub(DEFAULT_DECIMALS_FACTOR);
+        if (loss > maxGvtLoss) {
+            gvtAssets = DEFAULT_DECIMALS_FACTOR;
+            pwrdAssets = pwrdAssets.sub(loss.sub(maxGvtLoss));
+        } else {
+            gvtAssets = gvtAssets - loss;
+        }
+        return (gvtAssets, pwrdAssets);
+    }
+
+    function forceDistribute() private {
+        uint256 total = _controller().totalAssets();
+
+        if (total > lastPwrdAssets.add(DEFAULT_DECIMALS_FACTOR)) {
+            lastGvtAssets = total - lastPwrdAssets;
+        } else {
+            lastGvtAssets = DEFAULT_DECIMALS_FACTOR;
+            lastPwrdAssets = total.sub(DEFAULT_DECIMALS_FACTOR);
+        }
+    }
+
+    function distributeStrategyGainLoss(
+        uint256 gain,
+        uint256 loss,
+        address reward
+    ) external override {
+        require(msg.sender == controller, ""!Controller"");
+        uint256 lastGA = lastGvtAssets;
+        uint256 lastPA = lastPwrdAssets;
+        uint256 performanceBonus;
+        uint256 gvtAssets;
+        uint256 pwrdAssets;
+        int256 investPnL;
+        if (gain > 0) {
+            (gvtAssets, pwrdAssets, performanceBonus) = handleInvestGain(lastGA, lastPA, gain, reward);
+            if (performanceBonus > 0) {
+                gvt.mint(reward, gvt.factor(gvtAssets), performanceBonus);
+                gvtAssets = gvtAssets.add(performanceBonus);
+            }
+
+            lastGvtAssets = gvtAssets;
+            lastPwrdAssets = pwrdAssets;
+            investPnL = int256(gain);
+        } else if (loss > 0) {
+            (lastGvtAssets, lastPwrdAssets) = handleLoss(lastGA, lastPA, loss);
+            investPnL = -int256(loss);
+        }
+
+        emit LogPnLExecution(
+            0,
+            investPnL,
+            investPnL,
+            0,
+            0,
+            performanceBonus,
+            lastGA,
+            lastPA,
+            lastGvtAssets,
+            lastPwrdAssets
+        );
+    }
+
+    function distributePriceChange(uint256 currentTotalAssets) external override {
+        require(msg.sender == controller, ""!Controller"");
+        uint256 gvtAssets = lastGvtAssets;
+        uint256 pwrdAssets = lastPwrdAssets;
+        uint256 totalAssets = gvtAssets.add(pwrdAssets);
+
+        if (currentTotalAssets > totalAssets) {
+            lastGvtAssets = gvtAssets.add(currentTotalAssets.sub(totalAssets));
+        } else if (currentTotalAssets < totalAssets) {
+            (lastGvtAssets, lastPwrdAssets) = handleLoss(gvtAssets, pwrdAssets, totalAssets.sub(currentTotalAssets));
+        }
+        int256 priceChange = int256(currentTotalAssets) - int256(totalAssets);
+
+        emit LogPnLExecution(
+            0,
+            priceChange,
+            0,
+            priceChange,
+            0,
+            0,
+            gvtAssets,
+            pwrdAssets,
+            lastGvtAssets,
+            lastPwrdAssets
+        );
+    }
+}",2825.0,308.0,"***[H-01] implicit underflows***
+Function `decreaseGTokenLastAmount`There are a few underflows that are converted via a typecast afterwards to the expected value. If solidity 0.8.x would be used, then the code would revert.
+- int256(a-b) where a and b are uint: For example, if a=1 and b=2, then the intermediate result would be uint(-1) == 2**256-1
+- int256(-x) where x is a uint. For example, if x=1, then the intermediate result would be uint(-1) == 2**256-1
+It's better not to have underflows by using the appropriate typecasts. This is especially relevant when moving to solidity 0.8.x.```function sortVaultsByDelta(..)
+..
+    for (uint256 i = 0; i < N_COINS; i++) {
+        // Get difference between vault current assets and vault target
+        int256 delta = int256(unifiedAssets[i] - unifiedTotalAssets.mul(targetPercents[i]).div(PERCENTAGE_DECIMAL_FACTOR)); // underflow in intermediate result```",1.0,"pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""../interfaces/IPnL.sol"";
+import ""../common/Controllable.sol"";
+import ""../interfaces/IPnL.sol"";
+import ""../common/Constants.sol"";
+import {FixedGTokens} from ""../common/FixedContracts.sol"";
+
+contract PnL is Controllable, Constants, FixedGTokens, IPnL {
+    using SafeMath for uint256;
+
+    uint256 public override lastGvtAssets;
+    uint256 public override lastPwrdAssets;
+    bool public rebase = true;
+
+    uint256 public performanceFee; 
+
+    event LogRebaseSwitch(bool status);
+    event LogNewPerfromanceFee(uint256 fee);
+    event LogNewGtokenChange(bool pwrd, int256 change);
+    event LogPnLExecution(
+        uint256 deductedAssets,
+        int256 totalPnL,
+        int256 investPnL,
+        int256 pricePnL,
+        uint256 withdrawalBonus,
+        uint256 performanceBonus,
+        uint256 beforeGvtAssets,
+        uint256 beforePwrdAssets,
+        uint256 afterGvtAssets,
+        uint256 afterPwrdAssets
+    );
+
+    constructor(
+        address pwrd,
+        address gvt,
+        uint256 pwrdAssets,
+        uint256 gvtAssets
+    ) public FixedGTokens(pwrd, gvt) {
+        lastPwrdAssets = pwrdAssets;
+        lastGvtAssets = gvtAssets;
+    }
+
+    function setRebase(bool _rebase) external onlyOwner {
+        rebase = _rebase;
+        emit LogRebaseSwitch(_rebase);
+    }
+
+    
+    
+    function setPerformanceFee(uint256 _performanceFee) external onlyOwner {
+        performanceFee = _performanceFee;
+        emit LogNewPerfromanceFee(_performanceFee);
+    }
+
+    
+    function increaseGTokenLastAmount(bool pwrd, uint256 dollarAmount) external override {
+        require(msg.sender == controller, ""increaseGTokenLastAmount: !controller"");
+        if (!pwrd) {
+            lastGvtAssets = lastGvtAssets.add(dollarAmount);
+        } else {
+            lastPwrdAssets = lastPwrdAssets.add(dollarAmount);
+        }
+        emit LogNewGtokenChange(pwrd, int256(dollarAmount));
+    }
+
+    
+    function decreaseGTokenLastAmount(
+        bool pwrd,
+        uint256 dollarAmount,
+        uint256 bonus
+    ) external override {
+        require(msg.sender == controller, ""decreaseGTokenLastAmount: !controller"");
+        uint256 lastGA = lastGvtAssets;
+        uint256 lastPA = lastPwrdAssets;
+        if (!pwrd) {
+            lastGA = dollarAmount > lastGA ? 0 : lastGA.sub(dollarAmount);
+        } else {
+            lastPA = dollarAmount > lastPA ? 0 : lastPA.sub(dollarAmount);
+        }
+        if (bonus > 0) {
+            uint256 preGABeforeBonus = lastGA;
+            uint256 prePABeforeBonus = lastPA;
+            uint256 preTABeforeBonus = preGABeforeBonus.add(prePABeforeBonus);
+            if (rebase) {
+                lastGA = preGABeforeBonus.add(bonus.mul(preGABeforeBonus).div(preTABeforeBonus));
+                lastPA = prePABeforeBonus.add(bonus.mul(prePABeforeBonus).div(preTABeforeBonus));
+            } else {
+                lastGA = preGABeforeBonus.add(bonus);
+            }
+            emit LogPnLExecution(0, int256(bonus), 0, 0, bonus, 0, preGABeforeBonus, prePABeforeBonus, lastGA, lastPA);
+        }
+
+        lastGvtAssets = lastGA;
+        lastPwrdAssets = lastPA;
+        emit LogNewGtokenChange(pwrd, int256(-dollarAmount));
+    }
+
+    
+    function calcPnL() external view override returns (uint256, uint256) {
+        return (lastGvtAssets, lastPwrdAssets);
+    }
+
+    
+    function utilisationRatio() external view override returns (uint256) {
+        return lastGvtAssets != 0 ? lastPwrdAssets.mul(PERCENTAGE_DECIMAL_FACTOR).div(lastGvtAssets) : 0;
+    }
+
+    
+    function emergencyPnL() external override {
+        require(msg.sender == controller, ""emergencyPnL: !controller"");
+        forceDistribute();
+    }
+
+    
+    function recover() external override {
+        require(msg.sender == controller, ""recover: !controller"");
+        forceDistribute();
+    }
+
+
+    function handleInvestGain(
+        uint256 gvtAssets,
+        uint256 pwrdAssets,
+        uint256 profit,
+        address reward
+    )
+        private
+        view
+        returns (
+            uint256,
+            uint256,
+            uint256
+        )
+    {
+        uint256 performanceBonus;
+        if (performanceFee > 0 && reward != address(0)) {
+            performanceBonus = profit.mul(performanceFee).div(PERCENTAGE_DECIMAL_FACTOR);
+            profit = profit.sub(performanceBonus);
+        }
+        if (rebase) {
+            uint256 totalAssets = gvtAssets.add(pwrdAssets);
+            uint256 gvtProfit = profit.mul(gvtAssets).div(totalAssets);
+            uint256 pwrdProfit = profit.mul(pwrdAssets).div(totalAssets);
+
+            uint256 factor = pwrdAssets.mul(10000).div(gvtAssets);
+            if (factor > 10000) factor = 10000;
+            if (factor < 8000) {
+                factor = factor.mul(3).div(8).add(3000);
+            } else {
+                factor = factor.sub(8000).mul(2).add(6000);
+            }
+
+            uint256 portionFromPwrdProfit = pwrdProfit.mul(factor).div(10000);
+            gvtAssets = gvtAssets.add(gvtProfit.add(portionFromPwrdProfit));
+            pwrdAssets = pwrdAssets.add(pwrdProfit.sub(portionFromPwrdProfit));
+        } else {
+            gvtAssets = gvtAssets.add(profit);
+        }
+        return (gvtAssets, pwrdAssets, performanceBonus);
+    }
+
+    
+    
+    
+    
+    function handleLoss(
+        uint256 gvtAssets,
+        uint256 pwrdAssets,
+        uint256 loss
+    ) private pure returns (uint256, uint256) {
+        uint256 maxGvtLoss = gvtAssets.sub(DEFAULT_DECIMALS_FACTOR);
+        if (loss > maxGvtLoss) {
+            gvtAssets = DEFAULT_DECIMALS_FACTOR;
+            pwrdAssets = pwrdAssets.sub(loss.sub(maxGvtLoss));
+        } else {
+            gvtAssets = gvtAssets - loss;
+        }
+        return (gvtAssets, pwrdAssets);
+    }
+
+    function forceDistribute() private {
+        uint256 total = _controller().totalAssets();
+
+        if (total > lastPwrdAssets.add(DEFAULT_DECIMALS_FACTOR)) {
+            lastGvtAssets = total - lastPwrdAssets;
+        } else {
+            lastGvtAssets = DEFAULT_DECIMALS_FACTOR;
+            lastPwrdAssets = total.sub(DEFAULT_DECIMALS_FACTOR);
+        }
+    }
+
+    function distributeStrategyGainLoss(
+        uint256 gain,
+        uint256 loss,
+        address reward
+    ) external override {
+        require(msg.sender == controller, ""!Controller"");
+        uint256 lastGA = lastGvtAssets;
+        uint256 lastPA = lastPwrdAssets;
+        uint256 performanceBonus;
+        uint256 gvtAssets;
+        uint256 pwrdAssets;
+        int256 investPnL;
+        if (gain > 0) {
+            (gvtAssets, pwrdAssets, performanceBonus) = handleInvestGain(lastGA, lastPA, gain, reward);
+            if (performanceBonus > 0) {
+                gvt.mint(reward, gvt.factor(gvtAssets), performanceBonus);
+                gvtAssets = gvtAssets.add(performanceBonus);
+            }
+
+            lastGvtAssets = gvtAssets;
+            lastPwrdAssets = pwrdAssets;
+            investPnL = int256(gain);
+        } else if (loss > 0) {
+            (lastGvtAssets, lastPwrdAssets) = handleLoss(lastGA, lastPA, loss);
+            investPnL = -int256(loss);
+        }
+
+        emit LogPnLExecution(
+            0,
+            investPnL,
+            investPnL,
+            0,
+            0,
+            performanceBonus,
+            lastGA,
+            lastPA,
+            lastGvtAssets,
+            lastPwrdAssets
+        );
+    }
+
+    function distributePriceChange(uint256 currentTotalAssets) external override {
+        require(msg.sender == controller, ""!Controller"");
+        uint256 gvtAssets = lastGvtAssets;
+        uint256 pwrdAssets = lastPwrdAssets;
+        uint256 totalAssets = gvtAssets.add(pwrdAssets);
+
+        if (currentTotalAssets > totalAssets) {
+            lastGvtAssets = gvtAssets.add(currentTotalAssets.sub(totalAssets));
+        } else if (currentTotalAssets < totalAssets) {
+            (lastGvtAssets, lastPwrdAssets) = handleLoss(gvtAssets, pwrdAssets, totalAssets.sub(currentTotalAssets));
+        }
+        int256 priceChange = int256(currentTotalAssets) - int256(totalAssets);
+
+        emit LogPnLExecution(
+            0,
+            priceChange,
+            0,
+            priceChange,
+            0,
+            0,
+            gvtAssets,
+            pwrdAssets,
+            lastGvtAssets,
+            lastPwrdAssets
+        );
+    }
+}",2068.0,1,0,"<think>
+Let me identify the vulnerabilities in this PnL contract:
+
+1. Missing Input Validation:
+   - In `setPerformanceFee()`, there's no check to validate the performance fee percentage. It could be set to an extreme value like 100% or higher, which would be inappropriate.
+
+2. Rounding Issues:
+   - In `handleInvestGain()`, there are multiple division operations that could lead to precision loss or rounding errors. This is particularly concerning when calculating profit distributions.
+
+3. Reentrancy Vulnerability:
+   - The `distributeStrategyGainLoss()` function calls an external contract via `gvt.mint()`. This could potentially lead to a reentrancy attack if the GVT token has malicious code.
+
+4. Integer Overflow/Underflow:
+   - While the contract uses SafeMath for most operations, there's an unsafe subtraction in `handleLoss()` with `gvtAssets = gvtAssets - loss` which doesn't use SafeMath.
+
+5. Access Control Issues:
+   - The contract checks that certain functions can only be called by the controller, but if the controller is compromised, it could lead to significant damage.
+   - The controller seems to have too much control without enough checks and balances.
+
+6. Emergency Functions:
+   - The `emergencyPnL()` and `recover()` functions call `forceDistribute()`, which could drastically change the state without proper safeguards.
+
+7. Potential Logic Issues:
+   - In `handleInvestGain()`, the factor calculation for rebalancing might lead to unexpected behavior in certain edge cases.
+
+8. Lack of Pausing Mechanism:
+   - Critical financial contracts typically have pause/unpause functionality for emergencies, which this contract lacks.
+
+9. Incorrect Asset Calculations:
+   - In `forceDistribute()`, if total is less than lastPwrdAssets + DEFAULT_DECIMALS_FACTOR, it sets lastPwrdAssets to total - DEFAULT_DECIMALS_FACTOR. This could make accounting inconsistent.
+</think># Vulnerabilities in the PnL Contract
+
+After analyzing the smart contract, I've identified several vulnerabilities:
+
+## 1. Integer Underflow in handleLoss()
+solidity
+gvtAssets = gvtAssets - loss; // Line 205
+This operation doesn't use SafeMath, creating an underflow risk if loss is greater than gvtAssets.
+
+## 2. Uncapped Performance Fee
+The `setPerformanceFee()` function doesn't have an upper bound check. The owner could set the fee to 100% or higher, potentially draining all profits.
+
+## 3. Rounding and Precision Loss 
+Multiple division operations in functions like `handleInvestGain()` can result in precision loss. For example:
+solidity
+uint256 gvtProfit = profit.mul(gvtAssets).div(totalAssets);
+uint256 pwrdProfit = profit.mul(pwrdAssets).div(totalAssets);
+
+## 4. Reentrancy Vulnerability
+`distributeStrategyGainLoss()` calls an external contract via `gvt.mint()` before updating state variables, which could allow reentrancy attacks.
+
+## 5. Lack of Input Validation
+Several functions accept parameters without proper validation:
+- `increaseGTokenLastAmount()` and `decreaseGTokenLastAmount()` could manipulate token balances without limits
+- `setPerformanceFee()` accepts any value without bounds
+
+## 6. Centralization Risks
+The contract gives significant power to the owner and controller:
+- The owner can change important parameters (performanceFee, rebase)
+- The controller can invoke critical functions like emergencyPnL()
+
+## 7. Potential DoS in forceDistribute()
+If `total` is extremely small, the function might revert due to insufficient balance for subtraction operations.
+
+## 8. Missing Checks for Zero Address
+The constructor doesn't verify that provided addresses for pwrd and gvt are non-zero.
+
+## 9. Logical Inconsistency in Asset Management
+In `handleLoss()`, the function tries to keep a minimum balance of `DEFAULT_DECIMALS_FACTOR` for gvtAssets, but this approach might lead to accounting inconsistencies.
+
+## 10. Inefficient Error Handling
+Error messages are present but could be more descriptive to aid in debugging and transparency.
+
+These vulnerabilities could impact the security and reliability of the contract, potentially leading to fund loss or manipulation.","---
+
+**[H-01] Implicit Underflows**
+
+**Report Description**:
+The issue highlights implicit underflows in the `decreaseGTokenLastAmount` function and other parts of the code where intermediate results of arithmetic operations could lead to unexpected behavior. Specifically, the use of `int256(a - b)` where `a` and `b` are `uint` types can result in underflows if `b` is greater than `a`. Similarly, `int256(-x)` where `x` is a `uint` can also lead to underflows. These issues are particularly relevant when upgrading to Solidity 0.8.x, where such underflows would cause the transaction to revert. The report suggests avoiding these underflows by using appropriate typecasts.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The `response_list` does not address the specific issue of implicit underflows in the `decreaseGTokenLastAmount` function or similar arithmetic operations. While the response list mentions integer overflow/underflow in general (e.g., in `handleLoss()`), it does not cover the specific scenarios described in the issue report, such as the use of `int256(a - b)` or `int256(-x)` with `uint` types. Therefore, the response does not adequately address the vulnerability described in the issue.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[H-01] Implicit Underflows**
+
+---
+
+The `response_list` fails to address the specific issue of implicit underflows in the `decreaseGTokenLastAmount` function and similar arithmetic operations. This gap indicates a need for more comprehensive coverage of vulnerabilities related to arithmetic operations and type casting in Solidity smart contracts.",0,0,1,10,"```
+None.
+```","The **Average Precision (AP)** for the query is **0.0**. 
+
+Since there are no true positives in the ranked list of predictions, the precision at every rank is 0, and the average of these values is also 0.",0,19.62777018547060,3908.0,3.0
+Buoy3Pool.sol,"// SPDX-License-Identifier: AGPLv3
+pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""@openzeppelin/contracts/token/ERC20/ERC20.sol"";
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+
+import {FixedStablecoins} from ""contracts/common/FixedContracts.sol"";
+import {ICurve3Pool} from ""contracts/interfaces/ICurve.sol"";
+
+import ""contracts/common/Controllable.sol"";
+
+import ""contracts/interfaces/IBuoy.sol"";
+import ""contracts/interfaces/IChainPrice.sol"";
+import ""contracts/interfaces/IChainlinkAggregator.sol"";
+import ""contracts/interfaces/IERC20Detailed.sol"";
+
+/// @notice Contract for calculating prices of underlying assets and LP tokens in Curve pool. Also
+///     used to sanity check pool against external oracle, to ensure that pools underlying coin ratios
+///     are within a specific range (measued in BP) of the external oracles coin price ratios.
+///     Sanity check:
+///         The Buoy checks previously recorded (cached) curve coin dy, which it compares against current curve dy,
+///         blocking any interaction that is outside a certain tolerance (BASIS_POINTS). When updting the cached
+///         value, the buoy uses chainlink to ensure that curves prices arent off peg.
+contract Buoy3Pool is FixedStablecoins, Controllable, IBuoy, IChainPrice {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    uint256 TIME_LIMIT = 3000;
+    uint256 public BASIS_POINTS = 20;
+    uint256 constant CHAIN_FACTOR = 100;
+
+    ICurve3Pool public immutable override curvePool;
+    IERC20 public immutable lpToken;
+
+    mapping(uint256 => uint256) lastRatio;
+
+    // Chianlink price feed
+    address public immutable daiUsdAgg;
+    address public immutable usdcUsdAgg;
+    address public immutable usdtUsdAgg;
+
+    mapping(address => mapping(address => uint256)) public tokenRatios;
+
+    event LogNewBasisPointLimit(uint256 oldLimit, uint256 newLimit);
+
+    constructor(
+        address _crv3pool,
+        address poolToken,
+        address[N_COINS] memory _tokens,
+        uint256[N_COINS] memory _decimals,
+        address[N_COINS] memory aggregators
+    ) public FixedStablecoins(_tokens, _decimals) {
+        curvePool = ICurve3Pool(_crv3pool);
+        lpToken = IERC20(poolToken);
+        daiUsdAgg = aggregators[0];
+        usdcUsdAgg = aggregators[1];
+        usdtUsdAgg = aggregators[2];
+    }
+
+    /// @notice Set limit for how much Curve pool and external oracle is allowed
+    ///     to deviate before failing transactions
+    /// @param newLimit New limit in BP
+    function setBasisPointsLmit(uint256 newLimit) external onlyOwner {
+        uint256 oldLimit = BASIS_POINTS;
+        BASIS_POINTS = newLimit;
+        emit LogNewBasisPointLimit(oldLimit, newLimit);
+    }
+
+    /// @notice Check the health of the Curve pool:
+    ///     Ratios are checked by the following heuristic:
+    ///     Orcale A - Curve
+    ///     Oracle B - External oracle
+    ///     Both oracles establish ratios for a set of stable coins
+    ///         (a, b, c)
+    ///     and product the following set of ratios:
+    ///         (a/a, a/b, a/c), (b/b, b/a, b/c), (c/c, c/a, c/b)
+    ///     It's simply to reduce the number of comparisons to be made
+    ///     in order to have complete coverage of the system ratios:
+    ///         1) ratios between a stable coin and itself can be discarded
+    ///         2) inverted ratios, a/b bs b/a, while producing different results
+    ///             should both reflect the same change in any one of the two
+    ///             underlying assets, but in opposite directions
+    ///     This mean that the following set should provide the necessary coverage checks
+    ///     to establish that the coins pricing is healthy:
+    ///         (a/b, a/c)
+    function safetyCheck() external view override returns (bool) {
+        for (uint256 i = 1; i < N_COINS; i++) {
+            uint256 _ratio = curvePool.get_dy(int128(0), int128(i), getDecimal(0));
+            _ratio = abs(int256(_ratio - lastRatio[i]));
+            if (_ratio.mul(PERCENTAGE_DECIMAL_FACTOR).div(CURVE_RATIO_DECIMALS_FACTOR) > BASIS_POINTS) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// @notice Updated cached curve value with a custom tolerance towards chainlink
+    /// @param tolerance How much difference between curve and chainlink can be tolerated
+    function updateRatiosWithTolerance(uint256 tolerance) external override returns (bool) {
+        require(msg.sender == controller || msg.sender == owner(), ""updateRatiosWithTolerance: !authorized"");
+        return _updateRatios(tolerance);
+    }
+
+    /// @notice Updated cached curve values
+    function updateRatios() external override returns (bool) {
+        require(msg.sender == controller || msg.sender == owner(), ""updateRatios: !authorized"");
+        return _updateRatios(BASIS_POINTS);
+    }
+
+    /// @notice Get USD value for a specific input amount of tokens, slippage included
+    function stableToUsd(uint256[N_COINS] calldata inAmounts, bool deposit) external view override returns (uint256) {
+        return _stableToUsd(inAmounts, deposit);
+    }
+
+    /// @notice Get estimate USD price of a stablecoin amount
+    /// @param inAmount Token amount
+    /// @param i Index of token
+    function singleStableToUsd(uint256 inAmount, uint256 i) external view override returns (uint256) {
+        uint256[N_COINS] memory inAmounts;
+        inAmounts[i] = inAmount;
+        return _stableToUsd(inAmounts, true);
+    }
+
+    /// @notice Get LP token value of input amount of tokens
+    function stableToLp(uint256[N_COINS] calldata tokenAmounts, bool deposit) external view override returns (uint256) {
+        return _stableToLp(tokenAmounts, deposit);
+    }
+
+    /// @notice Get LP token value of input amount of single token
+    function singleStableFromUsd(uint256 inAmount, int128 i) external view override returns (uint256) {
+        return _singleStableFromLp(_usdToLp(inAmount), i);
+    }
+
+    /// @notice Get LP token value of input amount of single token
+    function singleStableFromLp(uint256 inAmount, int128 i) external view override returns (uint256) {
+        return _singleStableFromLp(inAmount, i);
+    }
+
+    /// @notice Get USD price of LP tokens you receive for a specific input amount of tokens, slippage included
+    function lpToUsd(uint256 inAmount) external view override returns (uint256) {
+        return _lpToUsd(inAmount);
+    }
+
+    /// @notice Convert USD amount to LP tokens
+    function usdToLp(uint256 inAmount) external view override returns (uint256) {
+        return _usdToLp(inAmount);
+    }
+
+    /// @notice Split LP token amount to balance of pool tokens
+    /// @param inAmount Amount of LP tokens
+    /// @param totalBalance Total balance of pool
+    function poolBalances(uint256 inAmount, uint256 totalBalance)
+        internal
+        view
+        returns (uint256[N_COINS] memory balances)
+    {
+        uint256[N_COINS] memory _balances;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            _balances[i] = (IERC20(getToken(i)).balanceOf(address(curvePool)).mul(inAmount)).div(totalBalance);
+        }
+        balances = _balances;
+    }
+
+    function getVirtualPrice() external view override returns (uint256) {
+        return curvePool.get_virtual_price();
+    }
+
+    // Internal functions
+    function _lpToUsd(uint256 inAmount) internal view returns (uint256) {
+        return inAmount.mul(curvePool.get_virtual_price()).div(DEFAULT_DECIMALS_FACTOR);
+    }
+
+    function _stableToUsd(uint256[N_COINS] memory tokenAmounts, bool deposit) internal view returns (uint256) {
+        require(tokenAmounts.length == N_COINS, ""deposit: !length"");
+        uint256[N_COINS] memory _tokenAmounts;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            _tokenAmounts[i] = tokenAmounts[i];
+        }
+        uint256 lpAmount = curvePool.calc_token_amount(_tokenAmounts, deposit);
+        return _lpToUsd(lpAmount);
+    }
+
+    function _stableToLp(uint256[N_COINS] memory tokenAmounts, bool deposit) internal view returns (uint256) {
+        require(tokenAmounts.length == N_COINS, ""deposit: !length"");
+        uint256[N_COINS] memory _tokenAmounts;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            _tokenAmounts[i] = tokenAmounts[i];
+        }
+        return curvePool.calc_token_amount(_tokenAmounts, deposit);
+    }
+
+    function _singleStableFromLp(uint256 inAmount, int128 i) internal view returns (uint256) {
+        uint256 result = curvePool.calc_withdraw_one_coin(inAmount, i);
+        return result;
+    }
+
+    /// @notice Convert USD amount to LP tokens
+    function _usdToLp(uint256 inAmount) internal view returns (uint256) {
+        return inAmount.mul(DEFAULT_DECIMALS_FACTOR).div(curvePool.get_virtual_price());
+    }
+
+    /// @notice Calculate price ratios for stablecoins
+    ///     Get USD price data for stablecoin
+    /// @param i Stablecoin to get USD price for
+    function getPriceFeed(uint256 i) external view override returns (uint256 _price) {
+        _price = uint256(IChainlinkAggregator(getAggregator(i)).latestAnswer());
+    }
+
+    /// @notice Fetch chainlink token ratios
+    /// @param i Token in
+    function getTokenRatios(uint256 i) private view returns (uint256[3] memory _ratios) {
+        uint256[3] memory _prices;
+        _prices[0] = uint256(IChainlinkAggregator(getAggregator(0)).latestAnswer());
+        _prices[1] = uint256(IChainlinkAggregator(getAggregator(1)).latestAnswer());
+        _prices[2] = uint256(IChainlinkAggregator(getAggregator(2)).latestAnswer());
+        for (uint256 j = 0; j < 3; j++) {
+            if (i == j) {
+                _ratios[i] = CHAINLINK_PRICE_DECIMAL_FACTOR;
+            } else {
+                _ratios[j] = _prices[i].mul(CHAINLINK_PRICE_DECIMAL_FACTOR).div(_prices[j]);
+            }
+        }
+        return _ratios;
+    }
+
+    function getAggregator(uint256 index) private view returns (address) {
+        if (index == 0) {
+            return daiUsdAgg;
+        } else if (index == 1) {
+            return usdcUsdAgg;
+        } else {
+            return usdtUsdAgg;
+        }
+    }
+
+    /// @notice Get absolute value
+    function abs(int256 x) private pure returns (uint256) {
+        return x >= 0 ? uint256(x) : uint256(-x);
+    }
+
+    function _updateRatios(uint256 tolerance) private returns (bool) {
+        uint256[N_COINS] memory chainRatios = getTokenRatios(0);
+        uint256[N_COINS] memory newRatios;
+        for (uint256 i = 1; i < N_COINS; i++) {
+            uint256 _ratio = curvePool.get_dy(int128(0), int128(i), getDecimal(0));
+            uint256 check = abs(int256(_ratio) - int256(chainRatios[i].div(CHAIN_FACTOR)));
+            if (check.mul(PERCENTAGE_DECIMAL_FACTOR).div(CURVE_RATIO_DECIMALS_FACTOR) > tolerance) {
+                return false;
+            } else {
+                newRatios[i] = _ratio;
+            }
+        }
+        for (uint256 i = 1; i < N_COINS; i++) {
+            lastRatio[i] = newRatios[i];
+        }
+        return true;
+    }
+}",2761.0,259.0,"[H-01] implicit underflows
+There are a few underflows that are converted via a typecast afterwards to the expected value. If solidity 0.8.x would be used, then the code would revert.
+- int256(a-b) where a and b are uint: For example, if a=1 and b=2, then the intermediate result would be uint(-1) == 2**256-1
+- int256(-x) where x is a uint. For example, if x=1, then the intermediate result would be uint(-1) == 2**256-1
+It's better not to have underflows by using the appropriate typecasts. This is especially relevant when moving to solidity 0.8.x.
+
+[H-02] Buoy3Pool.safetyCheck is not precise and has some assumptions
+The `safetyCheck` function has several issues that impact how precise the checks are:
+(1) Only checks if the `a/b` and a/c ratios are within `BASIS_POINTS`. By transitivity, b/c is only within `2 * BASIS_POINTS` if `a/b` and `a/c` are in range. For a more precise check whether both USDC and USDT are within range, b/c must be checked as well.
+(2) If a/b is within range, this does not imply that b/a is within range.
+""inverted ratios, a/b bs b/a, while producing different results should both reflect the same change in any one of the two underlying assets, but in opposite directions""Example: lastRatio = 1.0 ratio: a = 1.0, b = 0.8 => a/b = 1.25, b/a = 0.8 If a/b was used with a 20% range, it'd be out of range, but b/a is in range.
+(3) The NatSpec for the function states that it checks Curve and an external oracle, but no external oracle calls are checked, both _ratio and lastRatio are only from Curve. Only _updateRatios checks the oracle.
+
+[M-01] Usage of deprecated ChainLink API in Buoy3Pool
+The Chainlink API (`latestAnswer`) used in the Buoy3Pool oracle wrappers is deprecated:
+This API is deprecated. Please see API Reference for the latest Price Feed API. Chainlink Docs
+It seems like the old API can return stale data. Checks similar to that of the new API using latestTimestamp and latestRoundare are needed, as this could lead to stale prices according to the Chainlink documentation:",3.0,"pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""@openzeppelin/contracts/token/ERC20/ERC20.sol"";
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+
+import {FixedStablecoins} from ""contracts/common/FixedContracts.sol"";
+import {ICurve3Pool} from ""contracts/interfaces/ICurve.sol"";
+
+import ""contracts/common/Controllable.sol"";
+
+import ""contracts/interfaces/IBuoy.sol"";
+import ""contracts/interfaces/IChainPrice.sol"";
+import ""contracts/interfaces/IChainlinkAggregator.sol"";
+import ""contracts/interfaces/IERC20Detailed.sol"";
+
+
+contract Buoy3Pool is FixedStablecoins, Controllable, IBuoy, IChainPrice {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    uint256 TIME_LIMIT = 3000;
+    uint256 public BASIS_POINTS = 20;
+    uint256 constant CHAIN_FACTOR = 100;
+
+    ICurve3Pool public immutable override curvePool;
+    IERC20 public immutable lpToken;
+
+    mapping(uint256 => uint256) lastRatio;
+
+    
+    address public immutable daiUsdAgg;
+    address public immutable usdcUsdAgg;
+    address public immutable usdtUsdAgg;
+
+    mapping(address => mapping(address => uint256)) public tokenRatios;
+
+    event LogNewBasisPointLimit(uint256 oldLimit, uint256 newLimit);
+
+    constructor(
+        address _crv3pool,
+        address poolToken,
+        address[N_COINS] memory _tokens,
+        uint256[N_COINS] memory _decimals,
+        address[N_COINS] memory aggregators
+    ) public FixedStablecoins(_tokens, _decimals) {
+        curvePool = ICurve3Pool(_crv3pool);
+        lpToken = IERC20(poolToken);
+        daiUsdAgg = aggregators[0];
+        usdcUsdAgg = aggregators[1];
+        usdtUsdAgg = aggregators[2];
+    }
+
+    
+    
+    
+    function setBasisPointsLmit(uint256 newLimit) external onlyOwner {
+        uint256 oldLimit = BASIS_POINTS;
+        BASIS_POINTS = newLimit;
+        emit LogNewBasisPointLimit(oldLimit, newLimit);
+    }
+
+    
+
+    function safetyCheck() external view override returns (bool) {
+        for (uint256 i = 1; i < N_COINS; i++) {
+            uint256 _ratio = curvePool.get_dy(int128(0), int128(i), getDecimal(0));
+            _ratio = abs(int256(_ratio - lastRatio[i]));
+            if (_ratio.mul(PERCENTAGE_DECIMAL_FACTOR).div(CURVE_RATIO_DECIMALS_FACTOR) > BASIS_POINTS) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    
+    
+    function updateRatiosWithTolerance(uint256 tolerance) external override returns (bool) {
+        require(msg.sender == controller || msg.sender == owner(), ""updateRatiosWithTolerance: !authorized"");
+        return _updateRatios(tolerance);
+    }
+
+    
+    function updateRatios() external override returns (bool) {
+        require(msg.sender == controller || msg.sender == owner(), ""updateRatios: !authorized"");
+        return _updateRatios(BASIS_POINTS);
+    }
+
+    
+    function stableToUsd(uint256[N_COINS] calldata inAmounts, bool deposit) external view override returns (uint256) {
+        return _stableToUsd(inAmounts, deposit);
+    }
+
+    
+    
+    
+    function singleStableToUsd(uint256 inAmount, uint256 i) external view override returns (uint256) {
+        uint256[N_COINS] memory inAmounts;
+        inAmounts[i] = inAmount;
+        return _stableToUsd(inAmounts, true);
+    }
+
+    
+    function stableToLp(uint256[N_COINS] calldata tokenAmounts, bool deposit) external view override returns (uint256) {
+        return _stableToLp(tokenAmounts, deposit);
+    }
+
+    
+    function singleStableFromUsd(uint256 inAmount, int128 i) external view override returns (uint256) {
+        return _singleStableFromLp(_usdToLp(inAmount), i);
+    }
+
+    
+    function singleStableFromLp(uint256 inAmount, int128 i) external view override returns (uint256) {
+        return _singleStableFromLp(inAmount, i);
+    }
+
+    
+    function lpToUsd(uint256 inAmount) external view override returns (uint256) {
+        return _lpToUsd(inAmount);
+    }
+
+    
+    function usdToLp(uint256 inAmount) external view override returns (uint256) {
+        return _usdToLp(inAmount);
+    }
+
+    
+    
+    
+    function poolBalances(uint256 inAmount, uint256 totalBalance)
+        internal
+        view
+        returns (uint256[N_COINS] memory balances)
+    {
+        uint256[N_COINS] memory _balances;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            _balances[i] = (IERC20(getToken(i)).balanceOf(address(curvePool)).mul(inAmount)).div(totalBalance);
+        }
+        balances = _balances;
+    }
+
+    function getVirtualPrice() external view override returns (uint256) {
+        return curvePool.get_virtual_price();
+    }
+
+    
+    function _lpToUsd(uint256 inAmount) internal view returns (uint256) {
+        return inAmount.mul(curvePool.get_virtual_price()).div(DEFAULT_DECIMALS_FACTOR);
+    }
+
+    function _stableToUsd(uint256[N_COINS] memory tokenAmounts, bool deposit) internal view returns (uint256) {
+        require(tokenAmounts.length == N_COINS, ""deposit: !length"");
+        uint256[N_COINS] memory _tokenAmounts;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            _tokenAmounts[i] = tokenAmounts[i];
+        }
+        uint256 lpAmount = curvePool.calc_token_amount(_tokenAmounts, deposit);
+        return _lpToUsd(lpAmount);
+    }
+
+    function _stableToLp(uint256[N_COINS] memory tokenAmounts, bool deposit) internal view returns (uint256) {
+        require(tokenAmounts.length == N_COINS, ""deposit: !length"");
+        uint256[N_COINS] memory _tokenAmounts;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            _tokenAmounts[i] = tokenAmounts[i];
+        }
+        return curvePool.calc_token_amount(_tokenAmounts, deposit);
+    }
+
+    function _singleStableFromLp(uint256 inAmount, int128 i) internal view returns (uint256) {
+        uint256 result = curvePool.calc_withdraw_one_coin(inAmount, i);
+        return result;
+    }
+
+    
+    function _usdToLp(uint256 inAmount) internal view returns (uint256) {
+        return inAmount.mul(DEFAULT_DECIMALS_FACTOR).div(curvePool.get_virtual_price());
+    }
+
+    
+    
+    
+    function getPriceFeed(uint256 i) external view override returns (uint256 _price) {
+        _price = uint256(IChainlinkAggregator(getAggregator(i)).latestAnswer());
+    }
+
+    
+    
+    function getTokenRatios(uint256 i) private view returns (uint256[3] memory _ratios) {
+        uint256[3] memory _prices;
+        _prices[0] = uint256(IChainlinkAggregator(getAggregator(0)).latestAnswer());
+        _prices[1] = uint256(IChainlinkAggregator(getAggregator(1)).latestAnswer());
+        _prices[2] = uint256(IChainlinkAggregator(getAggregator(2)).latestAnswer());
+        for (uint256 j = 0; j < 3; j++) {
+            if (i == j) {
+                _ratios[i] = CHAINLINK_PRICE_DECIMAL_FACTOR;
+            } else {
+                _ratios[j] = _prices[i].mul(CHAINLINK_PRICE_DECIMAL_FACTOR).div(_prices[j]);
+            }
+        }
+        return _ratios;
+    }
+
+    function getAggregator(uint256 index) private view returns (address) {
+        if (index == 0) {
+            return daiUsdAgg;
+        } else if (index == 1) {
+            return usdcUsdAgg;
+        } else {
+            return usdtUsdAgg;
+        }
+    }
+
+    
+    function abs(int256 x) private pure returns (uint256) {
+        return x >= 0 ? uint256(x) : uint256(-x);
+    }
+
+    function _updateRatios(uint256 tolerance) private returns (bool) {
+        uint256[N_COINS] memory chainRatios = getTokenRatios(0);
+        uint256[N_COINS] memory newRatios;
+        for (uint256 i = 1; i < N_COINS; i++) {
+            uint256 _ratio = curvePool.get_dy(int128(0), int128(i), getDecimal(0));
+            uint256 check = abs(int256(_ratio) - int256(chainRatios[i].div(CHAIN_FACTOR)));
+            if (check.mul(PERCENTAGE_DECIMAL_FACTOR).div(CURVE_RATIO_DECIMALS_FACTOR) > tolerance) {
+                return false;
+            } else {
+                newRatios[i] = _ratio;
+            }
+        }
+        for (uint256 i = 1; i < N_COINS; i++) {
+            lastRatio[i] = newRatios[i];
+        }
+        return true;
+    }
+}",2067.0,2,1,"<think>
+I need to systematically analyze this Curve 3Pool monitoring contract for vulnerabilities. Let me go through potential issues:
+
+1. Integer overflow/underflow: The contract is using SafeMath, which is good for preventing these issues.
+
+2. Missing input validation: Let's check if there are any unchecked inputs.
+
+3. Reentrancy vulnerabilities: The contract does interact with external contracts, so this is a possibility.
+
+4. Access control issues: Checking for potential authorization problems.
+
+5. Gas limitations: Looking for potential gas-expensive operations.
+
+6. Logic/math errors: Need to examine the math operations for potential mistakes.
+
+7. Oracle manipulation: The contract relies on Chainlink price feeds.
+
+8. Incorrect error handling: Checking for insufficient error handling.
+
+9. Unchecked external calls: Looking for external calls that might fail.
+
+Let me assess each potential issue:
+</think># Vulnerabilities in the Buoy3Pool Contract
+
+After analyzing the provided Solidity contract, I've identified the following vulnerabilities:
+
+## 1. Typo in Function Name - Potential Misconfiguration
+solidity
+function setBasisPointsLmit(uint256 newLimit) external onlyOwner {
+The function name has a typo (""Lmit"" instead of ""Limit""), which could lead to confusion or interface mismatches.
+
+## 2. Improper Security Check Tolerance
+The `safetyCheck()` function compares with `lastRatio` but doesn't ensure that `lastRatio` has been initialized. If `updateRatios()` hasn't been called yet, `lastRatio` values would be zero, potentially allowing unsafe price conditions to pass the check.
+
+## 3. Inconsistent Authorization Logic
+Some functions check for:
+solidity
+require(msg.sender == controller || msg.sender == owner(), ""updateRatios: !authorized"");
+While others use `onlyOwner` modifier. This inconsistency could lead to permission confusion.
+
+## 4. Oracle Price Manipulation Vulnerability
+The contract relies on Chainlink price feeds but doesn't check for stale or invalid prices. There's no verification of:
+- Price timestamp freshness
+- Price validity (e.g., negative values)
+
+## 5. Division Before Multiplication
+In `_updateRatios()`, there's a potential precision loss:
+solidity
+uint256 check = abs(int256(_ratio) - int256(chainRatios[i].div(CHAIN_FACTOR)));
+The division occurs before multiplication, which can lead to precision loss.
+
+## 6. Missing Zero Address Checks
+The constructor doesn't validate that critical addresses like `_crv3pool`, `poolToken`, and `aggregators` are non-zero.
+
+## 7. Missing Event for Critical Updates
+The `_updateRatios()` function updates important `lastRatio` values but doesn't emit events about these changes, making it difficult to track changes off-chain.
+
+## 8. Lack of Reentrancy Protection
+The contract interacts with external contracts without using reentrancy guards. This includes calls to the curve pool and token contracts.
+
+## 9. Lack of Slippage Protection
+Functions like `_stableToLp` and `_singleStableFromLp` don't have slippage protection, which could lead to significant loss if executed during volatile market conditions.
+
+## 10. No Timelock for Parameter Changes
+Critical parameters like `BASIS_POINTS` can be changed immediately by the owner without a timelock, which could be exploited if owner account is compromised.
+
+These vulnerabilities range from minor code quality issues to potentially serious security concerns related to price oracles and slippage.","### **Comparison and Evaluation**
+
+---
+
+#### **[H-01] Implicit Underflows**
+
+**Report Description**:  
+The issue highlights implicit underflows in the code, particularly in operations like `int256(a-b)` and `int256(-x)` where `a` and `b` are `uint`. These operations can lead to unexpected behavior, especially when transitioning to Solidity 0.8.x, which reverts on underflows. The report emphasizes the importance of using appropriate typecasts to avoid such issues.
+
+**Match in Response List**:  
+**No match found**. The response list does not address implicit underflows or the specific risks associated with typecasting `uint` to `int256`.
+
+**Validation**:  
+**Incorrect**. The response list does not cover this issue at all. It focuses on other vulnerabilities like integer overflow/underflow (using SafeMath), but it does not address the specific problem of implicit underflows caused by typecasting `uint` to `int256`.
+
+---
+
+#### **[H-02] Buoy3Pool.safetyCheck is not precise and has some assumptions**
+
+**Report Description**:  
+The `safetyCheck` function has several precision issues:  
+1. It only checks `a/b` and `a/c` ratios, ignoring `b/c`, which could lead to imprecise results.  
+2. It does not account for inverted ratios (e.g., `a/b` vs. `b/a`), which can produce different results.  
+3. The NatSpec documentation claims it checks an external oracle, but no such checks are implemented.
+
+**Match in Response List**:  
+Partially matches with **""Improper Security Check Tolerance""** and **""Oracle Price Manipulation Vulnerability""** in the response list.
+
+**Validation**:  
+**Partially Correct**.  
+- The response identifies that `safetyCheck` does not ensure `lastRatio` is initialized, which is related to the precision issue but does not address the specific problems with ratio checks (`a/b`, `a/c`, `b/c`) or inverted ratios.  
+- The response also mentions the lack of checks for stale or invalid prices in the Chainlink oracle, which aligns with the issue of missing external oracle checks. However, it does not fully cover the precision and ratio-related concerns.
+
+---
+
+#### **[M-01] Usage of deprecated ChainLink API in Buoy3Pool**
+
+**Report Description**:  
+The Chainlink API (`latestAnswer`) used in the `Buoy3Pool` oracle wrappers is deprecated. The old API can return stale data, and the contract does not implement checks for `latestTimestamp` or `latestRound`, which are recommended in the Chainlink documentation.
+
+**Match in Response List**:  
+Matches with **""Oracle Price Manipulation Vulnerability""** in the response list.
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue with the deprecated Chainlink API and the lack of checks for stale or invalid prices. It correctly highlights the risks associated with using the old API and the need for additional checks, which aligns with the issue report.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[M-01] Usage of deprecated ChainLink API in Buoy3Pool**
+
+**Partially Correct Matches**:  
+- **[H-02] Buoy3Pool.safetyCheck is not precise and has some assumptions**
+
+**Missed Issues from Issue Report**:  
+- **[H-01] Implicit Underflows**
+
+---
+
+### **Conclusion**  
+The response list covers some of the issues in the report, particularly those related to the Chainlink API and the `safetyCheck` function. However, it misses the critical issue of implicit underflows caused by typecasting `uint` to `int256`. Additionally, the coverage of the `safetyCheck` function's precision issues is incomplete. To improve, the response list should address implicit underflows and provide a more detailed analysis of the ratio checks in `safetyCheck`.",1,1,1,10,"```
+1. Oracle Price Manipulation Vulnerability
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the ranks at which the true positives appear in the ranked list of predictions**:
+   - The true positive ""Oracle Price Manipulation Vulnerability"" appears at rank 4 in the ranked list of predictions.
+
+2. **Calculate the precision at that rank**:
+   - Precision at rank 4 (\( P@4 \)) is calculated as the number of true positives up to rank 4 divided by 4.
+   - Since there is only one true positive up to rank 4, \( P@4 = \frac{1}{4} = 0.25 \).
+
+3. **Average the precision values for all true positives**:
+   - Since there is only one true positive, the **Average Precision (AP)** is simply the precision at rank 4.
+
+**Output**:
+```
+0.25
+```",0.25,16.232853174209600,3576.0,3.0
+Controller.sol,"// SPDX-License-Identifier: AGPLv3
+pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+import ""@openzeppelin/contracts/utils/Pausable.sol"";
+
+import {FixedStablecoins, FixedGTokens} from ""./common/FixedContracts.sol"";
+import ""./common/Whitelist.sol"";
+
+import ""./interfaces/IBuoy.sol"";
+import ""./interfaces/IChainPrice.sol"";
+import ""./interfaces/IController.sol"";
+import ""./interfaces/IERC20Detailed.sol"";
+import ""./interfaces/IInsurance.sol"";
+import ""./interfaces/ILifeGuard.sol"";
+import ""./interfaces/IPnL.sol"";
+import ""./interfaces/IToken.sol"";
+import ""./interfaces/IVault.sol"";
+
+/// @notice The main hub for Gro protocol - The controller links up the other contracts,
+///     and acts a route for the other contracts to call one another. It holds global states
+///     such as paused and emergency. Contracts that depend on the controller implement
+///     Controllable.
+///
+///     *****************************************************************************
+///     System tokens - GTokens:
+///     gvt - high yield, uninsured
+///     pwrd - insured by gvt, pays part of its yield to gvt (depending on utilisation)
+///
+///     Tokens order is DAI, USDC, USDT.
+///     Index 0 - DAI, 1 - USDC, 2 - USDT
+///
+///     System vaults:
+///     Stablecoin vaults: One per stablecoin
+///     Curve vault: Vault for LP (liquidity pool) token
+contract Controller is Pausable, Ownable, Whitelist, FixedStablecoins, FixedGTokens, IController {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+
+    address public override curveVault; // LP token vault
+
+    bool public preventSmartContracts = false;
+
+    address public override insurance; // Insurance logic
+    address public override pnl; // Profit and loss calculations
+    address public override lifeGuard; // Asset swapping
+    address public override buoy; // Oracle
+    address public override depositHandler;
+    address public override withdrawHandler;
+    address public override emergencyHandler;
+
+    uint256 public override deadCoin = 99;
+    bool public override emergencyState;
+    // Lower bound for how many gvt can be burned before getting to close to the utilisation ratio
+    uint256 public utilisationRatioLimitGvt;
+    uint256 public utilisationRatioLimitPwrd;
+
+    /// Limits for what deposits/withdrawals that are considered 'large', and thus will be handled with
+    ///     a different logic - limits are checked against total assets locked in etiher of the two tokens (pwrd, gvt)
+    uint256 public bigFishThreshold = 100; // %Basis Points limit
+    uint256 public bigFishAbsoluteThreshold = 0; // Absolute limit
+    address public override reward;
+
+    mapping(address => bool) public safeAddresses; // Some integrations need to be exempt from flashloan checks
+    mapping(uint256 => address) public override underlyingVaults; // Protocol stablecoin vaults
+    mapping(address => uint256) public vaultIndexes;
+
+    mapping(address => address) public override referrals;
+
+    // Pwrd (true) and gvt (false) mapped to respective withdrawal fee
+    mapping(bool => uint256) public override withdrawalFee;
+
+    event LogNewWithdrawHandler(address tokens);
+    event LogNewDepositHandler(address tokens);
+    event LogNewVault(uint256 index, address vault);
+    event LogNewCurveVault(address curveVault);
+    event LogNewLifeguard(address lifeguard);
+    event LogNewInsurance(address insurance);
+    event LogNewPnl(address pnl);
+    event LogNewBigFishThreshold(uint256 percent, uint256 absolute);
+    event LogFlashSwitchUpdated(bool status);
+    event LogNewSafeAddress(address account);
+    event LogNewRewardsContract(address reward);
+    event LogNewUtilLimit(bool indexed pwrd, uint256 limit);
+    event LogNewCurveToStableDistribution(uint256 amount, uint256[N_COINS] amounts, uint256[N_COINS] delta);
+    event LogNewWithdrawalFee(address user, bool pwrd, uint256 newFee);
+
+    constructor(
+        address pwrd,
+        address gvt,
+        address[N_COINS] memory _tokens,
+        uint256[N_COINS] memory _decimals
+    ) public FixedStablecoins(_tokens, _decimals) FixedGTokens(pwrd, gvt) {}
+
+    function pause() external onlyWhitelist {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function setWithdrawHandler(address _withdrawHandler, address _emergencyHandler) external onlyOwner {
+        require(_withdrawHandler != address(0), ""setWithdrawHandler: 0x"");
+        withdrawHandler = _withdrawHandler;
+        emergencyHandler = _emergencyHandler;
+        emit LogNewWithdrawHandler(_withdrawHandler);
+    }
+
+    function setDepositHandler(address _depositHandler) external onlyOwner {
+        require(_depositHandler != address(0), ""setDepositHandler: 0x"");
+        depositHandler = _depositHandler;
+        emit LogNewDepositHandler(_depositHandler);
+    }
+
+    function stablecoins() external view override returns (address[N_COINS] memory) {
+        return underlyingTokens();
+    }
+
+    /// @notice Returns amount to skim of larger deposits for alternative vault (Curve)
+    function getSkimPercent() external view override returns (uint256) {
+        return IInsurance(insurance).calcSkim();
+    }
+
+    /// @notice Returns list of all the underling protocol vaults
+    function vaults() external view override returns (address[N_COINS] memory) {
+        address[N_COINS] memory result;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            result[i] = underlyingVaults[i];
+        }
+        return result;
+    }
+
+    /// @notice Set system vaults, vault index should match its underlying token
+    function setVault(uint256 index, address vault) external onlyOwner {
+        require(vault != address(0), ""setVault: 0x"");
+        require(index < N_COINS, ""setVault: !index"");
+        underlyingVaults[index] = vault;
+        vaultIndexes[vault] = index + 1;
+        emit LogNewVault(index, vault);
+    }
+
+    function setCurveVault(address _curveVault) external onlyOwner {
+        require(_curveVault != address(0), ""setCurveVault: 0x"");
+        curveVault = _curveVault;
+        vaultIndexes[_curveVault] = N_COINS + 1;
+        emit LogNewCurveVault(_curveVault);
+    }
+
+    function setLifeGuard(address _lifeGuard) external onlyOwner {
+        require(_lifeGuard != address(0), ""setLifeGuard: 0x"");
+        lifeGuard = _lifeGuard;
+        buoy = ILifeGuard(_lifeGuard).getBuoy();
+        emit LogNewLifeguard(_lifeGuard);
+    }
+
+    function setInsurance(address _insurance) external onlyOwner {
+        require(_insurance != address(0), ""setInsurance: 0x"");
+        insurance = _insurance;
+        emit LogNewInsurance(_insurance);
+    }
+
+    function setPnL(address _pnl) external onlyOwner {
+        require(_pnl != address(0), ""setPnl: 0x"");
+        pnl = _pnl;
+        emit LogNewPnl(_pnl);
+    }
+
+    function addSafeAddress(address account) external onlyOwner {
+        safeAddresses[account] = true;
+        emit LogNewSafeAddress(account);
+    }
+
+    function switchEoaOnly(bool check) external onlyOwner {
+        preventSmartContracts = check;
+    }
+
+    /// @notice Set limit for when a deposit will be rerouted for alternative logic
+    /// @param _percent %BP limit
+    /// @param _absolute Absolute limit
+    /// @dev The two limits should be used as an upper and lower bound - the % limit
+    ///     considers the current TVL in the token interacted with (gvt or pwrd) and will
+    ///     act as the upper bound when the TVL is low. The absolute value will be the lower bound,
+    ///     ensuring that small deposits won't suffer higher gas costs.
+    function setBigFishThreshold(uint256 _percent, uint256 _absolute) external onlyOwner {
+        require(_percent > 0, ""_whaleLimit is 0"");
+        bigFishThreshold = _percent;
+        bigFishAbsoluteThreshold = _absolute;
+        emit LogNewBigFishThreshold(_percent, _absolute);
+    }
+
+    function setReward(address _reward) external onlyOwner {
+        require(_reward != address(0), ""setReward: 0x"");
+        reward = _reward;
+        emit LogNewRewardsContract(_reward);
+    }
+
+    function addReferral(address account, address referral) external override {
+        require(msg.sender == depositHandler, ""!depositHandler"");
+        if (account != address(0) && referral != address(0) && referrals[account] == address(0)) {
+            referrals[account] = referral;
+        }
+    }
+
+    /// @notice Set withdrawal fee for token
+    /// @param pwrd Pwrd or gvt (pwrd/gvt)
+    /// @param newFee New token fee
+    function setWithdrawalFee(bool pwrd, uint256 newFee) external onlyOwner {
+        withdrawalFee[pwrd] = newFee;
+        emit LogNewWithdrawalFee(msg.sender, pwrd, newFee);
+    }
+
+    /// @notice Calculate system total assets
+    function totalAssets() external view override returns (uint256) {
+        return emergencyState ? _totalAssetsEmergency() : _totalAssets();
+    }
+
+    /// @notice Calculate pwrd/gro vault total assets
+    function gTokenTotalAssets() public view override returns (uint256) {
+        (uint256 gvtAssets, uint256 pwrdAssets) = IPnL(pnl).calcPnL();
+        if (msg.sender == address(gvt)) {
+            return gvtAssets;
+        }
+        if (msg.sender == address(pwrd)) {
+            return pwrdAssets;
+        }
+        return 0;
+    }
+
+    function gToken(bool isPWRD) external view override returns (address) {
+        return isPWRD ? address(pwrd) : address(gvt);
+    }
+
+    /// @notice Check if the deposit/withdrawal needs to go through alternate logic
+    /// @param amount USD amount of deposit/withdrawal
+    /// @dev Larger deposits are handled differently than small deposits in order
+    ///     to guarantee that the system isn't overexposed to any one stablecoin
+    function isValidBigFish(
+        bool pwrd,
+        bool deposit,
+        uint256 amount
+    ) external view override returns (bool) {
+        if (deposit && pwrd) {
+            require(validGTokenIncrease(amount), ""isBigFish: !validGTokenIncrease"");
+        } else if (!pwrd && !deposit) {
+            require(validGTokenDecrease(amount), ""isBigFish: !validGTokenDecrease"");
+        }
+        (uint256 gvtAssets, uint256 pwrdAssets) = IPnL(pnl).calcPnL();
+        uint256 assets = pwrdAssets.add(gvtAssets);
+        if (amount < bigFishAbsoluteThreshold) {
+            return false;
+        } else if (amount > assets) {
+            return true;
+        } else {
+            return amount > assets.mul(bigFishThreshold).div(PERCENTAGE_DECIMAL_FACTOR);
+        }
+    }
+
+    function distributeCurveAssets(uint256 amount, uint256[N_COINS] memory delta) external onlyWhitelist {
+        uint256[N_COINS] memory amounts = ILifeGuard(lifeGuard).distributeCurveVault(amount, delta);
+        emit LogNewCurveToStableDistribution(amount, amounts, delta);
+    }
+
+    /// @notice Block if not an EOA or whitelisted
+    /// @param sender Address of contract to check
+    function eoaOnly(address sender) public override {
+        if (preventSmartContracts && !safeAddresses[tx.origin]) {
+            require(sender == tx.origin, ""EOA only"");
+        }
+    }
+
+    /// @notice TotalAssets = lifeguard + stablecoin vaults + LP vault
+    function _totalAssets() private view returns (uint256) {
+        require(IBuoy(buoy).safetyCheck(), ""!buoy.safetyCheck"");
+        uint256[N_COINS] memory lgAssets = ILifeGuard(lifeGuard).getAssets();
+        uint256[N_COINS] memory vaultAssets;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            vaultAssets[i] = lgAssets[i].add(IVault(underlyingVaults[i]).totalAssets());
+        }
+        uint256 totalLp = IVault(curveVault).totalAssets();
+        totalLp = totalLp.add(IBuoy(buoy).stableToLp(vaultAssets, true));
+        uint256 vp = IBuoy(buoy).getVirtualPrice();
+
+        return totalLp.mul(vp).div(DEFAULT_DECIMALS_FACTOR);
+    }
+
+    /// @notice Same as _totalAssets function, but excluding curve vault + 1 stablecoin
+    ///             and uses chianlink as a price oracle
+    function _totalAssetsEmergency() private view returns (uint256) {
+        IChainPrice chainPrice = IChainPrice(buoy);
+        uint256 total;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            if (i != deadCoin) {
+                address tokenAddress = getToken(i);
+                uint256 decimals = getDecimal(i);
+                IERC20 token = IERC20(tokenAddress);
+                uint256 price = chainPrice.getPriceFeed(i);
+                uint256 assets = IVault(underlyingVaults[i]).totalAssets().add(token.balanceOf(lifeGuard));
+                assets = assets.mul(price).div(CHAINLINK_PRICE_DECIMAL_FACTOR);
+                assets = assets.mul(DEFAULT_DECIMALS_FACTOR).div(decimals);
+                total = total.add(assets);
+            }
+        }
+        return total;
+    }
+
+    /// @notice Set protocol into emergency mode, disabling the use of a give stablecoin.
+    ///             This state assumes:
+    ///                 - Stablecoin of excessively of peg
+    ///                 - Curve3Pool has failed
+    ///             Swapping wil be disabled and the allocation target will be set to
+    ///             100 % for the disabled stablecoin, effectively stopping the system from
+    ///             returning any to the user. Deposit are disable in this mode.
+    /// @param coin Stable coin to disable
+    function emergency(uint256 coin) external onlyWhitelist {
+        require(coin < N_COINS, ""invalid coin"");
+        if (!paused()) {
+            _pause();
+        }
+        deadCoin = coin;
+        emergencyState = true;
+
+        uint256 percent;
+        for (uint256 i; i < N_COINS; i++) {
+            if (i == coin) {
+                percent = 10000;
+            } else {
+                percent = 0;
+            }
+            IInsurance(insurance).setUnderlyingTokenPercent(i, percent);
+        }
+        IPnL(pnl).emergencyPnL();
+    }
+
+    /// @notice Recover the system after emergency mode -
+    /// @param allocations New system target allocations
+    /// @dev Will recalculate system assets and atempt to give back any
+    ///     recovered assets to the GVT side
+    function restart(uint256[] calldata allocations) external onlyOwner whenPaused {
+        _unpause();
+        deadCoin = 99;
+        emergencyState = false;
+
+        for (uint256 i; i < N_COINS; i++) {
+            IInsurance(insurance).setUnderlyingTokenPercent(i, allocations[i]);
+        }
+        IPnL(pnl).recover();
+    }
+
+    /// @notice Distribute any gains or losses generated from a harvest
+    /// @param gain harvset gains
+    /// @param loss harvest losses
+    function distributeStrategyGainLoss(uint256 gain, uint256 loss) external override {
+        uint256 index = vaultIndexes[msg.sender];
+        require(index > 0 || index <= N_COINS + 1, ""!VaultAdaptor"");
+        IPnL ipnl = IPnL(pnl);
+        IBuoy ibuoy = IBuoy(buoy);
+        uint256 gainUsd;
+        uint256 lossUsd;
+        index = index - 1;
+        if (index < N_COINS) {
+            if (gain > 0) {
+                gainUsd = ibuoy.singleStableToUsd(gain, index);
+            } else if (loss > 0) {
+                lossUsd = ibuoy.singleStableToUsd(loss, index);
+            }
+        } else {
+            if (gain > 0) {
+                gainUsd = ibuoy.lpToUsd(gain);
+            } else if (loss > 0) {
+                lossUsd = ibuoy.lpToUsd(loss);
+            }
+        }
+        ipnl.distributeStrategyGainLoss(gainUsd, lossUsd, reward);
+        // Check if curve spot price within tollerance, if so update them
+        if (ibuoy.updateRatios()) {
+            // If the curve ratios were successfully updated, realize system price changes
+            ipnl.distributePriceChange(_totalAssets());
+        }
+    }
+
+    function realizePriceChange(uint256 tolerance) external onlyOwner {
+        IPnL ipnl = IPnL(pnl);
+        IBuoy ibuoy = IBuoy(buoy);
+        if (emergencyState) {
+            ipnl.distributePriceChange(_totalAssetsEmergency());
+        } else {
+            // Check if curve spot price within tollerance, if so update them
+            if (ibuoy.updateRatiosWithTolerance(tolerance)) {
+                // If the curve ratios were successfully updated, realize system price changes
+                ipnl.distributePriceChange(_totalAssets());
+            }
+        }
+    }
+
+    function burnGToken(
+        bool pwrd,
+        bool all,
+        address account,
+        uint256 amount,
+        uint256 bonus
+    ) external override {
+        require(msg.sender == withdrawHandler || msg.sender == emergencyHandler, ""burnGToken: !withdrawHandler"");
+        IToken gt = gTokens(pwrd);
+        if (!all) {
+            gt.burn(account, gt.factor(), amount);
+        } else {
+            gt.burnAll(account);
+        }
+        // Update underlying assets held in pwrd/gvt
+        IPnL(pnl).decreaseGTokenLastAmount(pwrd, amount, bonus);
+    }
+
+    function mintGToken(
+        bool pwrd,
+        address account,
+        uint256 amount
+    ) external override {
+        require(msg.sender == depositHandler, ""burnGToken: !depositHandler"");
+        IToken gt = gTokens(pwrd);
+        gt.mint(account, gt.factor(), amount);
+        IPnL(pnl).increaseGTokenLastAmount(pwrd, amount);
+    }
+
+    /// @notice Calcualte withdrawal value when withdrawing all
+    /// @param pwrd Pwrd or gvt (pwrd/gvt)
+    /// @param account User account
+    function getUserAssets(bool pwrd, address account) external view override returns (uint256 deductUsd) {
+        IToken gt = gTokens(pwrd);
+        deductUsd = gt.getAssets(account);
+        require(deductUsd > 0, ""!minAmount"");
+    }
+
+    /// @notice Check if it's OK to mint the specified amount of tokens, this affects
+    ///     pwrds, as they have an upper bound set by the amount of gvt
+    /// @param amount Amount of token to mint
+    function validGTokenIncrease(uint256 amount) private view returns (bool) {
+        return
+            gTokens(false).totalAssets().mul(utilisationRatioLimitPwrd).div(PERCENTAGE_DECIMAL_FACTOR) >=
+            amount.add(gTokens(true).totalAssets());
+    }
+
+    /// @notice Check if it's OK to burn the specified amount of tokens, this affects
+    ///     gvt, as they have a lower bound set by the amount of pwrds
+    /// @param amount Amount of token to burn
+    function validGTokenDecrease(uint256 amount) public view override returns (bool) {
+        return
+            gTokens(false).totalAssets().sub(amount).mul(utilisationRatioLimitGvt).div(PERCENTAGE_DECIMAL_FACTOR) >=
+            gTokens(true).totalAssets();
+    }
+
+    /// @notice Set the lower bound for when to stop accepting deposits for pwrd - this allows for a bit of legroom
+    ///     for gvt to be sold (if this limit is reached, this contract only accepts deposits for gvt)
+    /// @param _utilisationRatioLimitPwrd Lower limit for pwrd (%BP)
+    function setUtilisationRatioLimitPwrd(uint256 _utilisationRatioLimitPwrd) external onlyOwner {
+        utilisationRatioLimitPwrd = _utilisationRatioLimitPwrd;
+        emit LogNewUtilLimit(true, _utilisationRatioLimitPwrd);
+    }
+
+    /// @notice Set the lower bound for when to stop accepting gvt withdrawals
+    /// @param _utilisationRatioLimitGvt Lower limit for pwrd (%BP)
+    function setUtilisationRatioLimitGvt(uint256 _utilisationRatioLimitGvt) external onlyOwner {
+        utilisationRatioLimitGvt = _utilisationRatioLimitGvt;
+        emit LogNewUtilLimit(false, _utilisationRatioLimitGvt);
+    }
+
+    function getStrategiesTargetRatio() external view override returns (uint256[] memory) {
+        uint256 utilRatio = IPnL(pnl).utilisationRatio();
+        return IInsurance(insurance).getStrategiesTargetRatio(utilRatio);
+    }
+}",4665.0,475.0,"[H-03] Incorrect use of operator leads to arbitrary minting of GVT tokens
+The `distributeStrategyGainLoss()` function distributes any gains or losses generated from a harvest and is expected to be called only by valid protocol vault adaptors. It is an externally visible function and the access control is indirectly enforced on msg.sender by checking that `vaultIndexes[msg.sender]` is a valid index range 1-4. However, the operator used in the require() is || instead of &&, which allows an arbitrary msg.sender, i.e. attacker, to bypass the check.
+Scenario: An arbitrary non-vault address calling this function will get an index of 0 because of default mapping value in` vaultIndexes[msg.sender]`, which will fail the `> 0` check, but pass the `<= N_COINS + 1` check (N_COINS = 3) because 0 <= 4 which will allow control to go past this check.
+Furthermore, on L362, `index=0` will underflow the -1 decrement (due to lack of SafeMath.sub and use of < 0.8.0 solc) and the index will be set to (`uint256_MAX - 1`). This will allow execution to proceed to the ""else"" part of conditional meant for curve LP vault. Therefore, this will allow any random address to call this function with arbitrary values of gain/loss and distribute arbitrary gain/loss appearing to come from Curve vault.
+
+[M-02] Safe addresses can only be added but not removed
+The `addSafeAddress()` takes an address and adds it to a “safe list"". This is used in eoaOnly() to give exemption to safe addresses that are trusted smart contracts, when all other smart contacts are prevented from protocol interaction. The stated purpose is to allow only such partner/trusted smart contract integrations (project rep mentioned Argent wallet as the only one for now but that may change) an exemption from potential flash loan threats. But if there is a safe listed integration that needs to be later disabled, it cannot be done. The protocol will have to rely on other measures (outside the scope of this contest) to prevent flash loan manipulations which are specified as an area of critical concern.
+
+[M-04] Flash loan risk mitigation is optional and not robust enough
+The `switchEoaOnly()` allows the owner to disable `preventSmartContracts` (the project’s plan apparently is to do so after the beta-period) which will allow any smart contract to interact with the protocol and potentially exploit any underlying flash loan vulnerabilities which are specified as an area of critical concern.
+The current mitigation is to optionally prevent contracts, except whitelisted partner ones, from interacting with the protocol to prevent any flash loan manipulations. A more robust approach would be to add logic preventing multiple txs to the protocol from the same address/tx.origin within the same block when smart contracts are allowed. This will avoid any reliance on trust with integrating partners/protocols.",3.0,"pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+import ""@openzeppelin/contracts/utils/Pausable.sol"";
+
+import {FixedStablecoins, FixedGTokens} from ""./common/FixedContracts.sol"";
+import ""./common/Whitelist.sol"";
+
+import ""./interfaces/IBuoy.sol"";
+import ""./interfaces/IChainPrice.sol"";
+import ""./interfaces/IController.sol"";
+import ""./interfaces/IERC20Detailed.sol"";
+import ""./interfaces/IInsurance.sol"";
+import ""./interfaces/ILifeGuard.sol"";
+import ""./interfaces/IPnL.sol"";
+import ""./interfaces/IToken.sol"";
+import ""./interfaces/IVault.sol"";
+
+
+contract Controller is Pausable, Ownable, Whitelist, FixedStablecoins, FixedGTokens, IController {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+
+    address public override curveVault; 
+
+    bool public preventSmartContracts = false;
+
+    address public override insurance; 
+    address public override pnl; 
+    address public override lifeGuard; 
+    address public override buoy; 
+    address public override depositHandler;
+    address public override withdrawHandler;
+    address public override emergencyHandler;
+
+    uint256 public override deadCoin = 99;
+    bool public override emergencyState;
+    
+    uint256 public utilisationRatioLimitGvt;
+    uint256 public utilisationRatioLimitPwrd;
+
+    
+    
+    uint256 public bigFishThreshold = 100; 
+    uint256 public bigFishAbsoluteThreshold = 0; 
+    address public override reward;
+
+    mapping(address => bool) public safeAddresses; 
+    mapping(uint256 => address) public override underlyingVaults; 
+    mapping(address => uint256) public vaultIndexes;
+
+    mapping(address => address) public override referrals;
+
+    
+    mapping(bool => uint256) public override withdrawalFee;
+
+    event LogNewWithdrawHandler(address tokens);
+    event LogNewDepositHandler(address tokens);
+    event LogNewVault(uint256 index, address vault);
+    event LogNewCurveVault(address curveVault);
+    event LogNewLifeguard(address lifeguard);
+    event LogNewInsurance(address insurance);
+    event LogNewPnl(address pnl);
+    event LogNewBigFishThreshold(uint256 percent, uint256 absolute);
+    event LogFlashSwitchUpdated(bool status);
+    event LogNewSafeAddress(address account);
+    event LogNewRewardsContract(address reward);
+    event LogNewUtilLimit(bool indexed pwrd, uint256 limit);
+    event LogNewCurveToStableDistribution(uint256 amount, uint256[N_COINS] amounts, uint256[N_COINS] delta);
+    event LogNewWithdrawalFee(address user, bool pwrd, uint256 newFee);
+
+    constructor(
+        address pwrd,
+        address gvt,
+        address[N_COINS] memory _tokens,
+        uint256[N_COINS] memory _decimals
+    ) public FixedStablecoins(_tokens, _decimals) FixedGTokens(pwrd, gvt) {}
+
+    function pause() external onlyWhitelist {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function setWithdrawHandler(address _withdrawHandler, address _emergencyHandler) external onlyOwner {
+        require(_withdrawHandler != address(0), ""setWithdrawHandler: 0x"");
+        withdrawHandler = _withdrawHandler;
+        emergencyHandler = _emergencyHandler;
+        emit LogNewWithdrawHandler(_withdrawHandler);
+    }
+
+    function setDepositHandler(address _depositHandler) external onlyOwner {
+        require(_depositHandler != address(0), ""setDepositHandler: 0x"");
+        depositHandler = _depositHandler;
+        emit LogNewDepositHandler(_depositHandler);
+    }
+
+    function stablecoins() external view override returns (address[N_COINS] memory) {
+        return underlyingTokens();
+    }
+
+    
+    function getSkimPercent() external view override returns (uint256) {
+        return IInsurance(insurance).calcSkim();
+    }
+
+    
+    function vaults() external view override returns (address[N_COINS] memory) {
+        address[N_COINS] memory result;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            result[i] = underlyingVaults[i];
+        }
+        return result;
+    }
+
+    
+    function setVault(uint256 index, address vault) external onlyOwner {
+        require(vault != address(0), ""setVault: 0x"");
+        require(index < N_COINS, ""setVault: !index"");
+        underlyingVaults[index] = vault;
+        vaultIndexes[vault] = index + 1;
+        emit LogNewVault(index, vault);
+    }
+
+    function setCurveVault(address _curveVault) external onlyOwner {
+        require(_curveVault != address(0), ""setCurveVault: 0x"");
+        curveVault = _curveVault;
+        vaultIndexes[_curveVault] = N_COINS + 1;
+        emit LogNewCurveVault(_curveVault);
+    }
+
+    function setLifeGuard(address _lifeGuard) external onlyOwner {
+        require(_lifeGuard != address(0), ""setLifeGuard: 0x"");
+        lifeGuard = _lifeGuard;
+        buoy = ILifeGuard(_lifeGuard).getBuoy();
+        emit LogNewLifeguard(_lifeGuard);
+    }
+
+    function setInsurance(address _insurance) external onlyOwner {
+        require(_insurance != address(0), ""setInsurance: 0x"");
+        insurance = _insurance;
+        emit LogNewInsurance(_insurance);
+    }
+
+    function setPnL(address _pnl) external onlyOwner {
+        require(_pnl != address(0), ""setPnl: 0x"");
+        pnl = _pnl;
+        emit LogNewPnl(_pnl);
+    }
+
+    function addSafeAddress(address account) external onlyOwner {
+        safeAddresses[account] = true;
+        emit LogNewSafeAddress(account);
+    }
+
+    function switchEoaOnly(bool check) external onlyOwner {
+        preventSmartContracts = check;
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function setBigFishThreshold(uint256 _percent, uint256 _absolute) external onlyOwner {
+        require(_percent > 0, ""_whaleLimit is 0"");
+        bigFishThreshold = _percent;
+        bigFishAbsoluteThreshold = _absolute;
+        emit LogNewBigFishThreshold(_percent, _absolute);
+    }
+
+    function setReward(address _reward) external onlyOwner {
+        require(_reward != address(0), ""setReward: 0x"");
+        reward = _reward;
+        emit LogNewRewardsContract(_reward);
+    }
+
+    function addReferral(address account, address referral) external override {
+        require(msg.sender == depositHandler, ""!depositHandler"");
+        if (account != address(0) && referral != address(0) && referrals[account] == address(0)) {
+            referrals[account] = referral;
+        }
+    }
+
+    
+    
+    
+    function setWithdrawalFee(bool pwrd, uint256 newFee) external onlyOwner {
+        withdrawalFee[pwrd] = newFee;
+        emit LogNewWithdrawalFee(msg.sender, pwrd, newFee);
+    }
+
+    
+    function totalAssets() external view override returns (uint256) {
+        return emergencyState ? _totalAssetsEmergency() : _totalAssets();
+    }
+
+    
+    function gTokenTotalAssets() public view override returns (uint256) {
+        (uint256 gvtAssets, uint256 pwrdAssets) = IPnL(pnl).calcPnL();
+        if (msg.sender == address(gvt)) {
+            return gvtAssets;
+        }
+        if (msg.sender == address(pwrd)) {
+            return pwrdAssets;
+        }
+        return 0;
+    }
+
+    function gToken(bool isPWRD) external view override returns (address) {
+        return isPWRD ? address(pwrd) : address(gvt);
+    }
+
+    
+    
+    
+    
+    function isValidBigFish(
+        bool pwrd,
+        bool deposit,
+        uint256 amount
+    ) external view override returns (bool) {
+        if (deposit && pwrd) {
+            require(validGTokenIncrease(amount), ""isBigFish: !validGTokenIncrease"");
+        } else if (!pwrd && !deposit) {
+            require(validGTokenDecrease(amount), ""isBigFish: !validGTokenDecrease"");
+        }
+        (uint256 gvtAssets, uint256 pwrdAssets) = IPnL(pnl).calcPnL();
+        uint256 assets = pwrdAssets.add(gvtAssets);
+        if (amount < bigFishAbsoluteThreshold) {
+            return false;
+        } else if (amount > assets) {
+            return true;
+        } else {
+            return amount > assets.mul(bigFishThreshold).div(PERCENTAGE_DECIMAL_FACTOR);
+        }
+    }
+
+    function distributeCurveAssets(uint256 amount, uint256[N_COINS] memory delta) external onlyWhitelist {
+        uint256[N_COINS] memory amounts = ILifeGuard(lifeGuard).distributeCurveVault(amount, delta);
+        emit LogNewCurveToStableDistribution(amount, amounts, delta);
+    }
+
+    
+    
+    function eoaOnly(address sender) public override {
+        if (preventSmartContracts && !safeAddresses[tx.origin]) {
+            require(sender == tx.origin, ""EOA only"");
+        }
+    }
+
+    
+    function _totalAssets() private view returns (uint256) {
+        require(IBuoy(buoy).safetyCheck(), ""!buoy.safetyCheck"");
+        uint256[N_COINS] memory lgAssets = ILifeGuard(lifeGuard).getAssets();
+        uint256[N_COINS] memory vaultAssets;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            vaultAssets[i] = lgAssets[i].add(IVault(underlyingVaults[i]).totalAssets());
+        }
+        uint256 totalLp = IVault(curveVault).totalAssets();
+        totalLp = totalLp.add(IBuoy(buoy).stableToLp(vaultAssets, true));
+        uint256 vp = IBuoy(buoy).getVirtualPrice();
+
+        return totalLp.mul(vp).div(DEFAULT_DECIMALS_FACTOR);
+    }
+
+    
+    
+    function _totalAssetsEmergency() private view returns (uint256) {
+        IChainPrice chainPrice = IChainPrice(buoy);
+        uint256 total;
+        for (uint256 i = 0; i < N_COINS; i++) {
+            if (i != deadCoin) {
+                address tokenAddress = getToken(i);
+                uint256 decimals = getDecimal(i);
+                IERC20 token = IERC20(tokenAddress);
+                uint256 price = chainPrice.getPriceFeed(i);
+                uint256 assets = IVault(underlyingVaults[i]).totalAssets().add(token.balanceOf(lifeGuard));
+                assets = assets.mul(price).div(CHAINLINK_PRICE_DECIMAL_FACTOR);
+                assets = assets.mul(DEFAULT_DECIMALS_FACTOR).div(decimals);
+                total = total.add(assets);
+            }
+        }
+        return total;
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    
+    function emergency(uint256 coin) external onlyWhitelist {
+        require(coin < N_COINS, ""invalid coin"");
+        if (!paused()) {
+            _pause();
+        }
+        deadCoin = coin;
+        emergencyState = true;
+
+        uint256 percent;
+        for (uint256 i; i < N_COINS; i++) {
+            if (i == coin) {
+                percent = 10000;
+            } else {
+                percent = 0;
+            }
+            IInsurance(insurance).setUnderlyingTokenPercent(i, percent);
+        }
+        IPnL(pnl).emergencyPnL();
+    }
+
+    
+    
+    
+    
+    function restart(uint256[] calldata allocations) external onlyOwner whenPaused {
+        _unpause();
+        deadCoin = 99;
+        emergencyState = false;
+
+        for (uint256 i; i < N_COINS; i++) {
+            IInsurance(insurance).setUnderlyingTokenPercent(i, allocations[i]);
+        }
+        IPnL(pnl).recover();
+    }
+
+    
+    
+    
+    function distributeStrategyGainLoss(uint256 gain, uint256 loss) external override {
+        uint256 index = vaultIndexes[msg.sender];
+        require(index > 0 || index <= N_COINS + 1, ""!VaultAdaptor"");
+        IPnL ipnl = IPnL(pnl);
+        IBuoy ibuoy = IBuoy(buoy);
+        uint256 gainUsd;
+        uint256 lossUsd;
+        index = index - 1;
+        if (index < N_COINS) {
+            if (gain > 0) {
+                gainUsd = ibuoy.singleStableToUsd(gain, index);
+            } else if (loss > 0) {
+                lossUsd = ibuoy.singleStableToUsd(loss, index);
+            }
+        } else {
+            if (gain > 0) {
+                gainUsd = ibuoy.lpToUsd(gain);
+            } else if (loss > 0) {
+                lossUsd = ibuoy.lpToUsd(loss);
+            }
+        }
+        ipnl.distributeStrategyGainLoss(gainUsd, lossUsd, reward);
+        
+        if (ibuoy.updateRatios()) {
+            
+            ipnl.distributePriceChange(_totalAssets());
+        }
+    }
+
+    function realizePriceChange(uint256 tolerance) external onlyOwner {
+        IPnL ipnl = IPnL(pnl);
+        IBuoy ibuoy = IBuoy(buoy);
+        if (emergencyState) {
+            ipnl.distributePriceChange(_totalAssetsEmergency());
+        } else {
+            
+            if (ibuoy.updateRatiosWithTolerance(tolerance)) {
+                
+                ipnl.distributePriceChange(_totalAssets());
+            }
+        }
+    }
+
+    function burnGToken(
+        bool pwrd,
+        bool all,
+        address account,
+        uint256 amount,
+        uint256 bonus
+    ) external override {
+        require(msg.sender == withdrawHandler || msg.sender == emergencyHandler, ""burnGToken: !withdrawHandler"");
+        IToken gt = gTokens(pwrd);
+        if (!all) {
+            gt.burn(account, gt.factor(), amount);
+        } else {
+            gt.burnAll(account);
+        }
+        
+        IPnL(pnl).decreaseGTokenLastAmount(pwrd, amount, bonus);
+    }
+
+    function mintGToken(
+        bool pwrd,
+        address account,
+        uint256 amount
+    ) external override {
+        require(msg.sender == depositHandler, ""burnGToken: !depositHandler"");
+        IToken gt = gTokens(pwrd);
+        gt.mint(account, gt.factor(), amount);
+        IPnL(pnl).increaseGTokenLastAmount(pwrd, amount);
+    }
+
+    
+    
+    
+    function getUserAssets(bool pwrd, address account) external view override returns (uint256 deductUsd) {
+        IToken gt = gTokens(pwrd);
+        deductUsd = gt.getAssets(account);
+        require(deductUsd > 0, ""!minAmount"");
+    }
+
+    
+    
+    
+    function validGTokenIncrease(uint256 amount) private view returns (bool) {
+        return
+            gTokens(false).totalAssets().mul(utilisationRatioLimitPwrd).div(PERCENTAGE_DECIMAL_FACTOR) >=
+            amount.add(gTokens(true).totalAssets());
+    }
+
+    
+    
+    
+    function validGTokenDecrease(uint256 amount) public view override returns (bool) {
+        return
+            gTokens(false).totalAssets().sub(amount).mul(utilisationRatioLimitGvt).div(PERCENTAGE_DECIMAL_FACTOR) >=
+            gTokens(true).totalAssets();
+    }
+
+    
+    
+    
+    function setUtilisationRatioLimitPwrd(uint256 _utilisationRatioLimitPwrd) external onlyOwner {
+        utilisationRatioLimitPwrd = _utilisationRatioLimitPwrd;
+        emit LogNewUtilLimit(true, _utilisationRatioLimitPwrd);
+    }
+
+    
+    
+    function setUtilisationRatioLimitGvt(uint256 _utilisationRatioLimitGvt) external onlyOwner {
+        utilisationRatioLimitGvt = _utilisationRatioLimitGvt;
+        emit LogNewUtilLimit(false, _utilisationRatioLimitGvt);
+    }
+
+    function getStrategiesTargetRatio() external view override returns (uint256[] memory) {
+        uint256 utilRatio = IPnL(pnl).utilisationRatio();
+        return IInsurance(insurance).getStrategiesTargetRatio(utilRatio);
+    }
+}",3483.0,1,2,"<think>
+I'll analyze this contract for potential vulnerabilities. Let me go through it systematically.
+
+1. Centralization risks
+   - The contract has many admin functions (onlyOwner modifiers)
+   - The owner can change key parameters like utilization ratios, vaults, handlers
+   - The owner has pause/unpause ability
+
+2. Access control issues
+   - Some functions are restricted to a whitelist rather than just the owner
+   - The onlyWhitelist modifier is imported but not shown, so it's hard to assess its security
+
+3. Logic vulnerabilities
+   - The `emergency` function allows setting a ""dead coin"" and changes allocation percentages to 10000 and 0, which feels risky
+   - The `distributeStrategyGainLoss` function relies on msg.sender being a vault, but validation is somewhat unclear
+
+4. Potential reentrancy
+   - The contract interacts with many external contracts (IPnL, IBuoy, etc.)
+   - Reentrancy protection is not always explicit
+
+5. Possible arithmetic issues
+   - Uses SafeMath for most operations which is good
+   - Some division operations that could potentially round to zero
+
+6. Input validation
+   - Some functions lack proper validation for inputs
+
+7. Gas limitations
+   - Loops through N_COINS in several places without gas considerations
+
+8. Missing modifier logic
+   - Some functions should have security modifiers like whenNotPaused
+</think># Vulnerabilities in the Contract
+
+After analyzing the smart contract, I've identified the following vulnerabilities and security concerns:
+
+## 1. Centralization Risks
+- **Excessive Owner Privileges**: The owner has extensive control over critical functions including setting vaults, handlers, and system parameters, creating a central point of failure.
+- **Emergency Control**: The `emergency` and `restart` functions give the owner significant power to alter the system state with limited checks and balances.
+
+## 2. Access Control Issues
+- **Inconsistent Permission Model**: Some functions use `onlyOwner` while others use `onlyWhitelist`, creating confusion about the permission model.
+- **Unclear Whitelisting Mechanism**: The imported `Whitelist` contract's implementation isn't visible, making it difficult to assess how addresses get whitelisted.
+
+## 3. Missing Input Validation
+- **Inadequate Parameter Validation**: In `setUtilisationRatioLimitPwrd` and similar functions, there are no upper bounds on input values.
+- **Zero Address Checks**: While some functions check for zero addresses, others don't consistently apply this check.
+
+## 4. Logic Vulnerabilities
+- **Manipulation of Price Oracles**: The contract relies heavily on external price oracles without mechanisms to detect price manipulation.
+- **Emergency Function Risk**: The `emergency` function sets allocation percentages to extreme values (10000 or 0) which could lead to imbalanced portfolios.
+
+## 5. Re-entrancy Vulnerabilities
+- **External Calls Before State Changes**: In functions like `distributeStrategyGainLoss`, external calls are made before updating internal state, potentially allowing re-entrancy attacks.
+- **Missing Re-entrancy Guards**: The contract doesn't use re-entrancy guards on functions that interact with external contracts.
+
+## 6. Flash Loan Attack Vulnerability
+- **No Checks for Flash Loan Attacks**: The contract doesn't have mechanisms to prevent flash loan attacks that could manipulate asset prices or exploit arbitrage opportunities.
+
+## 7. Arithmetic Issues
+- **Potential Division by Zero**: In various calculation functions, there are divisions that could potentially result in division by zero if not properly checked.
+- **Precision Loss**: Multiple divisions with large numbers could lead to precision loss despite SafeMath usage.
+
+## 8. Smart Contract Bypass
+- **preventSmartContracts Flag Bypass**: The `eoaOnly` function has a bypass mechanism for ""safeAddresses"" that could potentially be exploited by adding malicious addresses to the safe list.
+
+## 9. Denial of Service Risk
+- **Loops Without Gas Considerations**: Several functions loop through N_COINS without considering gas limitations, which could lead to out-of-gas errors if N_COINS becomes large.
+
+## 10. Incomplete Emergency Handling
+- **Partial Implementation**: The emergency functions alter the system state significantly but don't provide robust recovery mechanisms.
+
+These issues should be addressed to improve the security and reliability of the contract.","### **[H-03] Incorrect use of operator leads to arbitrary minting of GVT tokens**
+
+**Report Description**:  
+The `distributeStrategyGainLoss()` function is expected to be called only by valid protocol vault adaptors. Access control is indirectly enforced by checking that `vaultIndexes[msg.sender]` is within a valid range (1-4). However, the `require()` statement uses the `||` operator instead of `&&`, allowing an arbitrary `msg.sender` (attacker) to bypass the check. An attacker can call this function with `vaultIndexes[msg.sender] = 0`, which fails the `> 0` check but passes the `<= N_COINS + 1` check (since `0 <= 4`). This allows execution to proceed, and due to an underflow in the index calculation (on L362), the function will distribute arbitrary gains/losses, appearing to come from the Curve vault. This could lead to arbitrary minting of GVT tokens.
+
+**Match in Response List**:  
+Matches with the issue titled **""Logic Vulnerabilities""** in the response list, specifically the point:  
+- **Re-entrancy Vulnerabilities**: ""In functions like `distributeStrategyGainLoss`, external calls are made before updating internal state, potentially allowing re-entrancy attacks.""
+
+**Validation**:  
+**Partially Correct**. The response identifies the `distributeStrategyGainLoss` function as having a logic vulnerability but focuses on re-entrancy rather than the incorrect use of the `||` operator and the underflow issue. While the response correctly flags the function as problematic, it misses the core issue of improper access control and arithmetic underflow, which are critical to the vulnerability described in the report.
+
+---
+
+### **[M-02] Safe addresses can only be added but not removed**
+
+**Report Description**:  
+The `addSafeAddress()` function adds an address to a ""safe list,"" which is used in `eoaOnly()` to exempt trusted smart contracts from protocol interaction. However, there is no function to remove addresses from the safe list. If a safe-listed integration needs to be disabled (e.g., due to a compromise), the protocol cannot remove it and must rely on external measures to mitigate risks like flash loan manipulations.
+
+**Match in Response List**:  
+Matches with the issue titled **""Smart Contract Bypass""** in the response list, specifically the point:  
+- **preventSmartContracts Flag Bypass**: ""The `eoaOnly` function has a bypass mechanism for 'safeAddresses' that could potentially be exploited by adding malicious addresses to the safe list.""
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue with the `eoaOnly` function and the bypass mechanism for safe addresses. It correctly highlights the risk of adding malicious addresses to the safe list, which aligns with the report's concern about the inability to remove safe addresses. The response covers the core issue effectively.
+
+---
+
+### **[M-04] Flash loan risk mitigation is optional and not robust enough**
+
+**Report Description**:  
+The `switchEoaOnly()` function allows the owner to disable `preventSmartContracts`, which will allow any smart contract to interact with the protocol and potentially exploit flash loan vulnerabilities. The current mitigation relies on preventing contracts (except whitelisted partner ones) from interacting with the protocol. A more robust approach would be to add logic preventing multiple transactions from the same address/tx.origin within the same block when smart contracts are allowed, reducing reliance on trust with integrating partners/protocols.
+
+**Match in Response List**:  
+Matches with the issue titled **""Flash Loan Attack Vulnerability""** in the response list, specifically the point:  
+- **No Checks for Flash Loan Attacks**: ""The contract doesn't have mechanisms to prevent flash loan attacks that could manipulate asset prices or exploit arbitrage opportunities.""
+
+**Validation**:  
+**Correct**. The response accurately identifies the lack of mechanisms to prevent flash loan attacks, which aligns with the report's concern about the optional and insufficient mitigation of flash loan risks. The response covers the core issue effectively.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[M-02] Safe addresses can only be added but not removed**  
+- **[M-04] Flash loan risk mitigation is optional and not robust enough**
+
+**Partially Correct Matches**:  
+- **[H-03] Incorrect use of operator leads to arbitrary minting of GVT tokens**
+
+**Missed Issues from Issue Report**:  
+- *None*  
+
+--- 
+
+The response list effectively covers most of the issues in the report, with only one issue being partially addressed. The analysis of the `distributeStrategyGainLoss` function could be improved by focusing on the incorrect operator usage and arithmetic underflow rather than re-entrancy. Overall, the response list demonstrates a good understanding of the security concerns in the contract.",2,1,0,10,"```
+1. Smart Contract Bypass
+2. Flash Loan Attack Vulnerability
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the ranks of the true positives**:
+   - ""Smart Contract Bypass"" appears at rank 9.
+   - ""Flash Loan Attack Vulnerability"" appears at rank 6.
+
+2. **Calculate precision at each rank**:
+   - At rank 6: \( P@6 = \frac{1}{6} \approx 0.1667 \)
+   - At rank 9: \( P@9 = \frac{2}{9} \approx 0.2222 \)
+
+3. **Average the precision values**:
+   - \( AP = \frac{0.1667 + 0.2222}{2} \approx 0.1944 \)
+
+**Average Precision (AP)**: 0.1944",0.1944,21.4539897441864,5779.0,3.0
+BaseVaultAdaptor.sol,"// SPDX-License-Identifier: AGPLv3
+pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/token/ERC20/ERC20.sol"";
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+import ""contracts/vaults/yearnv2/v032/IYearnV2Vault.sol"";
+import ""../common/Controllable.sol"";
+import ""../interfaces/IVault.sol"";
+import ""../interfaces/IController.sol"";
+import ""../common/Constants.sol"";
+import ""../interfaces/IERC20Detailed.sol"";
+import ""../common/Whitelist.sol"";
+
+/// @notice Base contract for gro protocol vault adaptors - Vault adaptors act as a
+///     layer between the protocol and any yield aggregator vault. They provides additional
+///     functionality needed by the protocol, and allow the protocol to be agnostic
+///     to the type of underlying vault it interacts with.
+///
+///     ###############################################
+///     Base Vault Adaptor specifications
+///     ###############################################
+///
+///     Any deposit/withdrawal into the system will always attempt to interact with the
+///     appropriate vault adaptor (depending on token).
+///     - Deposit: A deposit will move assets into the vault adaptor, which will be
+///         available for investment into the underlying vault once a large enough amount
+///         of assets has amassed in the vault adaptor.
+///     - Withdrawal: A withdrawal will always attempt to pull from the vaultAdaptor if possible,
+///         if the assets in the adaptor fail to cover the withdrawal, the adaptor will
+///         attempt to withdraw assets from the underlying vaults strategies. The latter will
+///         also depend on whether pwrd or gvt is being withdrawn, as strategy assets affect
+///         system exposure levels.
+///     - Invest: Once a significant amount of assets have amassed in the vault adaptor, the
+///         invest trigger will signal that the adaptor is ready to invest assets. The adaptor
+///         always aims to hold a percent of total assets as univested assets (vaultReserve).
+///         This allows for smaller withdrawals to be cheaper as they dont have to interact with
+///         the underlying strategies.
+///     - Debt ratios: Ratio in %BP of assets to invest in the underlying strategies of a vault
+abstract contract BaseVaultAdaptor is Controllable, Constants, Whitelist, IVault {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    uint256 constant MAX_STRATS = 20;
+
+    // Underlying token
+    address public immutable override token;
+    uint256 public immutable decimals;
+    // Underlying vault
+    address public immutable override vault;
+    // Number of strategies
+    uint256 public strategiesLength;
+    // Used to determine if its OK to invest assets to underlying vault
+    uint256 public investThreshold;
+    // Used to establish if the strategy debt ratios need to be updated
+    uint256 public strategyRatioBuffer;
+    // How much of total assets should be held in the vault adaptor (%BP)
+    uint256 public vaultReserve;
+
+    event LogAdaptorToken(address token);
+    event LogAdaptorVault(address vault);
+    event LogAdaptorReserve(uint256 reserve);
+    event LogAdaptorStrategies(uint256 length);
+    event LogNewAdaptorInvestThreshold(uint256 threshold);
+    event LogNewAdaptorStrategyBuffer(uint256 buffer);
+    event LogNewDebtRatios(uint256[] strategyRetios);
+    event LogMigrate(address parent, address child, uint256 amount);
+
+    /// @notice Only the underlying vault is allowed to call
+    modifier onlyVault() {
+        require(msg.sender == vault);
+        _;
+    }
+
+    constructor(address _vault, address _token) public {
+        vault = _vault;
+        token = _token;
+        decimals = IERC20Detailed(_token).decimals();
+        IERC20(_token).safeApprove(address(_vault), 0);
+        IERC20(_token).safeApprove(address(_vault), type(uint256).max);
+    }
+
+    function setVaultReserve(uint256 reserve) external onlyOwner {
+        require(reserve <= PERCENTAGE_DECIMAL_FACTOR);
+        vaultReserve = reserve;
+        emit LogAdaptorReserve(reserve);
+    }
+
+    function setStrategiesLength(uint256 _strategiesLength) external onlyOwner {
+        strategiesLength = _strategiesLength;
+        emit LogAdaptorStrategies(_strategiesLength);
+    }
+
+    function setInvestThreshold(uint256 _investThreshold) external onlyOwner {
+        investThreshold = _investThreshold;
+        emit LogNewAdaptorInvestThreshold(_investThreshold);
+    }
+
+    function setStrategyRatioBuffer(uint256 _strategyRatioBuffer) external onlyOwner {
+        strategyRatioBuffer = _strategyRatioBuffer;
+        emit LogNewAdaptorStrategyBuffer(_strategyRatioBuffer);
+    }
+
+    /// @notice Determine if assets should be moved from the vault adaptors into the underlying vault
+    function investTrigger() external view override returns (bool) {
+        uint256 vaultHold = _totalAssets().mul(vaultReserve).div(PERCENTAGE_DECIMAL_FACTOR);
+        uint256 _investThreshold = investThreshold.mul(uint256(10)**decimals);
+        uint256 balance = IERC20(token).balanceOf(address(this));
+
+        if (balance < _investThreshold) {
+            return false;
+        } else if (balance.sub(_investThreshold) > vaultHold) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// @notice Move assets from vault adaptor into the underlying vault
+    function invest() external override onlyWhitelist {
+        uint256 vaultHold = _totalAssets().mul(vaultReserve).div(PERCENTAGE_DECIMAL_FACTOR);
+        uint256 _investThreshold = investThreshold.mul(uint256(10)**decimals);
+        uint256 balance = IERC20(token).balanceOf(address(this));
+
+        if (balance <= vaultHold) return;
+
+        if (balance.sub(vaultHold) > _investThreshold) {
+            depositToUnderlyingVault(balance.sub(vaultHold));
+        }
+
+        // Check and update strategies debt ratio
+        if (strategiesLength > 1) {
+            // Only for stablecoin vaults
+            uint256[] memory targetRatios = _controller().getStrategiesTargetRatio();
+            uint256[] memory currentRatios = getStrategiesDebtRatio();
+            bool update;
+            for (uint256 i; i < strategiesLength; i++) {
+                if (currentRatios[i] < targetRatios[i] && targetRatios[i].sub(currentRatios[i]) > strategyRatioBuffer) {
+                    update = true;
+                    break;
+                }
+
+                if (currentRatios[i] > targetRatios[i] && currentRatios[i].sub(targetRatios[i]) > strategyRatioBuffer) {
+                    update = true;
+                    break;
+                }
+            }
+            if (update) {
+                updateStrategiesDebtRatio(targetRatios);
+            }
+        }
+    }
+
+    /// @notice Calculate system total assets
+    function totalAssets() external view override returns (uint256) {
+        return _totalAssets();
+    }
+
+    /// @notice Get number of strategies in underlying vault
+    function getStrategiesLength() external view override returns (uint256) {
+        return strategiesLength;
+    }
+
+    /// @notice Withdraw assets from underlying vault
+    /// @param amount Amount to withdraw
+    /// @dev Sends assets to msg.sender
+    function withdraw(uint256 amount) external override {
+        require(msg.sender == _controller().lifeGuard(), ""withdraw: !lifeguard"");
+        if (!_withdrawFromAdapter(amount, msg.sender)) {
+            amount = _withdraw(calculateShare(amount), msg.sender);
+        }
+    }
+
+    /// @notice Withdraw assets from underlying vault
+    /// @param amount Amount to withdraw
+    /// @param recipient Target recipient
+    /// @dev Will try to pull assets from adaptor before moving on to pull
+    ///     assets from unerlying vault/strategies
+    function withdraw(uint256 amount, address recipient) external override {
+        require(msg.sender == _controller().insurance(), ""withdraw: !insurance"");
+        if (!_withdrawFromAdapter(amount, recipient)) {
+            amount = _withdraw(calculateShare(amount), recipient);
+        }
+    }
+
+    /// @notice Withdraw assets from vault to vault adaptor
+    /// @param amount Amount to withdraw
+    function withdrawToAdapter(uint256 amount) external onlyOwner {
+        amount = _withdraw(calculateShare(amount), address(this));
+    }
+
+    /// @notice Withdraw assets from underlying vault, but do so in a specific strategy order
+    /// @param amount Amount to withdraw
+    /// @param recipient Target recipient
+    /// @param reversed reverse strategy order
+    /// @dev This is an addaptation for yearn v2 vaults - these vaults have a defined withdraw
+    ///     order. Gro protocol needs to respect prtocol exposure, and thus might have to withdraw
+    ///     from different strategies depending on if pwrd or gvts are withdrawn.
+    function withdrawByStrategyOrder(
+        uint256 amount,
+        address recipient,
+        bool reversed
+    ) external override {
+        IController ctrl = _controller();
+        require(
+            msg.sender == ctrl.withdrawHandler() ||
+                msg.sender == ctrl.insurance() ||
+                msg.sender == ctrl.emergencyHandler(),
+            ""withdraw: !withdrawHandler/insurance""
+        );
+        if (!_withdrawFromAdapter(amount, recipient)) {
+            amount = _withdrawByStrategyOrder(calculateShare(amount), recipient, reversed);
+        }
+    }
+
+    /// @notice Withdraw assets from underlying vault, but do so from a specific strategy
+    /// @param amount Amount to withdraw
+    /// @param recipient Target recipient
+    /// @param strategyIndex Index of target strategy
+    /// @dev Same as for withdrawByStrategyOrder, but now we withdraw from a specific strategy.
+    ///     This functionality exists to be able to move assets from overExposed strategies.
+    function withdrawByStrategyIndex(
+        uint256 amount,
+        address recipient,
+        uint256 strategyIndex
+    ) external override {
+        require(msg.sender == _controller().insurance(), ""withdraw: !withdrawHandler/insurance"");
+        if (!_withdrawFromAdapter(amount, recipient)) {
+            amount = _withdrawByStrategyIndex(calculateShare(amount), recipient, strategyIndex);
+        }
+    }
+
+    /// @notice Withdraw assets from the vault adaptor itself
+    /// @param amount Amount to withdraw
+    /// @param recipient Target recipient
+    function _withdrawFromAdapter(uint256 amount, address recipient) private returns (bool _success) {
+        uint256 adapterAmount = IERC20(token).balanceOf(address(this));
+        if (adapterAmount >= amount) {
+            IERC20(token).safeTransfer(recipient, amount);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// @notice Get total amount invested in strategy
+    /// @param index Index of strategy
+    function getStrategyAssets(uint256 index) external view override returns (uint256 amount) {
+        return getStrategyTotalAssets(index);
+    }
+
+    /// @notice Deposit assets into the vault adaptor
+    /// @param amount Deposit amount
+    function deposit(uint256 amount) external override {
+        require(msg.sender == _controller().lifeGuard(), ""withdraw: !lifeguard"");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+    }
+
+    /// @notice Set new strategy debt ratios
+    /// @param strategyRatios Array of new debt ratios
+    function updateStrategyRatio(uint256[] calldata strategyRatios) external override {
+        require(
+            msg.sender == _controller().insurance() || msg.sender == owner(),
+            ""!updateStrategyRatio: !owner/insurance""
+        );
+        updateStrategiesDebtRatio(strategyRatios);
+        emit LogNewDebtRatios(strategyRatios);
+    }
+
+    /// @notice Check if underlying strategy needs to be harvested
+    /// @param index Index of stratey
+    /// @param callCost Cost of harvest
+    function strategyHarvestTrigger(uint256 index, uint256 callCost) external view override returns (bool harvested) {
+        require(index < strategiesLength, ""invalid index"");
+        return _strategyHarvestTrigger(index, callCost);
+    }
+
+    /// @notice Harvest underlying strategy
+    /// @param index Index of strategy
+    function strategyHarvest(uint256 index) external override onlyWhitelist returns (bool harvested) {
+        require(index < strategiesLength, ""invalid index"");
+        uint256 beforeAssets = vaultTotalAssets();
+        _strategyHarvest(index);
+        uint256 afterAssets = vaultTotalAssets();
+        if (afterAssets > beforeAssets) {
+            _controller().distributeStrategyGainLoss(afterAssets.sub(beforeAssets), 0);
+        } else if (afterAssets < beforeAssets) {
+            _controller().distributeStrategyGainLoss(0, beforeAssets.sub(afterAssets));
+        }
+        harvested = true;
+    }
+
+    /// @notice Migrate assets to new vault
+    /// @param child target for migration
+    function migrate(address child) external onlyOwner {
+        require(child != address(0), ""migrate: child == 0x"");
+        IERC20 _token = IERC20(token);
+        uint256 balance = _token.balanceOf(address(this));
+        _token.safeTransfer(child, balance);
+        emit LogMigrate(address(this), child, balance);
+    }
+
+    // Virtual functions
+    function _strategyHarvest(uint256 index) internal virtual;
+
+    function updateStrategiesDebtRatio(uint256[] memory ratios) internal virtual;
+
+    function getStrategiesDebtRatio() internal view virtual returns (uint256[] memory);
+
+    /// @notice Deposit from vault adaptors to underlying vaults
+    function depositToUnderlyingVault(uint256 amount) internal virtual;
+
+    function _withdraw(uint256 share, address recipient) internal virtual returns (uint256);
+
+    function _withdrawByStrategyOrder(
+        uint256 share,
+        address recipient,
+        bool reversed
+    ) internal virtual returns (uint256);
+
+    function _withdrawByStrategyIndex(
+        uint256 share,
+        address recipient,
+        uint256 index
+    ) internal virtual returns (uint256);
+
+    function _strategyHarvestTrigger(uint256 index, uint256 callCost) internal view virtual returns (bool);
+
+    function getStrategyEstimatedTotalAssets(uint256 index) internal view virtual returns (uint256);
+
+    function getStrategyTotalAssets(uint256 index) internal view virtual returns (uint256);
+
+    function vaultTotalAssets() internal view virtual returns (uint256);
+
+    function _totalAssets() internal view returns (uint256) {
+        uint256 total = IERC20(token).balanceOf(address(this)).add(vaultTotalAssets());
+        return total;
+    }
+
+    function calculateShare(uint256 amount) private view returns (uint256 share) {
+        uint256 sharePrice = _getVaultSharePrice();
+        share = amount.mul(uint256(10)**decimals).div(sharePrice);
+        uint256 balance = IERC20(vault).balanceOf(address(this));
+        share = share < balance ? share : balance;
+    }
+
+    /// @notice Calculate system total assets including estimated profits
+    function totalEstimatedAssets() external view returns (uint256) {
+        uint256 total = IERC20(token).balanceOf(address(this)).add(IERC20(token).balanceOf(address(vault)));
+        for (uint256 i = 0; i < strategiesLength; i++) {
+            total = total.add(getStrategyEstimatedTotalAssets(i));
+        }
+        return total;
+    }
+
+    function _getVaultSharePrice() internal view virtual returns (uint256);
+}",3280.0,360.0,"***[M-03] BaseVaultAdaptor assumes sharePrice is always in underlying decimals***
+The two `BaseVaultAdaptor.calculateShare` functions compute `share = amount.mul(uint256(10)**decimals).div(sharePrice)`
+```uint256 sharePrice = _getVaultSharePrice();
+// amount is in ""token"" decimals, share should be in ""vault"" decimals
+share = amount.mul(uint256(10)**decimals).div(sharePrice);
+```
+This assumes that the `sharePrice` is always in token decimals and that token decimals is the same as vault decimals.
+Both these assumptions happen to be correct for Yearn vaults, but that will not necessarily be the case for other protocols. As this functionality is in the BaseVaultAdaptor, and not in the specific VaultAdaptorYearnV2_032, consider generalizing the conversion.
+Integrating a token where the token or price is reported in a different precision will lead to potential losses as more shares are computed.
+Because the conversion seems highly protocol-specific, it is recommended that calculateShare should be an abstract function (like _getVaultSharePrice) that is implemented in the specific adaptors.",1.0,"pragma solidity >=0.6.0 <0.7.0;
+
+import ""@openzeppelin/contracts/token/ERC20/ERC20.sol"";
+import ""@openzeppelin/contracts/token/ERC20/SafeERC20.sol"";
+import ""@openzeppelin/contracts/math/SafeMath.sol"";
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+import ""contracts/vaults/yearnv2/v032/IYearnV2Vault.sol"";
+import ""../common/Controllable.sol"";
+import ""../interfaces/IVault.sol"";
+import ""../interfaces/IController.sol"";
+import ""../common/Constants.sol"";
+import ""../interfaces/IERC20Detailed.sol"";
+import ""../common/Whitelist.sol"";
+
+
+abstract contract BaseVaultAdaptor is Controllable, Constants, Whitelist, IVault {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    uint256 constant MAX_STRATS = 20;
+
+    
+    address public immutable override token;
+    uint256 public immutable decimals;
+    
+    address public immutable override vault;
+    
+    uint256 public strategiesLength;
+    
+    uint256 public investThreshold;
+    
+    uint256 public strategyRatioBuffer;
+    
+    uint256 public vaultReserve;
+
+    event LogAdaptorToken(address token);
+    event LogAdaptorVault(address vault);
+    event LogAdaptorReserve(uint256 reserve);
+    event LogAdaptorStrategies(uint256 length);
+    event LogNewAdaptorInvestThreshold(uint256 threshold);
+    event LogNewAdaptorStrategyBuffer(uint256 buffer);
+    event LogNewDebtRatios(uint256[] strategyRetios);
+    event LogMigrate(address parent, address child, uint256 amount);
+
+    
+    modifier onlyVault() {
+        require(msg.sender == vault);
+        _;
+    }
+
+    constructor(address _vault, address _token) public {
+        vault = _vault;
+        token = _token;
+        decimals = IERC20Detailed(_token).decimals();
+        IERC20(_token).safeApprove(address(_vault), 0);
+        IERC20(_token).safeApprove(address(_vault), type(uint256).max);
+    }
+
+    function setVaultReserve(uint256 reserve) external onlyOwner {
+        require(reserve <= PERCENTAGE_DECIMAL_FACTOR);
+        vaultReserve = reserve;
+        emit LogAdaptorReserve(reserve);
+    }
+
+    function setStrategiesLength(uint256 _strategiesLength) external onlyOwner {
+        strategiesLength = _strategiesLength;
+        emit LogAdaptorStrategies(_strategiesLength);
+    }
+
+    function setInvestThreshold(uint256 _investThreshold) external onlyOwner {
+        investThreshold = _investThreshold;
+        emit LogNewAdaptorInvestThreshold(_investThreshold);
+    }
+
+    function setStrategyRatioBuffer(uint256 _strategyRatioBuffer) external onlyOwner {
+        strategyRatioBuffer = _strategyRatioBuffer;
+        emit LogNewAdaptorStrategyBuffer(_strategyRatioBuffer);
+    }
+
+    
+    function investTrigger() external view override returns (bool) {
+        uint256 vaultHold = _totalAssets().mul(vaultReserve).div(PERCENTAGE_DECIMAL_FACTOR);
+        uint256 _investThreshold = investThreshold.mul(uint256(10)**decimals);
+        uint256 balance = IERC20(token).balanceOf(address(this));
+
+        if (balance < _investThreshold) {
+            return false;
+        } else if (balance.sub(_investThreshold) > vaultHold) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    
+    function invest() external override onlyWhitelist {
+        uint256 vaultHold = _totalAssets().mul(vaultReserve).div(PERCENTAGE_DECIMAL_FACTOR);
+        uint256 _investThreshold = investThreshold.mul(uint256(10)**decimals);
+        uint256 balance = IERC20(token).balanceOf(address(this));
+
+        if (balance <= vaultHold) return;
+
+        if (balance.sub(vaultHold) > _investThreshold) {
+            depositToUnderlyingVault(balance.sub(vaultHold));
+        }
+
+        
+        if (strategiesLength > 1) {
+            
+            uint256[] memory targetRatios = _controller().getStrategiesTargetRatio();
+            uint256[] memory currentRatios = getStrategiesDebtRatio();
+            bool update;
+            for (uint256 i; i < strategiesLength; i++) {
+                if (currentRatios[i] < targetRatios[i] && targetRatios[i].sub(currentRatios[i]) > strategyRatioBuffer) {
+                    update = true;
+                    break;
+                }
+
+                if (currentRatios[i] > targetRatios[i] && currentRatios[i].sub(targetRatios[i]) > strategyRatioBuffer) {
+                    update = true;
+                    break;
+                }
+            }
+            if (update) {
+                updateStrategiesDebtRatio(targetRatios);
+            }
+        }
+    }
+
+    
+    function totalAssets() external view override returns (uint256) {
+        return _totalAssets();
+    }
+
+    
+    function getStrategiesLength() external view override returns (uint256) {
+        return strategiesLength;
+    }
+
+    
+    
+    
+    function withdraw(uint256 amount) external override {
+        require(msg.sender == _controller().lifeGuard(), ""withdraw: !lifeguard"");
+        if (!_withdrawFromAdapter(amount, msg.sender)) {
+            amount = _withdraw(calculateShare(amount), msg.sender);
+        }
+    }
+
+    
+    function withdraw(uint256 amount, address recipient) external override {
+        require(msg.sender == _controller().insurance(), ""withdraw: !insurance"");
+        if (!_withdrawFromAdapter(amount, recipient)) {
+            amount = _withdraw(calculateShare(amount), recipient);
+        }
+    }
+
+    
+    
+    function withdrawToAdapter(uint256 amount) external onlyOwner {
+        amount = _withdraw(calculateShare(amount), address(this));
+    }
+
+    
+    function withdrawByStrategyOrder(
+        uint256 amount,
+        address recipient,
+        bool reversed
+    ) external override {
+        IController ctrl = _controller();
+        require(
+            msg.sender == ctrl.withdrawHandler() ||
+                msg.sender == ctrl.insurance() ||
+                msg.sender == ctrl.emergencyHandler(),
+            ""withdraw: !withdrawHandler/insurance""
+        );
+        if (!_withdrawFromAdapter(amount, recipient)) {
+            amount = _withdrawByStrategyOrder(calculateShare(amount), recipient, reversed);
+        }
+    }
+
+    
+    
+    
+    
+    
+    
+    function withdrawByStrategyIndex(
+        uint256 amount,
+        address recipient,
+        uint256 strategyIndex
+    ) external override {
+        require(msg.sender == _controller().insurance(), ""withdraw: !withdrawHandler/insurance"");
+        if (!_withdrawFromAdapter(amount, recipient)) {
+            amount = _withdrawByStrategyIndex(calculateShare(amount), recipient, strategyIndex);
+        }
+    }
+
+    
+    
+    
+    function _withdrawFromAdapter(uint256 amount, address recipient) private returns (bool _success) {
+        uint256 adapterAmount = IERC20(token).balanceOf(address(this));
+        if (adapterAmount >= amount) {
+            IERC20(token).safeTransfer(recipient, amount);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    
+    
+    function getStrategyAssets(uint256 index) external view override returns (uint256 amount) {
+        return getStrategyTotalAssets(index);
+    }
+
+    
+    
+    function deposit(uint256 amount) external override {
+        require(msg.sender == _controller().lifeGuard(), ""withdraw: !lifeguard"");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+    }
+
+    
+    
+    function updateStrategyRatio(uint256[] calldata strategyRatios) external override {
+        require(
+            msg.sender == _controller().insurance() || msg.sender == owner(),
+            ""!updateStrategyRatio: !owner/insurance""
+        );
+        updateStrategiesDebtRatio(strategyRatios);
+        emit LogNewDebtRatios(strategyRatios);
+    }
+
+    
+    
+    
+    function strategyHarvestTrigger(uint256 index, uint256 callCost) external view override returns (bool harvested) {
+        require(index < strategiesLength, ""invalid index"");
+        return _strategyHarvestTrigger(index, callCost);
+    }
+
+    
+    
+    function strategyHarvest(uint256 index) external override onlyWhitelist returns (bool harvested) {
+        require(index < strategiesLength, ""invalid index"");
+        uint256 beforeAssets = vaultTotalAssets();
+        _strategyHarvest(index);
+        uint256 afterAssets = vaultTotalAssets();
+        if (afterAssets > beforeAssets) {
+            _controller().distributeStrategyGainLoss(afterAssets.sub(beforeAssets), 0);
+        } else if (afterAssets < beforeAssets) {
+            _controller().distributeStrategyGainLoss(0, beforeAssets.sub(afterAssets));
+        }
+        harvested = true;
+    }
+
+    
+    
+    function migrate(address child) external onlyOwner {
+        require(child != address(0), ""migrate: child == 0x"");
+        IERC20 _token = IERC20(token);
+        uint256 balance = _token.balanceOf(address(this));
+        _token.safeTransfer(child, balance);
+        emit LogMigrate(address(this), child, balance);
+    }
+
+    
+    function _strategyHarvest(uint256 index) internal virtual;
+
+    function updateStrategiesDebtRatio(uint256[] memory ratios) internal virtual;
+
+    function getStrategiesDebtRatio() internal view virtual returns (uint256[] memory);
+
+    
+    function depositToUnderlyingVault(uint256 amount) internal virtual;
+
+    function _withdraw(uint256 share, address recipient) internal virtual returns (uint256);
+
+    function _withdrawByStrategyOrder(
+        uint256 share,
+        address recipient,
+        bool reversed
+    ) internal virtual returns (uint256);
+
+    function _withdrawByStrategyIndex(
+        uint256 share,
+        address recipient,
+        uint256 index
+    ) internal virtual returns (uint256);
+
+    function _strategyHarvestTrigger(uint256 index, uint256 callCost) internal view virtual returns (bool);
+
+    function getStrategyEstimatedTotalAssets(uint256 index) internal view virtual returns (uint256);
+
+    function getStrategyTotalAssets(uint256 index) internal view virtual returns (uint256);
+
+    function vaultTotalAssets() internal view virtual returns (uint256);
+
+    function _totalAssets() internal view returns (uint256) {
+        uint256 total = IERC20(token).balanceOf(address(this)).add(vaultTotalAssets());
+        return total;
+    }
+
+    function calculateShare(uint256 amount) private view returns (uint256 share) {
+        uint256 sharePrice = _getVaultSharePrice();
+        share = amount.mul(uint256(10)**decimals).div(sharePrice);
+        uint256 balance = IERC20(vault).balanceOf(address(this));
+        share = share < balance ? share : balance;
+    }
+
+    
+    function totalEstimatedAssets() external view returns (uint256) {
+        uint256 total = IERC20(token).balanceOf(address(this)).add(IERC20(token).balanceOf(address(vault)));
+        for (uint256 i = 0; i < strategiesLength; i++) {
+            total = total.add(getStrategyEstimatedTotalAssets(i));
+        }
+        return total;
+    }
+
+    function _getVaultSharePrice() internal view virtual returns (uint256);
+}",2314.0,0,1,"<think>
+Let me examine this smart contract to identify any vulnerabilities:
+
+1. First, let's look at the approval pattern:
+solidity
+IERC20(_token).safeApprove(address(_vault), 0);
+IERC20(_token).safeApprove(address(_vault), type(uint256).max);
+This approves the maximum amount to the vault, which creates a risk if the vault contract is compromised.
+
+2. Integer overflow/underflow concerns:
+- The contract uses SafeMath library, which should mitigate this risk, but let's check for any unchecked arithmetic operations.
+
+3. Access control issues:
+- The contract has onlyOwner, onlyVault, and onlyWhitelist modifiers, but we should check their implementation.
+
+4. Reentrancy issues:
+- The contract inherits from Controllable, Constants, Whitelist, so we'd need to analyze these to fully assess reentrancy protection.
+
+5. Missing input validation:
+- Several functions have parameters that may need validation.
+
+6. Missing slippage protection:
+- For deposit and withdrawal operations, lack of slippage protection could expose to sandwich attacks.
+
+7. Function visibility issues:
+- Check if any functions should be external vs. public, or internal vs. private.
+</think># Vulnerabilities in BaseVaultAdaptor Contract
+
+## 1. Infinite Token Approval
+solidity
+IERC20(_token).safeApprove(address(_vault), 0);
+IERC20(_token).safeApprove(address(_vault), type(uint256).max);
+The contract approves the maximum possible token amount to the vault in the constructor, creating a significant security risk if the vault contract is ever compromised.
+
+## 2. Lack of Input Validation
+Multiple functions don't adequately validate inputs:
+- `setStrategiesLength()` doesn't check if the new length is valid (could exceed MAX_STRATS)
+- `updateStrategiesDebtRatio()` doesn't verify that the provided array length matches strategiesLength
+
+## 3. Centralization Risks
+The contract has significant centralized control by the owner who can:
+- Change vault reserve settings
+- Set strategic investment parameters
+- Withdraw funds to adapter
+- Migrate all funds to another contract
+
+## 4. Potential Precision Loss
+Multiple calculations involving divisions could result in precision loss:
+solidity
+uint256 vaultHold = _totalAssets().mul(vaultReserve).div(PERCENTAGE_DECIMAL_FACTOR);
+
+## 5. Lack of Event Emissions
+Some state-changing functions don't emit events, making it difficult to track changes off-chain:
+- `withdraw()` doesn't emit events
+- `deposit()` doesn't emit events
+
+## 6. No Implementation Verification
+The contract doesn't verify the implementation of crucial abstract methods which might lead to unexpected behavior depending on how child contracts implement them.
+
+## 7. No Timelock for Critical Functions
+Owner-only functions like `migrate()` and `setVaultReserve()` lack a timelock mechanism, allowing immediate changes to critical parameters.
+
+## 8. Potential Integer Underflow
+While the contract uses SafeMath for most operations, careful review of abstract function implementations is needed to ensure all math operations are protected.
+
+## 9. Inconsistent Access Control
+Some functions have inconsistent access control:
+solidity
+function updateStrategyRatio(uint256[] calldata strategyRatios) external override {
+    require(
+        msg.sender == _controller().insurance() || msg.sender == owner(),
+        ""!updateStrategyRatio: !owner/insurance""
+    );
+    // ...
+}
+This creates potential confusion about who has authorization for which operations.
+
+## 10. Lack of Emergency Stop Mechanism
+The contract lacks a comprehensive emergency stop mechanism to pause operations in case of detected vulnerabilities.","### **[M-03] BaseVaultAdaptor assumes sharePrice is always in underlying decimals**
+
+**Report Description**:
+The `BaseVaultAdaptor.calculateShare` functions compute `share = amount.mul(uint256(10)**decimals).div(sharePrice)`, assuming that `sharePrice` is always in token decimals and that token decimals match vault decimals. While this assumption holds for Yearn vaults, it may not be true for other protocols. This could lead to incorrect share calculations and potential losses when integrating tokens with different precision. The report recommends making `calculateShare` an abstract function implemented in specific adaptors to handle protocol-specific conversions.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the specific issue of incorrect assumptions about `sharePrice` and token/vault decimals. While the response mentions ""Potential Precision Loss"" and ""No Implementation Verification,"" these points are not directly related to the core issue of incorrect share calculations due to decimal mismatches. The response fails to identify the vulnerability or propose a solution to handle protocol-specific conversions, which is the primary concern in the issue report.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[M-03] BaseVaultAdaptor assumes sharePrice is always in underlying decimals**
+
+---
+
+The response list does not adequately address the issue of incorrect assumptions about `sharePrice` and token/vault decimals. This is a significant gap, as the issue highlights a critical vulnerability that could lead to financial losses when integrating with different protocols. The response list focuses on other concerns, such as infinite token approval, input validation, and centralization risks, but misses the core issue described in the report.",0,0,1,10,"```
+None.
+```","Given that there are no true positives in the ranked list of predictions, the **Average Precision (AP)** is calculated as follows:
+
+- Since there are no true positives, the precision at any rank is 0.
+- The average of these precision values is also 0.
+
+Therefore, the **Average Precision (AP)** for this query is:
+
+**0.0**",0,18.30410385131840,4085.0,3.0
+,,,,,,,,6,4,,,3,3,4,48,,,0.4444,,,

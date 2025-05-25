@@ -1,0 +1,4250 @@
+nameid,code,tokens,loc,issue,vulnumber,code_snippet,processtokens,high_severity_count,medium_severity_count,Findings,Comparison,Correct Matches,Partially Correct,Missed,LLM-generated,matchList,MAP,Score,execution_time,total_tokens,total_steps
+LiquidityPool.sol,"// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.0;
+pragma abicoder v2;
+
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+import ""../security/Pausable.sol"";
+import ""./interfaces/IExecutorManager.sol"";
+import ""./interfaces/ILiquidityProviders.sol"";
+import ""../interfaces/IERC20Permit.sol"";
+import ""./interfaces/ITokenManager.sol"";
+
+contract LiquidityPool is ReentrancyGuardUpgradeable, Pausable, OwnableUpgradeable, ERC2771ContextUpgradeable {
+    address private constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 private constant BASE_DIVISOR = 10000000000; // Basis Points * 100 for better accuracy
+
+    uint256 public baseGas;
+
+    IExecutorManager private executorManager;
+    ITokenManager public tokenManager;
+    ILiquidityProviders public liquidityProviders;
+
+    struct PermitRequest {
+        uint256 nonce;
+        uint256 expiry;
+        bool allowed;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    mapping(bytes32 => bool) public processedHash;
+    mapping(address => uint256) public gasFeeAccumulatedByToken;
+
+    // Gas fee accumulated by token address => executor address
+    mapping(address => mapping(address => uint256)) public gasFeeAccumulated;
+
+    // Incentive Pool amount per token address
+    mapping(address => uint256) public incentivePool;
+
+    event AssetSent(
+        address indexed asset,
+        uint256 indexed amount,
+        uint256 indexed transferredAmount,
+        address target,
+        bytes depositHash,
+        uint256 fromChainId
+    );
+    event FeeDetails(uint256 indexed lpFee, uint256 indexed transferFee, uint256 indexed gasFee);
+    event Received(address indexed from, uint256 indexed amount);
+    event Deposit(
+        address indexed from,
+        address indexed tokenAddress,
+        address indexed receiver,
+        uint256 toChainId,
+        uint256 amount,
+        uint256 reward,
+        string tag
+    );
+    event GasFeeWithdraw(address indexed tokenAddress, address indexed owner, uint256 indexed amount);
+    event TrustedForwarderChanged(address indexed forwarderAddress);
+    event LiquidityProvidersChanged(address indexed liquidityProvidersAddress);
+    event EthReceived(address, uint256);
+
+    // MODIFIERS
+    modifier onlyExecutor() {
+        require(executorManager.getExecutorStatus(_msgSender()), ""Only executor is allowed"");
+        _;
+    }
+
+    modifier onlyLiquidityProviders() {
+        require(_msgSender() == address(liquidityProviders), ""Only liquidityProviders is allowed"");
+        _;
+    }
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(tokenManager.getTokensInfo(tokenAddress).supportedToken, ""Token not supported"");
+        _;
+    }
+
+    function initialize(
+        address _executorManagerAddress,
+        address _pauser,
+        address _trustedForwarder,
+        address _tokenManager,
+        address _liquidityProviders
+    ) public initializer {
+        require(_executorManagerAddress != address(0), ""ExecutorManager cannot be 0x0"");
+        require(_trustedForwarder != address(0), ""TrustedForwarder cannot be 0x0"");
+        require(_liquidityProviders != address(0), ""LiquidityProviders cannot be 0x0"");
+        __ERC2771Context_init(_trustedForwarder);
+        __ReentrancyGuard_init();
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        executorManager = IExecutorManager(_executorManagerAddress);
+        tokenManager = ITokenManager(_tokenManager);
+        liquidityProviders = ILiquidityProviders(_liquidityProviders);
+        baseGas = 21000;
+    }
+
+    function setTrustedForwarder(address trustedForwarder) public onlyOwner {
+        require(trustedForwarder != address(0), ""TrustedForwarder can't be 0"");
+        _trustedForwarder = trustedForwarder;
+        emit TrustedForwarderChanged(trustedForwarder);
+    }
+
+    function setLiquidityProviders(address _liquidityProviders) public onlyOwner {
+        require(_liquidityProviders != address(0), ""LiquidityProviders can't be 0"");
+        liquidityProviders = ILiquidityProviders(_liquidityProviders);
+        emit LiquidityProvidersChanged(_liquidityProviders);
+    }
+
+    function setBaseGas(uint128 gas) external onlyOwner {
+        baseGas = gas;
+    }
+
+    function getExecutorManager() public view returns (address) {
+        return address(executorManager);
+    }
+
+    function setExecutorManager(address _executorManagerAddress) external onlyOwner {
+        require(_executorManagerAddress != address(0), ""Executor Manager cannot be 0"");
+        executorManager = IExecutorManager(_executorManagerAddress);
+    }
+
+    function getCurrentLiquidity(address tokenAddress) public view returns (uint256 currentLiquidity) {
+        uint256 liquidityPoolBalance = liquidityProviders.getCurrentLiquidity(tokenAddress);
+        
+        currentLiquidity =
+            liquidityPoolBalance -
+            liquidityProviders.totalLPFees(tokenAddress) -
+            gasFeeAccumulatedByToken[tokenAddress] -
+            incentivePool[tokenAddress];
+    }
+
+    /**
+     * @dev Function used to deposit tokens into pool to initiate a cross chain token transfer.
+     * @param toChainId Chain id where funds needs to be transfered
+     * @param tokenAddress ERC20 Token address that needs to be transfered
+     * @param receiver Address on toChainId where tokens needs to be transfered
+     * @param amount Amount of token being transfered
+     */
+    function depositErc20(
+        uint256 toChainId,
+        address tokenAddress,
+        address receiver,
+        uint256 amount,
+        string memory tag
+    ) public tokenChecks(tokenAddress) whenNotPaused nonReentrant {
+        require(
+            tokenManager.getDepositConfig(toChainId, tokenAddress).min <= amount &&
+                tokenManager.getDepositConfig(toChainId, tokenAddress).max >= amount,
+            ""Deposit amount not in Cap limit""
+        );
+        require(receiver != address(0), ""Receiver address cannot be 0"");
+        require(amount != 0, ""Amount cannot be 0"");
+        address sender = _msgSender();
+
+        uint256 rewardAmount = getRewardAmount(amount, tokenAddress);
+        if (rewardAmount != 0) {
+            incentivePool[tokenAddress] = incentivePool[tokenAddress] - rewardAmount;
+        }
+        liquidityProviders.increaseCurrentLiquidity(tokenAddress, amount);
+        SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(tokenAddress), sender, address(this), amount);
+        // Emit (amount + reward amount) in event
+        emit Deposit(sender, tokenAddress, receiver, toChainId, amount + rewardAmount, rewardAmount, tag);
+    }
+
+    function getRewardAmount(uint256 amount, address tokenAddress) public view returns (uint256 rewardAmount) {
+        uint256 currentLiquidity = getCurrentLiquidity(tokenAddress);
+        uint256 providedLiquidity = liquidityProviders.getSuppliedLiquidityByToken(tokenAddress);
+        if (currentLiquidity < providedLiquidity) {
+            uint256 liquidityDifference = providedLiquidity - currentLiquidity;
+            if (amount >= liquidityDifference) {
+                rewardAmount = incentivePool[tokenAddress];
+            } else {
+                // Multiply by 10000000000 to avoid 0 reward amount for small amount and liquidity difference
+                rewardAmount = (amount * incentivePool[tokenAddress] * 10000000000) / liquidityDifference;
+                rewardAmount = rewardAmount / 10000000000;
+            }
+        }
+    }
+
+    /**
+     * DAI permit and Deposit.
+     */
+    function permitAndDepositErc20(
+        address tokenAddress,
+        address receiver,
+        uint256 amount,
+        uint256 toChainId,
+        PermitRequest calldata permitOptions,
+        string memory tag
+    ) external {
+        IERC20Permit(tokenAddress).permit(
+            _msgSender(),
+            address(this),
+            permitOptions.nonce,
+            permitOptions.expiry,
+            permitOptions.allowed,
+            permitOptions.v,
+            permitOptions.r,
+            permitOptions.s
+        );
+        depositErc20(toChainId, tokenAddress, receiver, amount, tag);
+    }
+
+    /**
+     * EIP2612 and Deposit.
+     */
+    function permitEIP2612AndDepositErc20(
+        address tokenAddress,
+        address receiver,
+        uint256 amount,
+        uint256 toChainId,
+        PermitRequest calldata permitOptions,
+        string memory tag
+    ) external {
+        IERC20Permit(tokenAddress).permit(
+            _msgSender(),
+            address(this),
+            amount,
+            permitOptions.expiry,
+            permitOptions.v,
+            permitOptions.r,
+            permitOptions.s
+        );
+        depositErc20(toChainId, tokenAddress, receiver, amount, tag);
+    }
+
+    /**
+     * @dev Function used to deposit native token into pool to initiate a cross chain token transfer.
+     * @param receiver Address on toChainId where tokens needs to be transfered
+     * @param toChainId Chain id where funds needs to be transfered
+     */
+    function depositNative(
+        address receiver,
+        uint256 toChainId,
+        string memory tag
+    ) external payable whenNotPaused nonReentrant {
+        require(
+            tokenManager.getDepositConfig(toChainId, NATIVE).min <= msg.value &&
+                tokenManager.getDepositConfig(toChainId, NATIVE).max >= msg.value,
+            ""Deposit amount not in Cap limit""
+        );
+        require(receiver != address(0), ""Receiver address cannot be 0"");
+        require(msg.value != 0, ""Amount cannot be 0"");
+
+        uint256 rewardAmount = getRewardAmount(msg.value, NATIVE);
+        if (rewardAmount != 0) {
+            incentivePool[NATIVE] = incentivePool[NATIVE] - rewardAmount;
+        }
+        liquidityProviders.increaseCurrentLiquidity(NATIVE, msg.value);
+        emit Deposit(_msgSender(), NATIVE, receiver, toChainId, msg.value + rewardAmount, rewardAmount, tag);
+    }
+
+    function sendFundsToUser(
+        address tokenAddress,
+        uint256 amount,
+        address payable receiver,
+        bytes memory depositHash,
+        uint256 tokenGasPrice,
+        uint256 fromChainId
+    ) external nonReentrant onlyExecutor tokenChecks(tokenAddress) whenNotPaused {
+        uint256 initialGas = gasleft();
+        require(
+            tokenManager.getTransferConfig(tokenAddress).min <= amount &&
+                tokenManager.getTransferConfig(tokenAddress).max >= amount,
+            ""Withdraw amnt not in Cap limits""
+        );
+        require(receiver != address(0), ""Bad receiver address"");
+
+        (bytes32 hashSendTransaction, bool status) = checkHashStatus(tokenAddress, amount, receiver, depositHash);
+
+        require(!status, ""Already Processed"");
+        processedHash[hashSendTransaction] = true;
+
+        uint256 amountToTransfer = getAmountToTransfer(initialGas, tokenAddress, amount, tokenGasPrice);
+        liquidityProviders.decreaseCurrentLiquidity(tokenAddress, amountToTransfer);
+
+        if (tokenAddress == NATIVE) {
+            require(address(this).balance >= amountToTransfer, ""Not Enough Balance"");
+            (bool success, ) = receiver.call{value: amountToTransfer}("""");
+            require(success, ""Native Transfer Failed"");
+        } else {
+            require(IERC20Upgradeable(tokenAddress).balanceOf(address(this)) >= amountToTransfer, ""Not Enough Balance"");
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(tokenAddress), receiver, amountToTransfer);
+        }
+
+        emit AssetSent(tokenAddress, amount, amountToTransfer, receiver, depositHash, fromChainId);
+    }
+
+    /**
+     * @dev Internal function to calculate amount of token that needs to be transfered afetr deducting all required fees.
+     * Fee to be deducted includes gas fee, lp fee and incentive pool amount if needed.
+     * @param initialGas Gas provided initially before any calculations began
+     * @param tokenAddress Token address for which calculation needs to be done
+     * @param amount Amount of token to be transfered before deducting the fee
+     * @param tokenGasPrice Gas price in the token being transfered to be used to calculate gas fee
+     * @return amountToTransfer Total amount to be transfered after deducting all fees.
+     */
+    function getAmountToTransfer(
+        uint256 initialGas,
+        address tokenAddress,
+        uint256 amount,
+        uint256 tokenGasPrice
+    ) internal returns (uint256 amountToTransfer) {
+        uint256 transferFeePerc = getTransferFee(tokenAddress, amount);
+        uint256 lpFee;
+        if (transferFeePerc > tokenManager.getTokensInfo(tokenAddress).equilibriumFee) {
+            // Here add some fee to incentive pool also
+            lpFee = (amount * tokenManager.getTokensInfo(tokenAddress).equilibriumFee) / BASE_DIVISOR;
+            incentivePool[tokenAddress] =
+                (incentivePool[tokenAddress] +
+                    (amount * (transferFeePerc - tokenManager.getTokensInfo(tokenAddress).equilibriumFee))) /
+                BASE_DIVISOR;
+        } else {
+            lpFee = (amount * transferFeePerc) / BASE_DIVISOR;
+        }
+        uint256 transferFeeAmount = (amount * transferFeePerc) / BASE_DIVISOR;
+
+        liquidityProviders.addLPFee(tokenAddress, lpFee);
+
+        uint256 totalGasUsed = initialGas - gasleft();
+        totalGasUsed = totalGasUsed + tokenManager.getTokensInfo(tokenAddress).transferOverhead;
+        totalGasUsed = totalGasUsed + baseGas;
+
+        uint256 gasFee = totalGasUsed * tokenGasPrice;
+        gasFeeAccumulatedByToken[tokenAddress] = gasFeeAccumulatedByToken[tokenAddress] + gasFee;
+        gasFeeAccumulated[tokenAddress][_msgSender()] = gasFeeAccumulated[tokenAddress][_msgSender()] + gasFee;
+        amountToTransfer = amount - (transferFeeAmount + gasFee);
+
+        emit FeeDetails(lpFee, transferFeeAmount, gasFee);
+    }
+
+    function getTransferFee(address tokenAddress, uint256 amount) public view returns (uint256 fee) {
+        uint256 currentLiquidity = getCurrentLiquidity(tokenAddress);
+        uint256 providedLiquidity = liquidityProviders.getSuppliedLiquidityByToken(tokenAddress);
+
+        uint256 resultingLiquidity = currentLiquidity - amount;
+
+        uint256 equilibriumFee = tokenManager.getTokensInfo(tokenAddress).equilibriumFee;
+        uint256 maxFee = tokenManager.getTokensInfo(tokenAddress).maxFee;
+        // Fee is represented in basis points * 10 for better accuracy
+        uint256 numerator = providedLiquidity * equilibriumFee * maxFee; // F(max) * F(e) * L(e)
+        uint256 denominator = equilibriumFee * providedLiquidity + (maxFee - equilibriumFee) * resultingLiquidity; // F(e) * L(e) + (F(max) - F(e)) * L(r)
+
+        if (denominator == 0) {
+            fee = 0;
+        } else {
+            fee = numerator / denominator;
+        }
+    }
+
+    function checkHashStatus(
+        address tokenAddress,
+        uint256 amount,
+        address payable receiver,
+        bytes memory depositHash
+    ) public view returns (bytes32 hashSendTransaction, bool status) {
+        hashSendTransaction = keccak256(abi.encode(tokenAddress, amount, receiver, keccak256(depositHash)));
+
+        status = processedHash[hashSendTransaction];
+    }
+
+    function withdrawErc20GasFee(address tokenAddress) external onlyExecutor whenNotPaused nonReentrant {
+        require(tokenAddress != NATIVE, ""Can't withdraw native token fee"");
+        // uint256 gasFeeAccumulated = gasFeeAccumulatedByToken[tokenAddress];
+        uint256 _gasFeeAccumulated = gasFeeAccumulated[tokenAddress][_msgSender()];
+        require(_gasFeeAccumulated != 0, ""Gas Fee earned is 0"");
+        gasFeeAccumulatedByToken[tokenAddress] = gasFeeAccumulatedByToken[tokenAddress] - _gasFeeAccumulated;
+        gasFeeAccumulated[tokenAddress][_msgSender()] = 0;
+        SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(tokenAddress), _msgSender(), _gasFeeAccumulated);
+        emit GasFeeWithdraw(tokenAddress, _msgSender(), _gasFeeAccumulated);
+    }
+
+    function withdrawNativeGasFee() external onlyExecutor whenNotPaused nonReentrant {
+        uint256 _gasFeeAccumulated = gasFeeAccumulated[NATIVE][_msgSender()];
+        require(_gasFeeAccumulated != 0, ""Gas Fee earned is 0"");
+        gasFeeAccumulatedByToken[NATIVE] = gasFeeAccumulatedByToken[NATIVE] - _gasFeeAccumulated;
+        gasFeeAccumulated[NATIVE][_msgSender()] = 0;
+        (bool success, ) = payable(_msgSender()).call{value: _gasFeeAccumulated}("""");
+        require(success, ""Native Transfer Failed"");
+
+        emit GasFeeWithdraw(address(this), _msgSender(), _gasFeeAccumulated);
+    }
+
+    function transfer(
+        address _tokenAddress,
+        address receiver,
+        uint256 _tokenAmount
+    ) external whenNotPaused onlyLiquidityProviders nonReentrant {
+        require(receiver != address(0), ""Invalid receiver"");
+        if (_tokenAddress == NATIVE) {
+            require(address(this).balance >= _tokenAmount, ""ERR__INSUFFICIENT_BALANCE"");
+            (bool success, ) = receiver.call{value: _tokenAmount}("""");
+            require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        } else {
+            IERC20Upgradeable baseToken = IERC20Upgradeable(_tokenAddress);
+            require(baseToken.balanceOf(address(this)) >= _tokenAmount, ""ERR__INSUFFICIENT_BALANCE"");
+            SafeERC20Upgradeable.safeTransfer(baseToken, receiver, _tokenAmount);
+        }
+    }
+
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address sender)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    receive() external payable {
+        emit EthReceived(_msgSender(), msg.value);
+    }
+}",4025.0,434.0,"[H-01] Can deposit native token for free and steal funds
+The `depositErc20` function allows setting `tokenAddress = NATIVE` and does not throw an error.No matter the `amount` chosen, the `SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(tokenAddress), sender, address(this), amount);` call will not revert because it performs a low-level call to `NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`, which is an EOA, and the low-level calls to EOAs always succeed.Because the safe* version is used, the EOA not returning any data does not revert either.
+This allows an attacker to deposit infinite native tokens by not paying anything.The contract will emit the same `Deposit` event as a real `depositNative` call and the attacker receives the native funds on the other chain.
+
+[H-03] Wrong formula when add fee incentivePool can lead to loss of funds.
+The `getAmountToTransfer` function of `LiquidityPool` updates `incentivePool[tokenAddress]` by adding some fee to it but the formula is wrong and the value of `incentivePool[tokenAddress]` will be divided by `BASE_DIVISOR (10000000000)` each time. After just a few time, the value of `incentivePool[tokenAddress]` will become zero and that amount of `tokenAddress` token will be locked in contract.
+
+[M-08] Incentive Pool can be drained without rebalancing the pool
+`depositErc20()` allows an attacker to specify the destination chain to be the same as the source chain and the receiver account to be the same as the caller account. This enables an attacker to drain the incentive pool without rebalancing the pool back to the equilibrium state.
+
+[M-18] Possible frontrun on `deposits` on LiquidityPool
+Rewards are given to a user for depositing either ERC20 tokens or their native token into the LiquidityPool. This reward is used to incentivize users to deposit funds into the liquidity pool when the pool is not in an equilibrium state.
+For regular users, this liquidity pool state fluctuates based on the frequency and amount of deposits made to the liquidity pool. If a malicious user can control the state of the liquidity pool before a victim deposits tokens into the liquidity pool, they can gain double rewards.
+To gain these double rewards, a malicious user can watch the mempool for transactions that will receive a reward when the deposit occurs. When a malicious user sees that victim deposit, the malicious user can attach a higher fee to their transaction and initiate a deposit. This will allow the malicious user's transaction to front-run before the victim's transaction.",4.0,"pragma solidity 0.8.0;
+pragma abicoder v2;
+
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+import ""../security/Pausable.sol"";
+import ""./interfaces/IExecutorManager.sol"";
+import ""./interfaces/ILiquidityProviders.sol"";
+import ""../interfaces/IERC20Permit.sol"";
+import ""./interfaces/ITokenManager.sol"";
+
+contract LiquidityPool is ReentrancyGuardUpgradeable, Pausable, OwnableUpgradeable, ERC2771ContextUpgradeable {
+    address private constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 private constant BASE_DIVISOR = 10000000000; 
+
+    uint256 public baseGas;
+
+    IExecutorManager private executorManager;
+    ITokenManager public tokenManager;
+    ILiquidityProviders public liquidityProviders;
+
+    struct PermitRequest {
+        uint256 nonce;
+        uint256 expiry;
+        bool allowed;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    mapping(bytes32 => bool) public processedHash;
+    mapping(address => uint256) public gasFeeAccumulatedByToken;
+
+    
+    mapping(address => mapping(address => uint256)) public gasFeeAccumulated;
+
+    
+    mapping(address => uint256) public incentivePool;
+
+    event AssetSent(
+        address indexed asset,
+        uint256 indexed amount,
+        uint256 indexed transferredAmount,
+        address target,
+        bytes depositHash,
+        uint256 fromChainId
+    );
+    event FeeDetails(uint256 indexed lpFee, uint256 indexed transferFee, uint256 indexed gasFee);
+    event Received(address indexed from, uint256 indexed amount);
+    event Deposit(
+        address indexed from,
+        address indexed tokenAddress,
+        address indexed receiver,
+        uint256 toChainId,
+        uint256 amount,
+        uint256 reward,
+        string tag
+    );
+    event GasFeeWithdraw(address indexed tokenAddress, address indexed owner, uint256 indexed amount);
+    event TrustedForwarderChanged(address indexed forwarderAddress);
+    event LiquidityProvidersChanged(address indexed liquidityProvidersAddress);
+    event EthReceived(address, uint256);
+
+    
+    modifier onlyExecutor() {
+        require(executorManager.getExecutorStatus(_msgSender()), ""Only executor is allowed"");
+        _;
+    }
+
+    modifier onlyLiquidityProviders() {
+        require(_msgSender() == address(liquidityProviders), ""Only liquidityProviders is allowed"");
+        _;
+    }
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(tokenManager.getTokensInfo(tokenAddress).supportedToken, ""Token not supported"");
+        _;
+    }
+
+    function initialize(
+        address _executorManagerAddress,
+        address _pauser,
+        address _trustedForwarder,
+        address _tokenManager,
+        address _liquidityProviders
+    ) public initializer {
+        require(_executorManagerAddress != address(0), ""ExecutorManager cannot be 0x0"");
+        require(_trustedForwarder != address(0), ""TrustedForwarder cannot be 0x0"");
+        require(_liquidityProviders != address(0), ""LiquidityProviders cannot be 0x0"");
+        __ERC2771Context_init(_trustedForwarder);
+        __ReentrancyGuard_init();
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        executorManager = IExecutorManager(_executorManagerAddress);
+        tokenManager = ITokenManager(_tokenManager);
+        liquidityProviders = ILiquidityProviders(_liquidityProviders);
+        baseGas = 21000;
+    }
+
+    function setTrustedForwarder(address trustedForwarder) public onlyOwner {
+        require(trustedForwarder != address(0), ""TrustedForwarder can't be 0"");
+        _trustedForwarder = trustedForwarder;
+        emit TrustedForwarderChanged(trustedForwarder);
+    }
+
+    function setLiquidityProviders(address _liquidityProviders) public onlyOwner {
+        require(_liquidityProviders != address(0), ""LiquidityProviders can't be 0"");
+        liquidityProviders = ILiquidityProviders(_liquidityProviders);
+        emit LiquidityProvidersChanged(_liquidityProviders);
+    }
+
+    function setBaseGas(uint128 gas) external onlyOwner {
+        baseGas = gas;
+    }
+
+    function getExecutorManager() public view returns (address) {
+        return address(executorManager);
+    }
+
+    function setExecutorManager(address _executorManagerAddress) external onlyOwner {
+        require(_executorManagerAddress != address(0), ""Executor Manager cannot be 0"");
+        executorManager = IExecutorManager(_executorManagerAddress);
+    }
+
+    function getCurrentLiquidity(address tokenAddress) public view returns (uint256 currentLiquidity) {
+        uint256 liquidityPoolBalance = liquidityProviders.getCurrentLiquidity(tokenAddress);
+        
+        currentLiquidity =
+            liquidityPoolBalance -
+            liquidityProviders.totalLPFees(tokenAddress) -
+            gasFeeAccumulatedByToken[tokenAddress] -
+            incentivePool[tokenAddress];
+    }
+
+    
+    function depositErc20(
+        uint256 toChainId,
+        address tokenAddress,
+        address receiver,
+        uint256 amount,
+        string memory tag
+    ) public tokenChecks(tokenAddress) whenNotPaused nonReentrant {
+        require(
+            tokenManager.getDepositConfig(toChainId, tokenAddress).min <= amount &&
+                tokenManager.getDepositConfig(toChainId, tokenAddress).max >= amount,
+            ""Deposit amount not in Cap limit""
+        );
+        require(receiver != address(0), ""Receiver address cannot be 0"");
+        require(amount != 0, ""Amount cannot be 0"");
+        address sender = _msgSender();
+
+        uint256 rewardAmount = getRewardAmount(amount, tokenAddress);
+        if (rewardAmount != 0) {
+            incentivePool[tokenAddress] = incentivePool[tokenAddress] - rewardAmount;
+        }
+        liquidityProviders.increaseCurrentLiquidity(tokenAddress, amount);
+        SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(tokenAddress), sender, address(this), amount);
+        
+        emit Deposit(sender, tokenAddress, receiver, toChainId, amount + rewardAmount, rewardAmount, tag);
+    }
+
+    function getRewardAmount(uint256 amount, address tokenAddress) public view returns (uint256 rewardAmount) {
+        uint256 currentLiquidity = getCurrentLiquidity(tokenAddress);
+        uint256 providedLiquidity = liquidityProviders.getSuppliedLiquidityByToken(tokenAddress);
+        if (currentLiquidity < providedLiquidity) {
+            uint256 liquidityDifference = providedLiquidity - currentLiquidity;
+            if (amount >= liquidityDifference) {
+                rewardAmount = incentivePool[tokenAddress];
+            } else {
+                
+                rewardAmount = (amount * incentivePool[tokenAddress] * 10000000000) / liquidityDifference;
+                rewardAmount = rewardAmount / 10000000000;
+            }
+        }
+    }
+
+    
+    function permitAndDepositErc20(
+        address tokenAddress,
+        address receiver,
+        uint256 amount,
+        uint256 toChainId,
+        PermitRequest calldata permitOptions,
+        string memory tag
+    ) external {
+        IERC20Permit(tokenAddress).permit(
+            _msgSender(),
+            address(this),
+            permitOptions.nonce,
+            permitOptions.expiry,
+            permitOptions.allowed,
+            permitOptions.v,
+            permitOptions.r,
+            permitOptions.s
+        );
+        depositErc20(toChainId, tokenAddress, receiver, amount, tag);
+    }
+
+    
+    function permitEIP2612AndDepositErc20(
+        address tokenAddress,
+        address receiver,
+        uint256 amount,
+        uint256 toChainId,
+        PermitRequest calldata permitOptions,
+        string memory tag
+    ) external {
+        IERC20Permit(tokenAddress).permit(
+            _msgSender(),
+            address(this),
+            amount,
+            permitOptions.expiry,
+            permitOptions.v,
+            permitOptions.r,
+            permitOptions.s
+        );
+        depositErc20(toChainId, tokenAddress, receiver, amount, tag);
+    }
+
+    
+    function depositNative(
+        address receiver,
+        uint256 toChainId,
+        string memory tag
+    ) external payable whenNotPaused nonReentrant {
+        require(
+            tokenManager.getDepositConfig(toChainId, NATIVE).min <= msg.value &&
+                tokenManager.getDepositConfig(toChainId, NATIVE).max >= msg.value,
+            ""Deposit amount not in Cap limit""
+        );
+        require(receiver != address(0), ""Receiver address cannot be 0"");
+        require(msg.value != 0, ""Amount cannot be 0"");
+
+        uint256 rewardAmount = getRewardAmount(msg.value, NATIVE);
+        if (rewardAmount != 0) {
+            incentivePool[NATIVE] = incentivePool[NATIVE] - rewardAmount;
+        }
+        liquidityProviders.increaseCurrentLiquidity(NATIVE, msg.value);
+        emit Deposit(_msgSender(), NATIVE, receiver, toChainId, msg.value + rewardAmount, rewardAmount, tag);
+    }
+
+    function sendFundsToUser(
+        address tokenAddress,
+        uint256 amount,
+        address payable receiver,
+        bytes memory depositHash,
+        uint256 tokenGasPrice,
+        uint256 fromChainId
+    ) external nonReentrant onlyExecutor tokenChecks(tokenAddress) whenNotPaused {
+        uint256 initialGas = gasleft();
+        require(
+            tokenManager.getTransferConfig(tokenAddress).min <= amount &&
+                tokenManager.getTransferConfig(tokenAddress).max >= amount,
+            ""Withdraw amnt not in Cap limits""
+        );
+        require(receiver != address(0), ""Bad receiver address"");
+
+        (bytes32 hashSendTransaction, bool status) = checkHashStatus(tokenAddress, amount, receiver, depositHash);
+
+        require(!status, ""Already Processed"");
+        processedHash[hashSendTransaction] = true;
+
+        uint256 amountToTransfer = getAmountToTransfer(initialGas, tokenAddress, amount, tokenGasPrice);
+        liquidityProviders.decreaseCurrentLiquidity(tokenAddress, amountToTransfer);
+
+        if (tokenAddress == NATIVE) {
+            require(address(this).balance >= amountToTransfer, ""Not Enough Balance"");
+            (bool success, ) = receiver.call{value: amountToTransfer}("""");
+            require(success, ""Native Transfer Failed"");
+        } else {
+            require(IERC20Upgradeable(tokenAddress).balanceOf(address(this)) >= amountToTransfer, ""Not Enough Balance"");
+            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(tokenAddress), receiver, amountToTransfer);
+        }
+
+        emit AssetSent(tokenAddress, amount, amountToTransfer, receiver, depositHash, fromChainId);
+    }
+
+    
+    function getAmountToTransfer(
+        uint256 initialGas,
+        address tokenAddress,
+        uint256 amount,
+        uint256 tokenGasPrice
+    ) internal returns (uint256 amountToTransfer) {
+        uint256 transferFeePerc = getTransferFee(tokenAddress, amount);
+        uint256 lpFee;
+        if (transferFeePerc > tokenManager.getTokensInfo(tokenAddress).equilibriumFee) {
+            
+            lpFee = (amount * tokenManager.getTokensInfo(tokenAddress).equilibriumFee) / BASE_DIVISOR;
+            incentivePool[tokenAddress] =
+                (incentivePool[tokenAddress] +
+                    (amount * (transferFeePerc - tokenManager.getTokensInfo(tokenAddress).equilibriumFee))) /
+                BASE_DIVISOR;
+        } else {
+            lpFee = (amount * transferFeePerc) / BASE_DIVISOR;
+        }
+        uint256 transferFeeAmount = (amount * transferFeePerc) / BASE_DIVISOR;
+
+        liquidityProviders.addLPFee(tokenAddress, lpFee);
+
+        uint256 totalGasUsed = initialGas - gasleft();
+        totalGasUsed = totalGasUsed + tokenManager.getTokensInfo(tokenAddress).transferOverhead;
+        totalGasUsed = totalGasUsed + baseGas;
+
+        uint256 gasFee = totalGasUsed * tokenGasPrice;
+        gasFeeAccumulatedByToken[tokenAddress] = gasFeeAccumulatedByToken[tokenAddress] + gasFee;
+        gasFeeAccumulated[tokenAddress][_msgSender()] = gasFeeAccumulated[tokenAddress][_msgSender()] + gasFee;
+        amountToTransfer = amount - (transferFeeAmount + gasFee);
+
+        emit FeeDetails(lpFee, transferFeeAmount, gasFee);
+    }
+
+    function getTransferFee(address tokenAddress, uint256 amount) public view returns (uint256 fee) {
+        uint256 currentLiquidity = getCurrentLiquidity(tokenAddress);
+        uint256 providedLiquidity = liquidityProviders.getSuppliedLiquidityByToken(tokenAddress);
+
+        uint256 resultingLiquidity = currentLiquidity - amount;
+
+        uint256 equilibriumFee = tokenManager.getTokensInfo(tokenAddress).equilibriumFee;
+        uint256 maxFee = tokenManager.getTokensInfo(tokenAddress).maxFee;
+        
+        uint256 numerator = providedLiquidity * equilibriumFee * maxFee; 
+        uint256 denominator = equilibriumFee * providedLiquidity + (maxFee - equilibriumFee) * resultingLiquidity; 
+
+        if (denominator == 0) {
+            fee = 0;
+        } else {
+            fee = numerator / denominator;
+        }
+    }
+
+    function checkHashStatus(
+        address tokenAddress,
+        uint256 amount,
+        address payable receiver,
+        bytes memory depositHash
+    ) public view returns (bytes32 hashSendTransaction, bool status) {
+        hashSendTransaction = keccak256(abi.encode(tokenAddress, amount, receiver, keccak256(depositHash)));
+
+        status = processedHash[hashSendTransaction];
+    }
+
+    function withdrawErc20GasFee(address tokenAddress) external onlyExecutor whenNotPaused nonReentrant {
+        require(tokenAddress != NATIVE, ""Can't withdraw native token fee"");
+        
+        uint256 _gasFeeAccumulated = gasFeeAccumulated[tokenAddress][_msgSender()];
+        require(_gasFeeAccumulated != 0, ""Gas Fee earned is 0"");
+        gasFeeAccumulatedByToken[tokenAddress] = gasFeeAccumulatedByToken[tokenAddress] - _gasFeeAccumulated;
+        gasFeeAccumulated[tokenAddress][_msgSender()] = 0;
+        SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(tokenAddress), _msgSender(), _gasFeeAccumulated);
+        emit GasFeeWithdraw(tokenAddress, _msgSender(), _gasFeeAccumulated);
+    }
+
+    function withdrawNativeGasFee() external onlyExecutor whenNotPaused nonReentrant {
+        uint256 _gasFeeAccumulated = gasFeeAccumulated[NATIVE][_msgSender()];
+        require(_gasFeeAccumulated != 0, ""Gas Fee earned is 0"");
+        gasFeeAccumulatedByToken[NATIVE] = gasFeeAccumulatedByToken[NATIVE] - _gasFeeAccumulated;
+        gasFeeAccumulated[NATIVE][_msgSender()] = 0;
+        (bool success, ) = payable(_msgSender()).call{value: _gasFeeAccumulated}("""");
+        require(success, ""Native Transfer Failed"");
+
+        emit GasFeeWithdraw(address(this), _msgSender(), _gasFeeAccumulated);
+    }
+
+    function transfer(
+        address _tokenAddress,
+        address receiver,
+        uint256 _tokenAmount
+    ) external whenNotPaused onlyLiquidityProviders nonReentrant {
+        require(receiver != address(0), ""Invalid receiver"");
+        if (_tokenAddress == NATIVE) {
+            require(address(this).balance >= _tokenAmount, ""ERR__INSUFFICIENT_BALANCE"");
+            (bool success, ) = receiver.call{value: _tokenAmount}("""");
+            require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        } else {
+            IERC20Upgradeable baseToken = IERC20Upgradeable(_tokenAddress);
+            require(baseToken.balanceOf(address(this)) >= _tokenAmount, ""ERR__INSUFFICIENT_BALANCE"");
+            SafeERC20Upgradeable.safeTransfer(baseToken, receiver, _tokenAmount);
+        }
+    }
+
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address sender)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    receive() external payable {
+        emit EthReceived(_msgSender(), msg.value);
+    }
+}",3573.0,2,2,"<think>
+Let me systematically analyze this contract for potential vulnerabilities:
+
+1. Reentrancy: The contract uses a ReentrancyGuard and has nonReentrant modifiers on critical functions, which is good. But let's check if there are any cross-function reentrancy issues.
+
+2. Integer Overflow/Underflow: The contract uses Solidity 0.8.0, which has built-in overflow/underflow checks, so this is likely not an issue.
+
+3. Access Control: The contract has proper onlyOwner, onlyExecutor, and onlyLiquidityProviders modifiers.
+
+4. Unbounded Loops: I don't see any loops in the code.
+
+5. Incorrect Fee Calculation: Let's check the fee calculations for potential issues.
+
+6. Unprotected External Calls: Let's check if any external calls could be exploited.
+
+7. Front-running: Check if any functions are vulnerable to front-running.
+
+Potential issues I've identified:
+</think># Vulnerabilities in LiquidityPool Contract
+
+After analyzing the provided contract, I've identified the following vulnerabilities and security concerns:
+
+## 1. Underflow in Incentive Pool
+
+In both `depositErc20` and `depositNative` functions, the contract subtracts `rewardAmount` from `incentivePool[tokenAddress]` without checking if there's enough balance:
+
+solidity
+incentivePool[tokenAddress] = incentivePool[tokenAddress] - rewardAmount;
+
+While Solidity 0.8.0 has built-in overflow/underflow protection, this could lead to transaction reversions if the incentive pool is depleted.
+
+## 2. Unchecked Return Value in ERC20 Permit Functions
+
+In both `permitAndDepositErc20` and `permitEIP2612AndDepositErc20` functions, the contract doesn't check the return value of the `permit` function call, which could lead to silent failures.
+
+## 3. Missing Slippage Protection
+
+The contract doesn't implement slippage protection for fee calculations, which means users could receive significantly less than expected if market conditions change between transaction submission and execution.
+
+## 4. Potential DOS in Fee Calculation
+
+In `getTransferFee` function, there's a division that could lead to a DOS if `denominator` is very small (but not zero):
+
+solidity
+fee = numerator / denominator;
+
+## 5. Insufficient Input Validation
+
+The `depositHash` parameter in `sendFundsToUser` is not validated, potentially allowing manipulation of transaction identifiers.
+
+## 6. Centralization Risks
+
+- The contract gives extensive power to the owner, who can change critical components like the trusted forwarder and executor manager
+- The executor role has privileged access to send funds and withdraw gas fees
+
+## 7. Potential Front-Running in Fee Withdrawals
+
+The gas fee withdrawal functions (`withdrawErc20GasFee` and `withdrawNativeGasFee`) could be front-run to extract value if the token price changes significantly.
+
+## 8. Lack of Event Emission in Some State Changes
+
+Some state changes don't emit events, making it difficult to track contract activity off-chain:
+- No event when executor manager is changed
+- No event when incentive pool changes
+
+## 9. Hardcoded Constants
+
+The contract uses several hardcoded constants (`BASE_DIVISOR = 10000000000`, `baseGas = 21000`) which may not be adaptable to different environments or network conditions.
+
+## 10. No Critical Emergency Stop Functionality
+
+While the contract is Pausable, there's no specific emergency functionality to handle critical security incidents beyond pausing.
+
+These vulnerabilities expose the contract to various risks, from financial loss to potential denial of service. Implementation of additional checks and balances would improve the contract's security posture.","### **Analysis of Issues and Responses**
+
+---
+
+#### **[H-01] Can deposit native token for free and steal funds**
+
+**Report Description**:  
+The `depositErc20` function allows setting `tokenAddress = NATIVE` (a special address representing native tokens) without throwing an error. The `SafeERC20Upgradeable.safeTransferFrom` call does not revert because it performs a low-level call to the `NATIVE` address, which is an EOA (Externally Owned Account). Since low-level calls to EOAs always succeed and the `safeTransferFrom` function does not revert when no data is returned, an attacker can deposit infinite native tokens without paying anything. This allows the attacker to steal native funds on the other chain.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this specific vulnerability. The issue involves a critical flaw in the `depositErc20` function that allows attackers to exploit the `NATIVE` address to deposit native tokens for free. This is a severe security risk that is entirely missed in the response list.
+
+---
+
+#### **[H-03] Wrong formula when add fee in `incentivePool` can lead to loss of funds**
+
+**Report Description**:  
+The `getAmountToTransfer` function in `LiquidityPool` updates `incentivePool[tokenAddress]` by adding a fee, but the formula is incorrect. The value of `incentivePool[tokenAddress]` is divided by `BASE_DIVISOR (10000000000)` each time, causing it to rapidly decrease to zero. This results in the token funds being locked in the contract.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this issue. The incorrect formula in `getAmountToTransfer` is a critical flaw that leads to the loss of funds in the `incentivePool`. This vulnerability is entirely missed in the response list.
+
+---
+
+#### **[M-08] Incentive Pool can be drained without rebalancing the pool**
+
+**Report Description**:  
+The `depositErc20` function allows an attacker to specify the destination chain as the same as the source chain and the receiver account as the same as the caller account. This enables the attacker to drain the incentive pool without rebalancing the pool back to the equilibrium state.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this issue. The ability to drain the incentive pool without rebalancing is a significant security risk that is entirely missed in the response list.
+
+---
+
+#### **[M-18] Possible frontrun on `deposits` on LiquidityPool**
+
+**Report Description**:  
+Rewards are given to users for depositing tokens into the LiquidityPool. A malicious user can watch the mempool for transactions that will receive a reward and front-run them by attaching a higher fee to their transaction. This allows the attacker to gain double rewards by controlling the state of the liquidity pool before the victim's deposit.
+
+**Match in Response List**:  
+Matches with the issue titled **""Potential Front-Running in Fee Withdrawals""**.
+
+**Validation**:  
+**Partially Correct**. The response list identifies front-running as a potential issue but focuses on fee withdrawals rather than deposits. While the core concept of front-running is addressed, the specific vulnerability related to deposits and double rewards is not fully covered.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[M-18] Possible frontrun on `deposits` on LiquidityPool**
+
+**Missed Issues from Issue Report**:  
+- **[H-01] Can deposit native token for free and steal funds**  
+- **[H-03] Wrong formula when add fee in `incentivePool` can lead to loss of funds**  
+- **[M-08] Incentive Pool can be drained without rebalancing the pool**
+
+---
+
+### **Conclusion**  
+The response list fails to address several critical vulnerabilities identified in the issue report, including the ability to deposit native tokens for free, the incorrect formula in `incentivePool`, and the draining of the incentive pool. While it partially covers the front-running issue, the focus is misaligned with the specific vulnerability described. Overall, the response list is insufficient in addressing the security risks outlined in the issue report.",0,1,3,10,"```
+None.
+```",0.0,0,19.32091999053960,5717.0,3.0
+LiquidityProviders.sol,"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+
+import ""../security/Pausable.sol"";
+import ""./interfaces/ILPToken.sol"";
+import ""./interfaces/ITokenManager.sol"";
+import ""./interfaces/IWhiteListPeriodManager.sol"";
+import ""./interfaces/ILiquidityPool.sol"";
+
+contract LiquidityProviders is
+    Initializable,
+    ReentrancyGuardUpgradeable,
+    ERC2771ContextUpgradeable,
+    OwnableUpgradeable,
+    Pausable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    address internal constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 public constant BASE_DIVISOR = 10**18;
+
+    ILPToken internal lpToken;
+    ILiquidityPool internal liquidityPool;
+    ITokenManager internal tokenManager;
+    IWhiteListPeriodManager internal whiteListPeriodManager;
+
+    event LiquidityAdded(address indexed tokenAddress, uint256 indexed amount, address indexed lp);
+    event LiquidityRemoved(address indexed tokenAddress, uint256 indexed amount, address indexed lp);
+    event FeeClaimed(address indexed tokenAddress, uint256 indexed fee, address indexed lp, uint256 sharesBurnt);
+    event FeeAdded(address indexed tokenAddress, uint256 indexed fee);
+    event EthReceived(address indexed sender, uint256 value);
+    event CurrentLiquidityChanged(address indexed token, uint256 indexed oldValue, uint256 indexed newValue);
+
+    // LP Fee Distribution
+    mapping(address => uint256) public totalReserve; // Include Liquidity + Fee accumulated
+    mapping(address => uint256) public totalLiquidity; // Include Liquidity only
+    mapping(address => uint256) public currentLiquidity; // Include current liquidity, updated on every in and out transfer
+    mapping(address => uint256) public totalLPFees;
+    mapping(address => uint256) public totalSharesMinted;
+
+    /**
+     * @dev Modifier for checking to validate a NFTId and it's ownership
+     * @param _tokenId token id to validate
+     * @param _transactor typically msgSender(), passed to verify against owner of _tokenId
+     */
+    modifier onlyValidLpToken(uint256 _tokenId, address _transactor) {
+        (address token, , ) = lpToken.tokenMetadata(_tokenId);
+        require(lpToken.exists(_tokenId), ""ERR__TOKEN_DOES_NOT_EXIST"");
+        require(lpToken.ownerOf(_tokenId) == _transactor, ""ERR__TRANSACTOR_DOES_NOT_OWN_NFT"");
+        _;
+    }
+
+    /**
+     * @dev Modifier for checking if msg.sender in liquiditypool
+     */
+    modifier onlyLiquidityPool() {
+        require(_msgSender() == address(liquidityPool), ""ERR__UNAUTHORIZED"");
+        _;
+    }
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(_isSupportedToken(tokenAddress), ""Token not supported"");
+        _;
+    }
+
+    /**
+     * @dev initalizes the contract, acts as constructor
+     * @param _trustedForwarder address of trusted forwarder
+     */
+    function initialize(
+        address _trustedForwarder,
+        address _lpToken,
+        address _tokenManager,
+        address _pauser
+    ) public initializer {
+        __ERC2771Context_init(_trustedForwarder);
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        __ReentrancyGuard_init();
+        _setLPToken(_lpToken);
+        _setTokenManager(_tokenManager);
+    }
+
+    function _isSupportedToken(address _token) internal view returns (bool) {
+        return tokenManager.getTokensInfo(_token).supportedToken;
+    }
+
+    function getTotalReserveByToken(address tokenAddress) public view returns (uint256) {
+        return totalReserve[tokenAddress];
+    }
+
+    function getSuppliedLiquidityByToken(address tokenAddress) public view returns (uint256) {
+        return totalLiquidity[tokenAddress];
+    }
+
+    function getTotalLPFeeByToken(address tokenAddress) public view returns (uint256) {
+        return totalLPFees[tokenAddress];
+    }
+
+    function getCurrentLiquidity(address tokenAddress) public view returns (uint256) {
+        return currentLiquidity[tokenAddress];
+    }
+
+    /**
+     * @dev To be called post initialization, used to set address of NFT Contract
+     * @param _lpToken address of lpToken
+     */
+    function setLpToken(address _lpToken) external onlyOwner {
+        _setLPToken(_lpToken);
+    }
+
+    /**
+     * Internal method to set LP token contract.
+     */
+    function _setLPToken(address _lpToken) internal {
+        lpToken = ILPToken(_lpToken);
+    }
+
+    function increaseCurrentLiquidity(address tokenAddress, uint256 amount) public onlyLiquidityPool {
+        _increaseCurrentLiquidity(tokenAddress, amount);
+    }
+
+    function decreaseCurrentLiquidity(address tokenAddress, uint256 amount) public onlyLiquidityPool {
+        _decreaseCurrentLiquidity(tokenAddress, amount);
+    }
+
+    function _increaseCurrentLiquidity(address tokenAddress, uint256 amount) private {
+        currentLiquidity[tokenAddress] += amount;
+        emit CurrentLiquidityChanged(tokenAddress, currentLiquidity[tokenAddress]-amount, currentLiquidity[tokenAddress]);
+    }
+
+    function _decreaseCurrentLiquidity(address tokenAddress, uint256 amount) private {
+        currentLiquidity[tokenAddress] -= amount;
+        emit CurrentLiquidityChanged(tokenAddress, currentLiquidity[tokenAddress]+amount, currentLiquidity[tokenAddress]);
+    }
+
+    /**
+     * Public method to set TokenManager contract.
+     */
+    function setTokenManager(address _tokenManager) external onlyOwner {
+        _setTokenManager(_tokenManager);
+    }
+
+    /**
+     * Internal method to set TokenManager contract.
+     */
+    function _setTokenManager(address _tokenManager) internal {
+        tokenManager = ITokenManager(_tokenManager);
+    }
+
+    /**
+     * @dev To be called post initialization, used to set address of WhiteListPeriodManager Contract
+     * @param _whiteListPeriodManager address of WhiteListPeriodManager
+     */
+    function setWhiteListPeriodManager(address _whiteListPeriodManager) external onlyOwner {
+        whiteListPeriodManager = IWhiteListPeriodManager(_whiteListPeriodManager);
+    }
+
+    /**
+     * @dev To be called post initialization, used to set address of LiquidityPool Contract
+     * @param _liquidityPool address of LiquidityPool
+     */
+    function setLiquidityPool(address _liquidityPool) external onlyOwner {
+        liquidityPool = ILiquidityPool(_liquidityPool);
+    }
+
+    /**
+     * @dev Returns price of Base token in terms of LP Shares
+     * @param _baseToken address of baseToken
+     * @return Price of Base token in terms of LP Shares
+     */
+    function getTokenPriceInLPShares(address _baseToken) public view returns (uint256) {
+        uint256 supply = totalSharesMinted[_baseToken];
+        if (supply > 0) {
+            return totalSharesMinted[_baseToken] / totalReserve[_baseToken];
+        }
+        return BASE_DIVISOR;
+    }
+
+    /**
+     * @dev Converts shares to token amount
+     */
+
+    function sharesToTokenAmount(uint256 _shares, address _tokenAddress) public view returns (uint256) {
+        return (_shares * totalReserve[_tokenAddress]) / totalSharesMinted[_tokenAddress];
+    }
+
+    /**
+     * @dev Returns the fee accumulated on a given NFT
+     * @param _nftId Id of NFT
+     * @return accumulated fee
+     */
+    function getFeeAccumulatedOnNft(uint256 _nftId) public view returns (uint256) {
+        require(lpToken.exists(_nftId), ""ERR__INVALID_NFT"");
+
+        (address _tokenAddress, uint256 nftSuppliedLiquidity, uint256 totalNFTShares) = lpToken.tokenMetadata(_nftId);
+
+        if (totalNFTShares == 0) {
+            return 0;
+        }
+        // Calculate rewards accumulated
+        uint256 eligibleLiquidity = sharesToTokenAmount(totalNFTShares, _tokenAddress);
+        uint256 lpFeeAccumulated;
+
+        // Handle edge cases where eligibleLiquidity is less than what was supplied by very small amount 
+        if(nftSuppliedLiquidity > eligibleLiquidity) {
+            lpFeeAccumulated = 0;
+        } else {
+            unchecked {
+                lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+            }
+        }
+        return lpFeeAccumulated;
+    }
+
+    /**
+     * @dev Records fee being added to total reserve
+     * @param _token Address of Token for which LP fee is being added
+     * @param _amount Amount being added
+     */
+    function addLPFee(address _token, uint256 _amount) external onlyLiquidityPool tokenChecks(_token) whenNotPaused {
+        totalReserve[_token] += _amount;
+        totalLPFees[_token] += _amount;
+        emit FeeAdded(_token, _amount);
+    }
+
+    /**
+     * @dev Internal function to add liquidity to a new NFT
+     */
+    function _addLiquidity(address _token, uint256 _amount) internal {
+        require(_amount > 0, ""ERR__AMOUNT_IS_0"");
+        uint256 nftId = lpToken.mint(_msgSender());
+        LpTokenMetadata memory data = LpTokenMetadata(_token, 0, 0);
+        lpToken.updateTokenMetadata(nftId, data);
+        _increaseLiquidity(nftId, _amount);
+    }
+
+    /**
+     * @dev Function to mint a new NFT for a user, add native liquidity and store the
+     *      record in the newly minted NFT
+     */
+    function addNativeLiquidity() external payable nonReentrant tokenChecks(NATIVE) whenNotPaused {
+        (bool success, ) = address(liquidityPool).call{value: msg.value}("""");
+        require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        _addLiquidity(NATIVE, msg.value);
+    }
+
+    /**
+     * @dev Function to mint a new NFT for a user, add token liquidity and store the
+     *      record in the newly minted NFT
+     * @param _token Address of token for which liquidity is to be added
+     * @param _amount Amount of liquidity added
+     */
+    function addTokenLiquidity(address _token, uint256 _amount)
+        external
+        nonReentrant
+        tokenChecks(_token)
+        whenNotPaused
+    {
+        require(_token != NATIVE, ""ERR__WRONG_FUNCTION"");
+        require(
+            IERC20Upgradeable(_token).allowance(_msgSender(), address(this)) >= _amount,
+            ""ERR__INSUFFICIENT_ALLOWANCE""
+        );
+        SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(_token), _msgSender(), address(liquidityPool), _amount);
+        _addLiquidity(_token, _amount);
+    }
+
+    /**
+     * @dev Internal helper function to increase liquidity in a given NFT
+     */
+    function _increaseLiquidity(uint256 _nftId, uint256 _amount) internal onlyValidLpToken(_nftId, _msgSender()) {
+        (address token, uint256 totalSuppliedLiquidity, uint256 totalShares) = lpToken.tokenMetadata(_nftId);
+
+        require(_amount > 0, ""ERR__AMOUNT_IS_0"");
+        whiteListPeriodManager.beforeLiquidityAddition(_msgSender(), token, _amount);
+
+        uint256 mintedSharesAmount;
+        // Adding liquidity in the pool for the first time
+        if (totalReserve[token] == 0) {
+            mintedSharesAmount = BASE_DIVISOR * _amount;
+        } else {
+            mintedSharesAmount = (_amount * totalSharesMinted[token]) / totalReserve[token];
+        }
+
+        require(mintedSharesAmount >= BASE_DIVISOR, ""ERR__AMOUNT_BELOW_MIN_LIQUIDITY"");
+
+        totalLiquidity[token] += _amount;
+        totalReserve[token] += _amount;
+        totalSharesMinted[token] += mintedSharesAmount;
+
+        LpTokenMetadata memory data = LpTokenMetadata(
+            token,
+            totalSuppliedLiquidity + _amount,
+            totalShares + mintedSharesAmount
+        );
+        lpToken.updateTokenMetadata(_nftId, data);
+
+        // Increase the current liquidity
+        _increaseCurrentLiquidity(token, _amount);
+        emit LiquidityAdded(token, _amount, _msgSender());
+    }
+
+    /**
+     * @dev Function to allow LPs to add ERC20 token liquidity to existing NFT
+     * @param _nftId ID of NFT for updating the balances
+     * @param _amount Token amount to be added
+     */
+    function increaseTokenLiquidity(uint256 _nftId, uint256 _amount) external nonReentrant whenNotPaused {
+        (address token, , ) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(token), ""ERR__TOKEN_NOT_SUPPORTED"");
+        require(token != NATIVE, ""ERR__WRONG_FUNCTION"");
+        require(
+            IERC20Upgradeable(token).allowance(_msgSender(), address(this)) >= _amount,
+            ""ERR__INSUFFICIENT_ALLOWANCE""
+        );
+        SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(token), _msgSender(), address(liquidityPool), _amount);
+        _increaseLiquidity(_nftId, _amount);
+    }
+
+    /**
+     * @dev Function to allow LPs to add native token liquidity to existing NFT
+     */
+    function increaseNativeLiquidity(uint256 _nftId) external payable nonReentrant whenNotPaused {
+        (address token, , ) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(NATIVE), ""ERR__TOKEN_NOT_SUPPORTED"");
+        require(token == NATIVE, ""ERR__WRONG_FUNCTION"");
+        (bool success, ) = address(liquidityPool).call{value: msg.value}("""");
+        require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        _increaseLiquidity(_nftId, msg.value);
+    }
+
+    /**
+     * @dev Function to allow LPs to remove their liquidity from an existing NFT
+     *      Also automatically redeems any earned fee
+     */
+    function removeLiquidity(uint256 _nftId, uint256 _amount)
+        external
+        nonReentrant
+        onlyValidLpToken(_nftId, _msgSender())
+        whenNotPaused
+    {
+        (address _tokenAddress, uint256 nftSuppliedLiquidity, uint256 totalNFTShares) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(_tokenAddress), ""ERR__TOKEN_NOT_SUPPORTED"");
+
+        require(_amount != 0, ""ERR__INVALID_AMOUNT"");
+        require(nftSuppliedLiquidity >= _amount, ""ERR__INSUFFICIENT_LIQUIDITY"");
+        whiteListPeriodManager.beforeLiquidityRemoval(_msgSender(), _tokenAddress, _amount);
+        // Claculate how much shares represent input amount
+        uint256 lpSharesForInputAmount = _amount * getTokenPriceInLPShares(_tokenAddress);
+
+        // Calculate rewards accumulated
+        uint256 eligibleLiquidity = sharesToTokenAmount(totalNFTShares, _tokenAddress);
+        
+        uint256 lpFeeAccumulated;
+
+        // Handle edge cases where eligibleLiquidity is less than what was supplied by very small amount 
+        if(nftSuppliedLiquidity > eligibleLiquidity) {
+            lpFeeAccumulated = 0;
+        } else {
+            unchecked {
+                lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+            }
+        }
+        // Calculate amount of lp shares that represent accumulated Fee
+        uint256 lpSharesRepresentingFee = lpFeeAccumulated * getTokenPriceInLPShares(_tokenAddress);
+
+        totalLPFees[_tokenAddress] -= lpFeeAccumulated;
+        uint256 amountToWithdraw = _amount + lpFeeAccumulated;
+        uint256 lpSharesToBurn = lpSharesForInputAmount + lpSharesRepresentingFee;
+
+        // Handle round off errors to avoid dust lp token in contract
+        if (totalNFTShares - lpSharesToBurn < BASE_DIVISOR) {
+            lpSharesToBurn = totalNFTShares;
+        }
+        totalReserve[_tokenAddress] -= amountToWithdraw;
+        totalLiquidity[_tokenAddress] -= _amount;
+        totalSharesMinted[_tokenAddress] -= lpSharesToBurn;
+
+        _decreaseCurrentLiquidity(_tokenAddress, _amount);
+
+        _burnSharesFromNft(_nftId, lpSharesToBurn, _amount, _tokenAddress);
+
+        _transferFromLiquidityPool(_tokenAddress, _msgSender(), amountToWithdraw);
+
+        emit LiquidityRemoved(_tokenAddress, amountToWithdraw, _msgSender());
+    }
+
+    /**
+     * @dev Function to allow LPs to claim the fee earned on their NFT
+     * @param _nftId ID of NFT where liquidity is recorded
+     */
+    function claimFee(uint256 _nftId) external onlyValidLpToken(_nftId, _msgSender()) whenNotPaused nonReentrant {
+        (address _tokenAddress, uint256 nftSuppliedLiquidity, uint256 totalNFTShares) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(_tokenAddress), ""ERR__TOKEN_NOT_SUPPORTED"");
+
+        uint256 lpSharesForSuppliedLiquidity = nftSuppliedLiquidity * getTokenPriceInLPShares(_tokenAddress);
+
+        // Calculate rewards accumulated
+        uint256 eligibleLiquidity = sharesToTokenAmount(totalNFTShares, _tokenAddress);
+        uint256 lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+        require(lpFeeAccumulated > 0, ""ERR__NO_REWARDS_TO_CLAIM"");
+        // Calculate amount of lp shares that represent accumulated Fee
+        uint256 lpSharesRepresentingFee = totalNFTShares - lpSharesForSuppliedLiquidity;
+
+        totalReserve[_tokenAddress] -= lpFeeAccumulated;
+        totalSharesMinted[_tokenAddress] -= lpSharesRepresentingFee;
+        totalLPFees[_tokenAddress] -= lpFeeAccumulated;
+
+        _burnSharesFromNft(_nftId, lpSharesRepresentingFee, 0, _tokenAddress);
+        _transferFromLiquidityPool(_tokenAddress, _msgSender(), lpFeeAccumulated);
+        emit FeeClaimed(_tokenAddress, lpFeeAccumulated, _msgSender(), lpSharesRepresentingFee);
+    }
+
+    /**
+     * @dev Internal Function to burn LP shares and remove liquidity from existing NFT
+     */
+    function _burnSharesFromNft(
+        uint256 _nftId,
+        uint256 _shares,
+        uint256 _tokenAmount,
+        address _tokenAddress
+    ) internal {
+        (, uint256 nftSuppliedLiquidity, uint256 nftShares) = lpToken.tokenMetadata(_nftId);
+        nftShares -= _shares;
+        nftSuppliedLiquidity -= _tokenAmount;
+
+        lpToken.updateTokenMetadata(_nftId, LpTokenMetadata(_tokenAddress, nftSuppliedLiquidity, nftShares));
+    }
+
+    function _transferFromLiquidityPool(
+        address _tokenAddress,
+        address _receiver,
+        uint256 _tokenAmount
+    ) internal {
+        liquidityPool.transfer(_tokenAddress, _receiver, _tokenAmount);
+    }
+
+    function getSuppliedLiquidity(uint256 _nftId) external view returns (uint256) {
+        (, uint256 totalSuppliedLiquidity, ) = lpToken.tokenMetadata(_nftId);
+        return totalSuppliedLiquidity;
+    }
+
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address sender)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    receive() external payable {
+        emit EthReceived(_msgSender(), msg.value);
+    }
+}",4555.0,475.0,"[H-02] LiquidityProviders.sol The share price of the LP can be manipulated and making future liquidityProviders unable to `removeLiquidity()`
+The share price of the liquidity can be manipulated to an extremely low value (1 underlying token worth a huge amount of shares), making it possible for `sharesToTokenAmount(totalNFTShares, _tokenAddress)` to overflow in `removeLiquidity()` and therefore freeze users' funds.
+
+[M-01] Unsupported tokens cannot be withdrawnIn the function `addTokenLiquidity`, supported tokens can be turned off again.Users won't be able to withdraw their liquidity anymore because of this check in the function `removeLiquidity`.
+
+[M-11] LiquidityProviders: Setting new liquidity pool will break contract
+Owners can change the `liquidityPool` variable any time with the `setLiquidityPool` function.If a liquidity pool was already set and users added liquidity with `addTokenLiquidity`, the tokens are directly transferred to the liquidity pool and not kept in the `LiquidityProviders` contract.Changing the `liquidityPool` to a different contract will make it impossible for the users to withdraw their liquidity using `removeLiquidity` because the tokens are still in the old `liquidityPool` and cannot be retrieved.
+
+[M-12] LiquidityProviders: Setting new LP token will break contract
+Owners can change the `lpToken` variable at any time with the `setLpToken` function.If an LP token was already set and users added liquidity with `addTokenLiquidity` and were minted a `lpToken` NFT, changing the `lpToken` to a different contract will make it impossible for the users to withdraw their liquidity using `removeLiquidity`.
+All users will lose their funds.
+
+[M-17] wrong condition checking in price calculation
+The `getTokenPriceInLPShares` function calculates the token price in LP shares, but it checks a wrong condition - if supposed to return `BASE_DIVISOR` if the total reserve is zero, not if the total shares minted is zero. This might leads to a case where the price is calculated incorrectly, or a division by zero is happening.
+
+[M-19] sharesToTokenAmount: Division by zero
+The public `sharesToTokenAmount` function does not check if the denominator `totalSharesMinted[_tokenAddress]` is zero.Neither do the callers of this function. The function will revert.Calling functions like `getFeeAccumulatedOnNft` and `sharesToTokenAmount` from another contract should never revert.
+
+[M-20] Liquidity providers unable to remove liquidity when the pool is in deficit state
+In the function `removeLiquidity`, LP token holders can not redeem their tokens when the pool is in the deficit state, i.e. `currentLiquidity << providedLiquidity`. This is due to that LP shares are computed based on providedLiquidity and the actual available pool balance is based on currentLiquidity.",7.0,"pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+
+import ""../security/Pausable.sol"";
+import ""./interfaces/ILPToken.sol"";
+import ""./interfaces/ITokenManager.sol"";
+import ""./interfaces/IWhiteListPeriodManager.sol"";
+import ""./interfaces/ILiquidityPool.sol"";
+
+contract LiquidityProviders is
+    Initializable,
+    ReentrancyGuardUpgradeable,
+    ERC2771ContextUpgradeable,
+    OwnableUpgradeable,
+    Pausable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    address internal constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 public constant BASE_DIVISOR = 10**18;
+
+    ILPToken internal lpToken;
+    ILiquidityPool internal liquidityPool;
+    ITokenManager internal tokenManager;
+    IWhiteListPeriodManager internal whiteListPeriodManager;
+
+    event LiquidityAdded(address indexed tokenAddress, uint256 indexed amount, address indexed lp);
+    event LiquidityRemoved(address indexed tokenAddress, uint256 indexed amount, address indexed lp);
+    event FeeClaimed(address indexed tokenAddress, uint256 indexed fee, address indexed lp, uint256 sharesBurnt);
+    event FeeAdded(address indexed tokenAddress, uint256 indexed fee);
+    event EthReceived(address indexed sender, uint256 value);
+    event CurrentLiquidityChanged(address indexed token, uint256 indexed oldValue, uint256 indexed newValue);
+
+    
+    mapping(address => uint256) public totalReserve; 
+    mapping(address => uint256) public totalLiquidity; 
+    mapping(address => uint256) public currentLiquidity; 
+    mapping(address => uint256) public totalLPFees;
+    mapping(address => uint256) public totalSharesMinted;
+
+    
+    modifier onlyValidLpToken(uint256 _tokenId, address _transactor) {
+        (address token, , ) = lpToken.tokenMetadata(_tokenId);
+        require(lpToken.exists(_tokenId), ""ERR__TOKEN_DOES_NOT_EXIST"");
+        require(lpToken.ownerOf(_tokenId) == _transactor, ""ERR__TRANSACTOR_DOES_NOT_OWN_NFT"");
+        _;
+    }
+
+    
+    modifier onlyLiquidityPool() {
+        require(_msgSender() == address(liquidityPool), ""ERR__UNAUTHORIZED"");
+        _;
+    }
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(_isSupportedToken(tokenAddress), ""Token not supported"");
+        _;
+    }
+
+    
+    function initialize(
+        address _trustedForwarder,
+        address _lpToken,
+        address _tokenManager,
+        address _pauser
+    ) public initializer {
+        __ERC2771Context_init(_trustedForwarder);
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        __ReentrancyGuard_init();
+        _setLPToken(_lpToken);
+        _setTokenManager(_tokenManager);
+    }
+
+    function _isSupportedToken(address _token) internal view returns (bool) {
+        return tokenManager.getTokensInfo(_token).supportedToken;
+    }
+
+    function getTotalReserveByToken(address tokenAddress) public view returns (uint256) {
+        return totalReserve[tokenAddress];
+    }
+
+    function getSuppliedLiquidityByToken(address tokenAddress) public view returns (uint256) {
+        return totalLiquidity[tokenAddress];
+    }
+
+    function getTotalLPFeeByToken(address tokenAddress) public view returns (uint256) {
+        return totalLPFees[tokenAddress];
+    }
+
+    function getCurrentLiquidity(address tokenAddress) public view returns (uint256) {
+        return currentLiquidity[tokenAddress];
+    }
+
+    
+    function setLpToken(address _lpToken) external onlyOwner {
+        _setLPToken(_lpToken);
+    }
+
+    
+    function _setLPToken(address _lpToken) internal {
+        lpToken = ILPToken(_lpToken);
+    }
+
+    function increaseCurrentLiquidity(address tokenAddress, uint256 amount) public onlyLiquidityPool {
+        _increaseCurrentLiquidity(tokenAddress, amount);
+    }
+
+    function decreaseCurrentLiquidity(address tokenAddress, uint256 amount) public onlyLiquidityPool {
+        _decreaseCurrentLiquidity(tokenAddress, amount);
+    }
+
+    function _increaseCurrentLiquidity(address tokenAddress, uint256 amount) private {
+        currentLiquidity[tokenAddress] += amount;
+        emit CurrentLiquidityChanged(tokenAddress, currentLiquidity[tokenAddress]-amount, currentLiquidity[tokenAddress]);
+    }
+
+    function _decreaseCurrentLiquidity(address tokenAddress, uint256 amount) private {
+        currentLiquidity[tokenAddress] -= amount;
+        emit CurrentLiquidityChanged(tokenAddress, currentLiquidity[tokenAddress]+amount, currentLiquidity[tokenAddress]);
+    }
+
+    
+    function setTokenManager(address _tokenManager) external onlyOwner {
+        _setTokenManager(_tokenManager);
+    }
+
+    
+    function _setTokenManager(address _tokenManager) internal {
+        tokenManager = ITokenManager(_tokenManager);
+    }
+
+    
+    function setWhiteListPeriodManager(address _whiteListPeriodManager) external onlyOwner {
+        whiteListPeriodManager = IWhiteListPeriodManager(_whiteListPeriodManager);
+    }
+
+    
+    function setLiquidityPool(address _liquidityPool) external onlyOwner {
+        liquidityPool = ILiquidityPool(_liquidityPool);
+    }
+
+    
+    function getTokenPriceInLPShares(address _baseToken) public view returns (uint256) {
+        uint256 supply = totalSharesMinted[_baseToken];
+        if (supply > 0) {
+            return totalSharesMinted[_baseToken] / totalReserve[_baseToken];
+        }
+        return BASE_DIVISOR;
+    }
+
+    
+
+    function sharesToTokenAmount(uint256 _shares, address _tokenAddress) public view returns (uint256) {
+        return (_shares * totalReserve[_tokenAddress]) / totalSharesMinted[_tokenAddress];
+    }
+
+    
+    function getFeeAccumulatedOnNft(uint256 _nftId) public view returns (uint256) {
+        require(lpToken.exists(_nftId), ""ERR__INVALID_NFT"");
+
+        (address _tokenAddress, uint256 nftSuppliedLiquidity, uint256 totalNFTShares) = lpToken.tokenMetadata(_nftId);
+
+        if (totalNFTShares == 0) {
+            return 0;
+        }
+        
+        uint256 eligibleLiquidity = sharesToTokenAmount(totalNFTShares, _tokenAddress);
+        uint256 lpFeeAccumulated;
+
+        
+        if(nftSuppliedLiquidity > eligibleLiquidity) {
+            lpFeeAccumulated = 0;
+        } else {
+            unchecked {
+                lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+            }
+        }
+        return lpFeeAccumulated;
+    }
+
+    
+    function addLPFee(address _token, uint256 _amount) external onlyLiquidityPool tokenChecks(_token) whenNotPaused {
+        totalReserve[_token] += _amount;
+        totalLPFees[_token] += _amount;
+        emit FeeAdded(_token, _amount);
+    }
+
+    
+    function _addLiquidity(address _token, uint256 _amount) internal {
+        require(_amount > 0, ""ERR__AMOUNT_IS_0"");
+        uint256 nftId = lpToken.mint(_msgSender());
+        LpTokenMetadata memory data = LpTokenMetadata(_token, 0, 0);
+        lpToken.updateTokenMetadata(nftId, data);
+        _increaseLiquidity(nftId, _amount);
+    }
+
+    
+    function addNativeLiquidity() external payable nonReentrant tokenChecks(NATIVE) whenNotPaused {
+        (bool success, ) = address(liquidityPool).call{value: msg.value}("""");
+        require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        _addLiquidity(NATIVE, msg.value);
+    }
+
+    
+    function addTokenLiquidity(address _token, uint256 _amount)
+        external
+        nonReentrant
+        tokenChecks(_token)
+        whenNotPaused
+    {
+        require(_token != NATIVE, ""ERR__WRONG_FUNCTION"");
+        require(
+            IERC20Upgradeable(_token).allowance(_msgSender(), address(this)) >= _amount,
+            ""ERR__INSUFFICIENT_ALLOWANCE""
+        );
+        SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(_token), _msgSender(), address(liquidityPool), _amount);
+        _addLiquidity(_token, _amount);
+    }
+
+    
+    function _increaseLiquidity(uint256 _nftId, uint256 _amount) internal onlyValidLpToken(_nftId, _msgSender()) {
+        (address token, uint256 totalSuppliedLiquidity, uint256 totalShares) = lpToken.tokenMetadata(_nftId);
+
+        require(_amount > 0, ""ERR__AMOUNT_IS_0"");
+        whiteListPeriodManager.beforeLiquidityAddition(_msgSender(), token, _amount);
+
+        uint256 mintedSharesAmount;
+        
+        if (totalReserve[token] == 0) {
+            mintedSharesAmount = BASE_DIVISOR * _amount;
+        } else {
+            mintedSharesAmount = (_amount * totalSharesMinted[token]) / totalReserve[token];
+        }
+
+        require(mintedSharesAmount >= BASE_DIVISOR, ""ERR__AMOUNT_BELOW_MIN_LIQUIDITY"");
+
+        totalLiquidity[token] += _amount;
+        totalReserve[token] += _amount;
+        totalSharesMinted[token] += mintedSharesAmount;
+
+        LpTokenMetadata memory data = LpTokenMetadata(
+            token,
+            totalSuppliedLiquidity + _amount,
+            totalShares + mintedSharesAmount
+        );
+        lpToken.updateTokenMetadata(_nftId, data);
+
+        
+        _increaseCurrentLiquidity(token, _amount);
+        emit LiquidityAdded(token, _amount, _msgSender());
+    }
+
+    
+    function increaseTokenLiquidity(uint256 _nftId, uint256 _amount) external nonReentrant whenNotPaused {
+        (address token, , ) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(token), ""ERR__TOKEN_NOT_SUPPORTED"");
+        require(token != NATIVE, ""ERR__WRONG_FUNCTION"");
+        require(
+            IERC20Upgradeable(token).allowance(_msgSender(), address(this)) >= _amount,
+            ""ERR__INSUFFICIENT_ALLOWANCE""
+        );
+        SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(token), _msgSender(), address(liquidityPool), _amount);
+        _increaseLiquidity(_nftId, _amount);
+    }
+
+    
+    function increaseNativeLiquidity(uint256 _nftId) external payable nonReentrant whenNotPaused {
+        (address token, , ) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(NATIVE), ""ERR__TOKEN_NOT_SUPPORTED"");
+        require(token == NATIVE, ""ERR__WRONG_FUNCTION"");
+        (bool success, ) = address(liquidityPool).call{value: msg.value}("""");
+        require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        _increaseLiquidity(_nftId, msg.value);
+    }
+
+    
+    function removeLiquidity(uint256 _nftId, uint256 _amount)
+        external
+        nonReentrant
+        onlyValidLpToken(_nftId, _msgSender())
+        whenNotPaused
+    {
+        (address _tokenAddress, uint256 nftSuppliedLiquidity, uint256 totalNFTShares) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(_tokenAddress), ""ERR__TOKEN_NOT_SUPPORTED"");
+
+        require(_amount != 0, ""ERR__INVALID_AMOUNT"");
+        require(nftSuppliedLiquidity >= _amount, ""ERR__INSUFFICIENT_LIQUIDITY"");
+        whiteListPeriodManager.beforeLiquidityRemoval(_msgSender(), _tokenAddress, _amount);
+        
+        uint256 lpSharesForInputAmount = _amount * getTokenPriceInLPShares(_tokenAddress);
+
+        
+        uint256 eligibleLiquidity = sharesToTokenAmount(totalNFTShares, _tokenAddress);
+        
+        uint256 lpFeeAccumulated;
+
+        
+        if(nftSuppliedLiquidity > eligibleLiquidity) {
+            lpFeeAccumulated = 0;
+        } else {
+            unchecked {
+                lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+            }
+        }
+        
+        uint256 lpSharesRepresentingFee = lpFeeAccumulated * getTokenPriceInLPShares(_tokenAddress);
+
+        totalLPFees[_tokenAddress] -= lpFeeAccumulated;
+        uint256 amountToWithdraw = _amount + lpFeeAccumulated;
+        uint256 lpSharesToBurn = lpSharesForInputAmount + lpSharesRepresentingFee;
+
+        
+        if (totalNFTShares - lpSharesToBurn < BASE_DIVISOR) {
+            lpSharesToBurn = totalNFTShares;
+        }
+        totalReserve[_tokenAddress] -= amountToWithdraw;
+        totalLiquidity[_tokenAddress] -= _amount;
+        totalSharesMinted[_tokenAddress] -= lpSharesToBurn;
+
+        _decreaseCurrentLiquidity(_tokenAddress, _amount);
+
+        _burnSharesFromNft(_nftId, lpSharesToBurn, _amount, _tokenAddress);
+
+        _transferFromLiquidityPool(_tokenAddress, _msgSender(), amountToWithdraw);
+
+        emit LiquidityRemoved(_tokenAddress, amountToWithdraw, _msgSender());
+    }
+
+    
+    function claimFee(uint256 _nftId) external onlyValidLpToken(_nftId, _msgSender()) whenNotPaused nonReentrant {
+        (address _tokenAddress, uint256 nftSuppliedLiquidity, uint256 totalNFTShares) = lpToken.tokenMetadata(_nftId);
+        require(_isSupportedToken(_tokenAddress), ""ERR__TOKEN_NOT_SUPPORTED"");
+
+        uint256 lpSharesForSuppliedLiquidity = nftSuppliedLiquidity * getTokenPriceInLPShares(_tokenAddress);
+
+        
+        uint256 eligibleLiquidity = sharesToTokenAmount(totalNFTShares, _tokenAddress);
+        uint256 lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+        require(lpFeeAccumulated > 0, ""ERR__NO_REWARDS_TO_CLAIM"");
+        
+        uint256 lpSharesRepresentingFee = totalNFTShares - lpSharesForSuppliedLiquidity;
+
+        totalReserve[_tokenAddress] -= lpFeeAccumulated;
+        totalSharesMinted[_tokenAddress] -= lpSharesRepresentingFee;
+        totalLPFees[_tokenAddress] -= lpFeeAccumulated;
+
+        _burnSharesFromNft(_nftId, lpSharesRepresentingFee, 0, _tokenAddress);
+        _transferFromLiquidityPool(_tokenAddress, _msgSender(), lpFeeAccumulated);
+        emit FeeClaimed(_tokenAddress, lpFeeAccumulated, _msgSender(), lpSharesRepresentingFee);
+    }
+
+    
+    function _burnSharesFromNft(
+        uint256 _nftId,
+        uint256 _shares,
+        uint256 _tokenAmount,
+        address _tokenAddress
+    ) internal {
+        (, uint256 nftSuppliedLiquidity, uint256 nftShares) = lpToken.tokenMetadata(_nftId);
+        nftShares -= _shares;
+        nftSuppliedLiquidity -= _tokenAmount;
+
+        lpToken.updateTokenMetadata(_nftId, LpTokenMetadata(_tokenAddress, nftSuppliedLiquidity, nftShares));
+    }
+
+    function _transferFromLiquidityPool(
+        address _tokenAddress,
+        address _receiver,
+        uint256 _tokenAmount
+    ) internal {
+        liquidityPool.transfer(_tokenAddress, _receiver, _tokenAmount);
+    }
+
+    function getSuppliedLiquidity(uint256 _nftId) external view returns (uint256) {
+        (, uint256 totalSuppliedLiquidity, ) = lpToken.tokenMetadata(_nftId);
+        return totalSuppliedLiquidity;
+    }
+
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address sender)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    receive() external payable {
+        emit EthReceived(_msgSender(), msg.value);
+    }
+}",3709.0,1,6,"<think>
+Let me go through the contract systematically to identify potential vulnerabilities:
+
+1. Reentrancy issues:
+   - The contract uses ReentrancyGuardUpgradeable which should prevent reentrancy attacks, and critical functions are marked with the `nonReentrant` modifier.
+
+2. Access control issues:
+   - There are proper access controls with `onlyOwner`, `onlyLiquidityPool`, and other modifiers.
+
+3. Integer overflow/underflow:
+   - The contract uses Solidity 0.8.0 which has built-in overflow/underflow protection.
+
+4. Business logic issues:
+   - In `getFeeAccumulatedOnNft` and `claimFee`, there's unchecked subtraction `eligibleLiquidity - nftSuppliedLiquidity`. If `eligibleLiquidity < nftSuppliedLiquidity`, this could revert due to underflow.
+   - In `removeLiquidity`, there's a similar issue with unchecked subtraction.
+
+5. Initialization vulnerabilities:
+   - The contract is upgradeable and uses `initializer` modifier, but there's no check to ensure all dependencies (like liquidityPool) are set before operating.
+
+6. External calls:
+   - There are external calls to the liquidityPool contract which could potentially be dangerous if not implemented correctly.
+
+7. Price calculation issues:
+   - The price calculation in `getTokenPriceInLPShares` could result in division by zero if `totalReserve[_baseToken]` is zero, though there's a check to return BASE_DIVISOR in that case.
+
+8. Missing event emissions:
+   - Some state changing functions don't emit events, which is not a security vulnerability but a best practice issue.
+
+9. State inconsistencies:
+   - If token transfers fail in certain ways, the contract state could be inconsistent.
+
+10. Precision loss:
+    - There are multiple divisions in price calculations which could lead to precision loss.
+
+11. Centralization risks:
+    - The contract has an owner with significant privileges.
+
+12. Possible reentrancy in receive() function:
+    - The receive() function doesn't have a nonReentrant modifier, though it's just emitting an event.
+
+13. Missing zero address checks:
+    - Some functions like `setLpToken`, `setTokenManager`, etc. don't check if the new address is the zero address.
+
+14. Validate requirements:
+    - In `claimFee`, there's no explicit check that ensures `eligibleLiquidity >= nftSuppliedLiquidity` before subtraction. If this isn't true, the function would revert due to Solidity 0.8.0's underflow protection.
+    
+15. Fee accumulation logic inconsistency:
+    - In `removeLiquidity`, the function computes `lpFeeAccumulated` but then sets it to 0 if `nftSuppliedLiquidity > eligibleLiquidity`. This seems like a potential issue in the business logic.
+</think># Vulnerabilities in LiquidityProviders Contract
+
+## 1. Logic Vulnerability in Fee Calculation
+The contract has a vulnerability in the fee calculation logic in both `removeLiquidity()` and `claimFee()`:
+
+solidity
+// In removeLiquidity()
+if(nftSuppliedLiquidity > eligibleLiquidity) {
+    lpFeeAccumulated = 0;
+} else {
+    unchecked {
+        lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+    }
+}
+
+The use of `unchecked` here is dangerous. While Solidity 0.8.0 provides overflow protection, this explicitly bypasses it. If `eligibleLiquidity` is less than `nftSuppliedLiquidity`, the calculation will underflow, potentially leading to incorrect fee amounts.
+
+## 2. Missing Initialization Parameter Validation
+In the `initialize()` function, there's no validation for the address parameters:
+
+solidity
+function initialize(
+    address _trustedForwarder,
+    address _lpToken,
+    address _tokenManager,
+    address _pauser
+) public initializer
+
+Passing zero addresses could lead to broken contract functionality.
+
+## 3. Incomplete Contract Dependencies Setup
+The contract sets most dependencies in the initializer but leaves `liquidityPool` and `whiteListPeriodManager` to be set later. There's no check before operations that these critical dependencies are properly set:
+
+solidity
+function setLiquidityPool(address _liquidityPool) external onlyOwner {
+    liquidityPool = ILiquidityPool(_liquidityPool);
+}
+
+function setWhiteListPeriodManager(address _whiteListPeriodManager) external onlyOwner {
+    whiteListPeriodManager = IWhiteListPeriodManager(_whiteListPeriodManager);
+}
+
+## 4. Division Precision Loss
+Several calculations involve division which can lead to precision loss:
+
+solidity
+mintedSharesAmount = (_amount * totalSharesMinted[token]) / totalReserve[token];
+
+## 5. Missing Zero Address Checks
+Functions like `setLpToken()`, `setTokenManager()`, etc. do not check if the provided address is zero:
+
+solidity
+function setLpToken(address _lpToken) external onlyOwner {
+    _setLPToken(_lpToken);
+}
+
+## 6. Centralization Risk
+The contract has significant privilege concentration with the owner who can:
+- Update core contract dependencies
+- Pause the contract
+- Control token whitelisting through TokenManager
+
+## 7. Unprotected Receive Function
+The `receive()` function doesn't have the `nonReentrant` modifier:
+
+solidity
+receive() external payable {
+    emit EthReceived(_msgSender(), msg.value);
+}
+
+## 8. Division by Zero Risk
+In `getTokenPriceInLPShares()`, if `totalReserve[_baseToken]` is zero but `totalSharesMinted[_baseToken]` is not, it could cause a division by zero:
+
+solidity
+return totalSharesMinted[_baseToken] / totalReserve[_baseToken];
+
+## 9. Transaction Order Dependence
+The LP token price calculation depends on the ratio of shares to reserves, making it potentially vulnerable to front-running and sandwich attacks.
+
+## 10. Inconsistent Fee Handling
+The `claimFee()` function doesn't have the same guards for negative fee calculations as `removeLiquidity()`:
+
+solidity
+uint256 lpFeeAccumulated = eligibleLiquidity - nftSuppliedLiquidity;
+require(lpFeeAccumulated > 0, ""ERR__NO_REWARDS_TO_CLAIM"");
+
+This is a better check but inconsistent with the approach in `removeLiquidity()`.","### **Comparison of Issue Report and Response List**
+
+---
+
+#### **[H-02] LiquidityProviders.sol: Share Price Manipulation**
+
+**Report Description**:  
+The share price of the LP can be manipulated to an extremely low value (1 underlying token worth a huge amount of shares), causing `sharesToTokenAmount(totalNFTShares, _tokenAddress)` to overflow in `removeLiquidity()`. This could freeze users' funds.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address the specific issue of share price manipulation or the potential overflow in `sharesToTokenAmount`. This is a critical vulnerability that is entirely missed.
+
+---
+
+#### **[M-01] Unsupported Tokens Cannot Be Withdrawn**
+
+**Report Description**:  
+In `addTokenLiquidity`, supported tokens can be turned off again. Users won't be able to withdraw their liquidity due to a check in `removeLiquidity`.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of unsupported tokens or the inability to withdraw liquidity. This is a significant oversight.
+
+---
+
+#### **[M-11] LiquidityProviders: Setting New Liquidity Pool Will Break Contract**
+
+**Report Description**:  
+Changing the `liquidityPool` variable via `setLiquidityPool` can make it impossible for users to withdraw their liquidity, as tokens are transferred to the old liquidity pool and cannot be retrieved.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of changing the `liquidityPool` variable and its impact on user withdrawals. This is a critical business logic vulnerability.
+
+---
+
+#### **[M-12] LiquidityProviders: Setting New LP Token Will Break Contract**
+
+**Report Description**:  
+Changing the `lpToken` variable via `setLpToken` can make it impossible for users to withdraw their liquidity, as the LP token NFT is tied to the old contract.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of changing the `lpToken` variable and its impact on user withdrawals. This is a critical business logic vulnerability.
+
+---
+
+#### **[M-17] Wrong Condition Checking in Price Calculation**
+
+**Report Description**:  
+The `getTokenPriceInLPShares` function checks the wrong condition (total shares minted instead of total reserve), potentially leading to incorrect price calculations or division by zero.
+
+**Match in Response List**:  
+**Partially Correct**. The response list mentions a division by zero risk in `getTokenPriceInLPShares` but does not address the incorrect condition check.
+
+**Validation**:  
+**Partially Correct**. The response identifies the division by zero risk but misses the core issue of the wrong condition check.
+
+---
+
+#### **[M-19] sharesToTokenAmount: Division by Zero**
+
+**Report Description**:  
+The `sharesToTokenAmount` function does not check if the denominator `totalSharesMinted[_tokenAddress]` is zero, causing the function to revert.
+
+**Match in Response List**:  
+**Correct**. The response list mentions division by zero risks in price calculations, which aligns with this issue.
+
+**Validation**:  
+**Correct**. The response accurately identifies the division by zero risk, which is a critical vulnerability.
+
+---
+
+#### **[M-20] Liquidity Providers Unable to Remove Liquidity When Pool is in Deficit State**
+
+**Report Description**:  
+In `removeLiquidity`, LP token holders cannot redeem their tokens when the pool is in a deficit state (`currentLiquidity << providedLiquidity`), as LP shares are computed based on `providedLiquidity` while the actual balance is based on `currentLiquidity`.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of liquidity providers being unable to remove liquidity in a deficit state. This is a significant business logic vulnerability.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- **[M-19] sharesToTokenAmount: Division by Zero**
+
+**Partially Correct Matches**:
+- **[M-17] Wrong Condition Checking in Price Calculation**
+
+**Missed Issues from Issue Report**:
+- **[H-02] LiquidityProviders.sol: Share Price Manipulation**
+- **[M-01] Unsupported Tokens Cannot Be Withdrawn**
+- **[M-11] LiquidityProviders: Setting New Liquidity Pool Will Break Contract**
+- **[M-12] LiquidityProviders: Setting New LP Token Will Break Contract**
+- **[M-20] Liquidity Providers Unable to Remove Liquidity When Pool is in Deficit State**
+
+---
+
+### **Conclusion**
+The response list identifies some vulnerabilities, such as division by zero risks and initialization issues, but misses critical business logic vulnerabilities like share price manipulation, unsupported token withdrawals, and liquidity pool/token changes. Additionally, it does not fully address the incorrect condition check in price calculations. Significant gaps remain in the coverage of the issue report.",1,1,5,10,"```
+1. sharesToTokenAmount: Division by Zero
+```","To calculate the **Average Precision (AP)**, we follow these steps:
+
+1. **Identify the ranks of true positives**:
+   - The true positive is `sharesToTokenAmount: Division by Zero`.
+   - This vulnerability appears at **rank 8** in the ranked list of predictions.
+
+2. **Calculate precision at the rank of the true positive**:
+   - Precision at rank \( k \) (\( P@k \)) is calculated as:
+     \[
+     P@k = \frac{\text{Number of true positives up to rank } k}{k}
+     \]
+   - At rank 8, there is **1 true positive**.
+   - So, \( P@8 = \frac{1}{8} = 0.125 \).
+
+3. **Compute the Average Precision (AP)**:
+   - Since there is only **1 true positive**, the AP is simply the precision at its rank.
+   - Thus, \( AP = 0.125 \).
+
+**Output**:
+```
+0.125
+```",0.125,28.494400024414100,6472.0,3.0
+LiquidityFarming.sol,"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/interfaces/IERC721ReceiverUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+
+import ""../security/Pausable.sol"";
+import ""./interfaces/ILPToken.sol"";
+import ""./interfaces/ILiquidityProviders.sol"";
+
+contract HyphenLiquidityFarming is
+    Initializable,
+    ERC2771ContextUpgradeable,
+    OwnableUpgradeable,
+    Pausable,
+    ReentrancyGuardUpgradeable,
+    IERC721ReceiverUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    ILPToken public lpToken;
+    ILiquidityProviders public liquidityProviders;
+
+    struct NFTInfo {
+        address payable staker;
+        uint256 rewardDebt;
+        uint256 unpaidRewards;
+        bool isStaked;
+    }
+
+    struct PoolInfo {
+        uint256 accTokenPerShare;
+        uint256 lastRewardTime;
+    }
+
+    struct RewardsPerSecondEntry {
+        uint256 rewardsPerSecond;
+        uint256 timestamp;
+    }
+
+    /// @notice Mapping to track the rewarder pool.
+    mapping(address => PoolInfo) public poolInfo;
+
+    /// @notice Info of each NFT that is staked.
+    mapping(uint256 => NFTInfo) public nftInfo;
+
+    /// @notice Reward rate per base token
+    //mapping(address => uint256) public rewardPerSecond;
+
+    /// @notice Reward Token
+    mapping(address => address) public rewardTokens;
+
+    /// @notice Staker => NFTs staked
+    mapping(address => uint256[]) public nftIdsStaked;
+
+    /// @notice Token => Total Shares Staked
+    mapping(address => uint256) public totalSharesStaked;
+
+    /// @notice Token => Reward Rate Updation history
+    mapping(address => RewardsPerSecondEntry[]) public rewardRateLog;
+
+    uint256 private constant ACC_TOKEN_PRECISION = 1e12;
+    address internal constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+
+    event LogDeposit(address indexed user, address indexed baseToken, uint256 nftId);
+    event LogWithdraw(address indexed user, address baseToken, uint256 nftId, address indexed to);
+    event LogOnReward(address indexed user, address indexed baseToken, uint256 amount, address indexed to);
+    event LogUpdatePool(address indexed baseToken, uint256 lastRewardTime, uint256 lpSupply, uint256 accToken1PerShare);
+    event LogRewardPerSecond(address indexed baseToken, uint256 rewardPerSecond);
+    event LogRewardPoolInitialized(address _baseToken, address _rewardToken, uint256 _rewardPerSecond);
+    event LogNativeReceived(address indexed sender, uint256 value);
+
+    function initialize(
+        address _trustedForwarder,
+        address _pauser,
+        ILiquidityProviders _liquidityProviders,
+        ILPToken _lpToken
+    ) public initializer {
+        __ERC2771Context_init(_trustedForwarder);
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        __ReentrancyGuard_init();
+        liquidityProviders = _liquidityProviders;
+        lpToken = _lpToken;
+    }
+
+    /// @notice Initialize the rewarder pool.
+    /// @param _baseToken Base token to be used for the rewarder pool.
+    /// @param _rewardToken Reward token to be used for the rewarder pool.
+    /// @param _rewardPerSecond Reward rate per base token.
+    function initalizeRewardPool(
+        address _baseToken,
+        address _rewardToken,
+        uint256 _rewardPerSecond
+    ) external onlyOwner {
+        require(rewardTokens[_baseToken] == address(0), ""ERR__POOL_ALREADY_INITIALIZED"");
+        require(_baseToken != address(0), ""ERR__BASE_TOKEN_IS_ZERO"");
+        require(_rewardToken != address(0), ""ERR_REWARD_TOKEN_IS_ZERO"");
+        rewardTokens[_baseToken] = _rewardToken;
+        rewardRateLog[_baseToken].push(RewardsPerSecondEntry(_rewardPerSecond, block.timestamp));
+        emit LogRewardPoolInitialized(_baseToken, _rewardToken, _rewardPerSecond);
+    }
+
+    function _sendErc20AndGetSentAmount(
+        IERC20Upgradeable _token,
+        uint256 _amount,
+        address _to
+    ) private returns (uint256) {
+        uint256 recepientBalance = _token.balanceOf(_to);
+        _token.safeTransfer(_to, _amount);
+        return _token.balanceOf(_to) - recepientBalance;
+    }
+
+    /// @notice Update the reward state of a nft, and if possible send reward funds to _to.
+    /// @param _nftId NFT ID that is being locked
+    /// @param _to Address to which rewards will be credited.
+    function _sendRewardsForNft(uint256 _nftId, address payable _to) internal {
+        NFTInfo storage nft = nftInfo[_nftId];
+        require(nft.isStaked, ""ERR__NFT_NOT_STAKED"");
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+
+        PoolInfo memory pool = updatePool(baseToken);
+        uint256 pending;
+        uint256 amountSent;
+        if (amount > 0) {
+            pending = ((amount * pool.accTokenPerShare) / ACC_TOKEN_PRECISION) - nft.rewardDebt + nft.unpaidRewards;
+            if (rewardTokens[baseToken] == NATIVE) {
+                uint256 balance = address(this).balance;
+                if (pending > balance) {
+                    unchecked {
+                        nft.unpaidRewards = pending - balance;
+                    }
+                    (bool success, ) = _to.call{value: balance}("""");
+                    require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+                    amountSent = balance;
+                } else {
+                    nft.unpaidRewards = 0;
+                    (bool success, ) = _to.call{value: pending}("""");
+                    require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+                    amountSent = pending;
+                }
+            } else {
+                IERC20Upgradeable rewardToken = IERC20Upgradeable(rewardTokens[baseToken]);
+                uint256 balance = rewardToken.balanceOf(address(this));
+                if (pending > balance) {
+                    unchecked {
+                        nft.unpaidRewards = pending - balance;
+                    }
+                    amountSent = _sendErc20AndGetSentAmount(rewardToken, balance, _to);
+                } else {
+                    nft.unpaidRewards = 0;
+                    amountSent = _sendErc20AndGetSentAmount(rewardToken, pending, _to);
+                }
+            }
+        }
+        nft.rewardDebt = (amount * pool.accTokenPerShare) / ACC_TOKEN_PRECISION;
+        emit LogOnReward(_msgSender(), baseToken, amountSent, _to);
+    }
+
+    /// @notice Sets the sushi per second to be distributed. Can only be called by the owner.
+    /// @param _rewardPerSecond The amount of Sushi to be distributed per second.
+    function setRewardPerSecond(address _baseToken, uint256 _rewardPerSecond) public onlyOwner {
+        rewardRateLog[_baseToken].push(RewardsPerSecondEntry(_rewardPerSecond, block.timestamp));
+        emit LogRewardPerSecond(_baseToken, _rewardPerSecond);
+    }
+
+    /// @notice Allows owner to reclaim/withdraw any tokens (including reward tokens) held by this contract
+    /// @param _token Token to reclaim, use 0x00 for Ethereum
+    /// @param _amount Amount of tokens to reclaim
+    /// @param _to Receiver of the tokens, first of his name, rightful heir to the lost tokens,
+    /// reightful owner of the extra tokens, and ether, protector of mistaken transfers, mother of token reclaimers,
+    /// the Khaleesi of the Great Token Sea, the Unburnt, the Breaker of blockchains.
+    function reclaimTokens(
+        address _token,
+        uint256 _amount,
+        address payable _to
+    ) external nonReentrant onlyOwner {
+        require(_to != address(0), ""ERR__TO_IS_ZERO"");
+        if (_token == NATIVE) {
+            (bool success, ) = payable(_to).call{value: _amount}("""");
+            require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        } else {
+            IERC20Upgradeable(_token).safeTransfer(_to, _amount);
+        }
+    }
+
+    /// @notice Deposit LP tokens
+    /// @param _nftId LP token nftId to deposit.
+    function deposit(uint256 _nftId, address payable _to) external whenNotPaused nonReentrant {
+        address msgSender = _msgSender();
+
+        require(
+            lpToken.isApprovedForAll(msgSender, address(this)) || lpToken.getApproved(_nftId) == address(this),
+            ""ERR__NOT_APPROVED""
+        );
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+
+        require(rewardTokens[baseToken] != address(0), ""ERR__POOL_NOT_INITIALIZED"");
+        require(rewardRateLog[baseToken].length != 0, ""ERR__POOL_NOT_INITIALIZED"");
+
+        NFTInfo storage nft = nftInfo[_nftId];
+        require(!nft.isStaked, ""ERR__NFT_ALREADY_STAKED"");
+
+        lpToken.safeTransferFrom(msgSender, address(this), _nftId);
+
+        PoolInfo memory pool = updatePool(baseToken);
+        nft.isStaked = true;
+        nft.staker = _to;
+        nft.rewardDebt = (amount * pool.accTokenPerShare) / ACC_TOKEN_PRECISION;
+
+        nftIdsStaked[_to].push(_nftId);
+        totalSharesStaked[baseToken] += amount;
+
+        emit LogDeposit(msgSender, baseToken, _nftId);
+    }
+
+    /// @notice Withdraw LP tokens
+    /// @param _nftId LP token nftId to withdraw.
+    /// @param _to The receiver of `amount` withdraw benefit.
+    function withdraw(uint256 _nftId, address payable _to) external whenNotPaused nonReentrant {
+        address msgSender = _msgSender();
+        uint256 nftsStakedLength = nftIdsStaked[msgSender].length;
+        uint256 index;
+        for (index = 0; index < nftsStakedLength; ++index) {
+            if (nftIdsStaked[msgSender][index] == _nftId) {
+                break;
+            }
+        }
+
+        require(index != nftsStakedLength, ""ERR__NFT_NOT_STAKED"");
+        nftIdsStaked[msgSender][index] = nftIdsStaked[msgSender][nftIdsStaked[msgSender].length - 1];
+        nftIdsStaked[msgSender].pop();
+
+        _sendRewardsForNft(_nftId, _to);
+        delete nftInfo[_nftId];
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+        totalSharesStaked[baseToken] -= amount;
+
+        lpToken.safeTransferFrom(address(this), msgSender, _nftId);
+
+        emit LogWithdraw(msgSender, baseToken, _nftId, _to);
+    }
+
+    /// @notice Extract all rewards without withdrawing LP tokens
+    /// @param _nftId LP token nftId for which rewards are to be withdrawn
+    /// @param _to The receiver of withdraw benefit.
+    function extractRewards(uint256 _nftId, address payable _to) external whenNotPaused nonReentrant {
+        require(nftInfo[_nftId].staker == _msgSender(), ""ERR__NOT_OWNER"");
+        _sendRewardsForNft(_nftId, _to);
+    }
+
+    /// @notice Calculates an up to date value of accTokenPerShare
+    /// @notice An updated value of accTokenPerShare is comitted to storage every time a new NFT is deposited, withdrawn or rewards are extracted
+    function getUpdatedAccTokenPerShare(address _baseToken) public view returns (uint256) {
+        uint256 accumulator = 0;
+        uint256 lastUpdatedTime = poolInfo[_baseToken].lastRewardTime;
+        uint256 counter = block.timestamp;
+        uint256 i = rewardRateLog[_baseToken].length - 1;
+        while (true) {
+            if (lastUpdatedTime >= counter) {
+                break;
+            }
+            unchecked {
+                accumulator +=
+                    rewardRateLog[_baseToken][i].rewardsPerSecond *
+                    (counter - max(lastUpdatedTime, rewardRateLog[_baseToken][i].timestamp));
+            }
+            counter = rewardRateLog[_baseToken][i].timestamp;
+            if (i == 0) {
+                break;
+            }
+            --i;
+        }
+
+        // We know that during all the periods that were included in the current iterations,
+        // the value of totalSharesStaked[_baseToken] would not have changed, as we only consider the
+        // updates to the pool that happened after the lastUpdatedTime.
+        accumulator = (accumulator * ACC_TOKEN_PRECISION) / totalSharesStaked[_baseToken];
+        return accumulator + poolInfo[_baseToken].accTokenPerShare;
+    }
+
+    /// @notice View function to see pending Token
+    /// @param _nftId NFT for which pending tokens are to be viewed
+    /// @return pending reward for a given user.
+    function pendingToken(uint256 _nftId) external view returns (uint256) {
+        NFTInfo storage nft = nftInfo[_nftId];
+        if (!nft.isStaked) {
+            return 0;
+        }
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+
+        PoolInfo memory pool = poolInfo[baseToken];
+        uint256 accToken1PerShare = pool.accTokenPerShare;
+        if (block.timestamp > pool.lastRewardTime && totalSharesStaked[baseToken] != 0) {
+            accToken1PerShare = getUpdatedAccTokenPerShare(baseToken);
+        }
+        return ((amount * accToken1PerShare) / ACC_TOKEN_PRECISION) - nft.rewardDebt + nft.unpaidRewards;
+    }
+
+    /// @notice Update reward variables of the given pool.
+    /// @return pool Returns the pool that was updated.
+    function updatePool(address _baseToken) public whenNotPaused returns (PoolInfo memory pool) {
+        pool = poolInfo[_baseToken];
+        if (block.timestamp > pool.lastRewardTime) {
+            if (totalSharesStaked[_baseToken] > 0) {
+                pool.accTokenPerShare = getUpdatedAccTokenPerShare(_baseToken);
+            }
+            pool.lastRewardTime = block.timestamp;
+            poolInfo[_baseToken] = pool;
+            emit LogUpdatePool(_baseToken, pool.lastRewardTime, totalSharesStaked[_baseToken], pool.accTokenPerShare);
+        }
+    }
+
+    /// @notice View function to see the tokens staked by a given user.
+    /// @param _user Address of user.
+    function getNftIdsStaked(address _user) public view returns (uint256[] memory nftIds) {
+        nftIds = nftIdsStaked[_user];
+    }
+
+    function getRewardRatePerSecond(address _baseToken) public view returns (uint256) {
+        return rewardRateLog[_baseToken][rewardRateLog[_baseToken].length - 1].rewardsPerSecond;
+    }
+
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override(IERC721ReceiverUpgradeable) returns (bytes4) {
+        return bytes4(keccak256(""onERC721Received(address,address,uint256,bytes)""));
+    }
+
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address sender)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    receive() external payable {
+        emit LogNativeReceived(_msgSender(), msg.value);
+    }
+
+    function max(uint256 _a, uint256 _b) private pure returns (uint256) {
+        return _a >= _b ? _a : _b;
+    }
+}",3691.0,373.0,"[H-04] Deleting `nft` Info can cause users' `nft.unpaidRewards` to be permanently erased
+When `withdraw()` is called, `_sendRewardsForNft(_nftId, _to)` will be called to send the rewards.In `_sendRewardsForNft()`, when `address(this).balance` is insufficient at the moment, `nft.unpaidRewards = pending - balance` will be recorded and the user can get it back at the next time.
+However, at L244, the whole `nftInfo` is being deleted, so that `nft.unpaidRewards` will also get erased.
+There is no way for the user to get back this `unpaidRewards` anymore
+
+[H-05] Users will lose a majority or even all of the rewards when the amount of total shares is too large, due to precision loss
+“function getUpdatedAccTokenPerShare(address _baseToken) public view returns (uint256) ”,  the accTokenPerShare is calculated based on the total staked shares.
+
+[M-04] Owners have absolute control over protocol
+Owners have full control over the protocol.
+
+[M-06] DoS by gas limit
+In `deposit` function it is possible to push to nftIdsStaked of anyone, an attacker can deposit too many nfts to another user, and when the user will try to withdraw an nft at the end of the list, they will iterate on the list and revert because of gas limit.
+
+[M-10] Call to non-existing contracts returns success
+Low level calls (call, delegate call and static call) return success if the called contract doesn’t exist (not deployed or destructed).
+This makes a user be able to send his funds to non-existing addresses.
+
+[M-14] LiquidityFarming.sol Unbounded for loops can potentially freeze users' funds in edge cases
+In the current implementation of `withdraw()`, it calls `_sendRewardsForNft()` at L243 which calls `updatePool()` at L129 which calls `getUpdatedAccTokenPerShare()` at L319.
+`getUpdatedAccTokenPerShare()` will loop over `rewardRateLog` to calculate an up to date value of accTokenPerShare.",6.0,"pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/interfaces/IERC721ReceiverUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+
+import ""../security/Pausable.sol"";
+import ""./interfaces/ILPToken.sol"";
+import ""./interfaces/ILiquidityProviders.sol"";
+
+contract HyphenLiquidityFarming is
+    Initializable,
+    ERC2771ContextUpgradeable,
+    OwnableUpgradeable,
+    Pausable,
+    ReentrancyGuardUpgradeable,
+    IERC721ReceiverUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    ILPToken public lpToken;
+    ILiquidityProviders public liquidityProviders;
+
+    struct NFTInfo {
+        address payable staker;
+        uint256 rewardDebt;
+        uint256 unpaidRewards;
+        bool isStaked;
+    }
+
+    struct PoolInfo {
+        uint256 accTokenPerShare;
+        uint256 lastRewardTime;
+    }
+
+    struct RewardsPerSecondEntry {
+        uint256 rewardsPerSecond;
+        uint256 timestamp;
+    }
+
+    
+    mapping(address => PoolInfo) public poolInfo;
+
+    
+    mapping(uint256 => NFTInfo) public nftInfo;
+
+    
+    
+
+    
+    mapping(address => address) public rewardTokens;
+
+    
+    mapping(address => uint256[]) public nftIdsStaked;
+
+    
+    mapping(address => uint256) public totalSharesStaked;
+
+    
+    mapping(address => RewardsPerSecondEntry[]) public rewardRateLog;
+
+    uint256 private constant ACC_TOKEN_PRECISION = 1e12;
+    address internal constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+
+    event LogDeposit(address indexed user, address indexed baseToken, uint256 nftId);
+    event LogWithdraw(address indexed user, address baseToken, uint256 nftId, address indexed to);
+    event LogOnReward(address indexed user, address indexed baseToken, uint256 amount, address indexed to);
+    event LogUpdatePool(address indexed baseToken, uint256 lastRewardTime, uint256 lpSupply, uint256 accToken1PerShare);
+    event LogRewardPerSecond(address indexed baseToken, uint256 rewardPerSecond);
+    event LogRewardPoolInitialized(address _baseToken, address _rewardToken, uint256 _rewardPerSecond);
+    event LogNativeReceived(address indexed sender, uint256 value);
+
+    function initialize(
+        address _trustedForwarder,
+        address _pauser,
+        ILiquidityProviders _liquidityProviders,
+        ILPToken _lpToken
+    ) public initializer {
+        __ERC2771Context_init(_trustedForwarder);
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        __ReentrancyGuard_init();
+        liquidityProviders = _liquidityProviders;
+        lpToken = _lpToken;
+    }
+
+    
+    
+    
+    
+    function initalizeRewardPool(
+        address _baseToken,
+        address _rewardToken,
+        uint256 _rewardPerSecond
+    ) external onlyOwner {
+        require(rewardTokens[_baseToken] == address(0), ""ERR__POOL_ALREADY_INITIALIZED"");
+        require(_baseToken != address(0), ""ERR__BASE_TOKEN_IS_ZERO"");
+        require(_rewardToken != address(0), ""ERR_REWARD_TOKEN_IS_ZERO"");
+        rewardTokens[_baseToken] = _rewardToken;
+        rewardRateLog[_baseToken].push(RewardsPerSecondEntry(_rewardPerSecond, block.timestamp));
+        emit LogRewardPoolInitialized(_baseToken, _rewardToken, _rewardPerSecond);
+    }
+
+    function _sendErc20AndGetSentAmount(
+        IERC20Upgradeable _token,
+        uint256 _amount,
+        address _to
+    ) private returns (uint256) {
+        uint256 recepientBalance = _token.balanceOf(_to);
+        _token.safeTransfer(_to, _amount);
+        return _token.balanceOf(_to) - recepientBalance;
+    }
+
+    
+    
+    
+    function _sendRewardsForNft(uint256 _nftId, address payable _to) internal {
+        NFTInfo storage nft = nftInfo[_nftId];
+        require(nft.isStaked, ""ERR__NFT_NOT_STAKED"");
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+
+        PoolInfo memory pool = updatePool(baseToken);
+        uint256 pending;
+        uint256 amountSent;
+        if (amount > 0) {
+            pending = ((amount * pool.accTokenPerShare) / ACC_TOKEN_PRECISION) - nft.rewardDebt + nft.unpaidRewards;
+            if (rewardTokens[baseToken] == NATIVE) {
+                uint256 balance = address(this).balance;
+                if (pending > balance) {
+                    unchecked {
+                        nft.unpaidRewards = pending - balance;
+                    }
+                    (bool success, ) = _to.call{value: balance}("""");
+                    require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+                    amountSent = balance;
+                } else {
+                    nft.unpaidRewards = 0;
+                    (bool success, ) = _to.call{value: pending}("""");
+                    require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+                    amountSent = pending;
+                }
+            } else {
+                IERC20Upgradeable rewardToken = IERC20Upgradeable(rewardTokens[baseToken]);
+                uint256 balance = rewardToken.balanceOf(address(this));
+                if (pending > balance) {
+                    unchecked {
+                        nft.unpaidRewards = pending - balance;
+                    }
+                    amountSent = _sendErc20AndGetSentAmount(rewardToken, balance, _to);
+                } else {
+                    nft.unpaidRewards = 0;
+                    amountSent = _sendErc20AndGetSentAmount(rewardToken, pending, _to);
+                }
+            }
+        }
+        nft.rewardDebt = (amount * pool.accTokenPerShare) / ACC_TOKEN_PRECISION;
+        emit LogOnReward(_msgSender(), baseToken, amountSent, _to);
+    }
+
+    
+    
+    function setRewardPerSecond(address _baseToken, uint256 _rewardPerSecond) public onlyOwner {
+        rewardRateLog[_baseToken].push(RewardsPerSecondEntry(_rewardPerSecond, block.timestamp));
+        emit LogRewardPerSecond(_baseToken, _rewardPerSecond);
+    }
+
+    
+    
+    
+    
+    
+    
+    function reclaimTokens(
+        address _token,
+        uint256 _amount,
+        address payable _to
+    ) external nonReentrant onlyOwner {
+        require(_to != address(0), ""ERR__TO_IS_ZERO"");
+        if (_token == NATIVE) {
+            (bool success, ) = payable(_to).call{value: _amount}("""");
+            require(success, ""ERR__NATIVE_TRANSFER_FAILED"");
+        } else {
+            IERC20Upgradeable(_token).safeTransfer(_to, _amount);
+        }
+    }
+
+    
+    
+    function deposit(uint256 _nftId, address payable _to) external whenNotPaused nonReentrant {
+        address msgSender = _msgSender();
+
+        require(
+            lpToken.isApprovedForAll(msgSender, address(this)) || lpToken.getApproved(_nftId) == address(this),
+            ""ERR__NOT_APPROVED""
+        );
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+
+        require(rewardTokens[baseToken] != address(0), ""ERR__POOL_NOT_INITIALIZED"");
+        require(rewardRateLog[baseToken].length != 0, ""ERR__POOL_NOT_INITIALIZED"");
+
+        NFTInfo storage nft = nftInfo[_nftId];
+        require(!nft.isStaked, ""ERR__NFT_ALREADY_STAKED"");
+
+        lpToken.safeTransferFrom(msgSender, address(this), _nftId);
+
+        PoolInfo memory pool = updatePool(baseToken);
+        nft.isStaked = true;
+        nft.staker = _to;
+        nft.rewardDebt = (amount * pool.accTokenPerShare) / ACC_TOKEN_PRECISION;
+
+        nftIdsStaked[_to].push(_nftId);
+        totalSharesStaked[baseToken] += amount;
+
+        emit LogDeposit(msgSender, baseToken, _nftId);
+    }
+
+    
+    
+    
+    function withdraw(uint256 _nftId, address payable _to) external whenNotPaused nonReentrant {
+        address msgSender = _msgSender();
+        uint256 nftsStakedLength = nftIdsStaked[msgSender].length;
+        uint256 index;
+        for (index = 0; index < nftsStakedLength; ++index) {
+            if (nftIdsStaked[msgSender][index] == _nftId) {
+                break;
+            }
+        }
+
+        require(index != nftsStakedLength, ""ERR__NFT_NOT_STAKED"");
+        nftIdsStaked[msgSender][index] = nftIdsStaked[msgSender][nftIdsStaked[msgSender].length - 1];
+        nftIdsStaked[msgSender].pop();
+
+        _sendRewardsForNft(_nftId, _to);
+        delete nftInfo[_nftId];
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+        totalSharesStaked[baseToken] -= amount;
+
+        lpToken.safeTransferFrom(address(this), msgSender, _nftId);
+
+        emit LogWithdraw(msgSender, baseToken, _nftId, _to);
+    }
+
+    
+    
+    
+    function extractRewards(uint256 _nftId, address payable _to) external whenNotPaused nonReentrant {
+        require(nftInfo[_nftId].staker == _msgSender(), ""ERR__NOT_OWNER"");
+        _sendRewardsForNft(_nftId, _to);
+    }
+
+    
+    
+    function getUpdatedAccTokenPerShare(address _baseToken) public view returns (uint256) {
+        uint256 accumulator = 0;
+        uint256 lastUpdatedTime = poolInfo[_baseToken].lastRewardTime;
+        uint256 counter = block.timestamp;
+        uint256 i = rewardRateLog[_baseToken].length - 1;
+        while (true) {
+            if (lastUpdatedTime >= counter) {
+                break;
+            }
+            unchecked {
+                accumulator +=
+                    rewardRateLog[_baseToken][i].rewardsPerSecond *
+                    (counter - max(lastUpdatedTime, rewardRateLog[_baseToken][i].timestamp));
+            }
+            counter = rewardRateLog[_baseToken][i].timestamp;
+            if (i == 0) {
+                break;
+            }
+            --i;
+        }
+
+        
+        
+        
+        accumulator = (accumulator * ACC_TOKEN_PRECISION) / totalSharesStaked[_baseToken];
+        return accumulator + poolInfo[_baseToken].accTokenPerShare;
+    }
+
+    
+    
+    
+    function pendingToken(uint256 _nftId) external view returns (uint256) {
+        NFTInfo storage nft = nftInfo[_nftId];
+        if (!nft.isStaked) {
+            return 0;
+        }
+
+        (address baseToken, , uint256 amount) = lpToken.tokenMetadata(_nftId);
+        amount /= liquidityProviders.BASE_DIVISOR();
+
+        PoolInfo memory pool = poolInfo[baseToken];
+        uint256 accToken1PerShare = pool.accTokenPerShare;
+        if (block.timestamp > pool.lastRewardTime && totalSharesStaked[baseToken] != 0) {
+            accToken1PerShare = getUpdatedAccTokenPerShare(baseToken);
+        }
+        return ((amount * accToken1PerShare) / ACC_TOKEN_PRECISION) - nft.rewardDebt + nft.unpaidRewards;
+    }
+
+    
+    
+    function updatePool(address _baseToken) public whenNotPaused returns (PoolInfo memory pool) {
+        pool = poolInfo[_baseToken];
+        if (block.timestamp > pool.lastRewardTime) {
+            if (totalSharesStaked[_baseToken] > 0) {
+                pool.accTokenPerShare = getUpdatedAccTokenPerShare(_baseToken);
+            }
+            pool.lastRewardTime = block.timestamp;
+            poolInfo[_baseToken] = pool;
+            emit LogUpdatePool(_baseToken, pool.lastRewardTime, totalSharesStaked[_baseToken], pool.accTokenPerShare);
+        }
+    }
+
+    
+    
+    function getNftIdsStaked(address _user) public view returns (uint256[] memory nftIds) {
+        nftIds = nftIdsStaked[_user];
+    }
+
+    function getRewardRatePerSecond(address _baseToken) public view returns (uint256) {
+        return rewardRateLog[_baseToken][rewardRateLog[_baseToken].length - 1].rewardsPerSecond;
+    }
+
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override(IERC721ReceiverUpgradeable) returns (bytes4) {
+        return bytes4(keccak256(""onERC721Received(address,address,uint256,bytes)""));
+    }
+
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address sender)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+
+    receive() external payable {
+        emit LogNativeReceived(_msgSender(), msg.value);
+    }
+
+    function max(uint256 _a, uint256 _b) private pure returns (uint256) {
+        return _a >= _b ? _a : _b;
+    }
+}",3032.0,2,4,"<think>
+Let's carefully analyze this contract to identify potential vulnerabilities. I'll go through function by function and look for common security issues:
+
+1. Function `initalizeRewardPool`:
+   - Has a typo in the name (should be ""initialize"")
+   - Checks that _baseToken and _rewardToken are not address(0), which is good
+   - Prevents re-initialization of a pool, which is also good
+
+2. Function `deposit`:
+   - Has reentrancy protection with the nonReentrant modifier
+   - Checks if the contract is approved to transfer the NFT, which is good
+   - Properly updates state variables
+
+3. Function `withdraw`:
+   - Has reentrancy protection
+   - The function searches for the NFT in the list of staked NFTs before allowing withdrawal
+   - Uses the ""swap and pop"" pattern to remove the NFT from the nftIdsStaked array
+   - Calls _sendRewardsForNft which can send native tokens
+
+4. Function `_sendRewardsForNft`:
+   - This function attempts to send rewards to users
+   - Uses low-level call to transfer native tokens
+   - Checks for success of the transfer, which is good
+   - However, it does not follow the checks-effects-interactions pattern, as it modifies state after external calls
+
+5. Function `reclaimTokens`:
+   - Allows the owner to withdraw any tokens from the contract
+   - Could potentially be used to drain rewards if not used carefully
+   - Uses low-level call for native token transfers
+
+6. Function `updatePool`:
+   - No obvious vulnerabilities, seems to correctly update the pool info
+
+7. Function `getUpdatedAccTokenPerShare`:
+   - May have an issue if totalSharesStaked[_baseToken] is 0, as it could cause a division by zero (though the function checks for this when used)
+
+Now for overall contract issues:
+
+1. Pausability: The contract is pausable, which means the owner can prevent withdrawals. This is a centralization risk.
+
+2. Missing max function: Actually, this contract does include a max function at the end.
+
+3. There's no check in the `withdraw` function to ensure the caller is the actual staker of the NFT. It only checks that the NFT is in the caller's staked list, but doesn't verify the NFT.staker matches the caller.
+
+4. In `_sendRewardsForNft`, the contract sends rewards before updating state, which could lead to a reentrancy vulnerability.
+
+5. In `setRewardPerSecond`, the owner can change reward rates at any time, potentially affecting user expectations.
+
+Let me list these vulnerabilities:
+</think># Vulnerabilities in HyphenLiquidityFarming Contract
+
+After analyzing the contract, I've identified the following vulnerabilities:
+
+## 1. Reentrancy Risk in _sendRewardsForNft
+The `_sendRewardsForNft` function doesn't follow the checks-effects-interactions pattern. It makes external calls to send tokens before updating state variables, which could potentially lead to reentrancy attacks when sending native tokens.
+
+solidity
+// External call occurs before state is updated
+(bool success, ) = _to.call{value: pending}("""");
+// State updated after external call
+nft.unpaidRewards = 0;
+
+## 2. Lack of Ownership Verification in withdraw
+The `withdraw` function doesn't verify that the caller is the rightful owner (staker) of the NFT. It only checks that the NFT is in the caller's staked list:
+
+solidity
+require(index != nftsStakedLength, ""ERR__NFT_NOT_STAKED"");
+
+It should also verify `nftInfo[_nftId].staker == msgSender` as it does in the `extractRewards` function.
+
+## 3. Division by Zero Possibility
+In `getUpdatedAccTokenPerShare`, if `totalSharesStaked[_baseToken]` is zero, a division by zero error will occur:
+
+solidity
+accumulator = (accumulator * ACC_TOKEN_PRECISION) / totalSharesStaked[_baseToken];
+
+While the contract attempts to check for this elsewhere, a more explicit check here would prevent potential issues.
+
+## 4. Centralization Risks
+- The owner can pause the contract, preventing withdrawals (`whenNotPaused` modifier)
+- The owner can change reward rates at any time via `setRewardPerSecond`
+- The owner can withdraw any tokens from the contract using `reclaimTokens`, including user rewards
+
+## 5. Typo in Function Name
+The function is named `initalizeRewardPool` instead of ""initializeRewardPool"", which is a minor issue but could cause confusion.
+
+## 6. Inconsistent NFT Transfer
+In the `withdraw` function, the contract uses `safeTransferFrom` to transfer the NFT, but it's transferring from itself to the user, which doesn't match the typical usage pattern:
+
+solidity
+lpToken.safeTransferFrom(address(this), msgSender, _nftId);
+
+This would fail if the contract hasn't approved itself for transfers.
+
+## 7. Array Length Limitations
+The contract stores arrays of staked NFT IDs which could grow unbounded, potentially causing gas limitations for users with many staked NFTs.
+
+## 8. Unchecked External Call Result in _sendErc20AndGetSentAmount
+The function doesn't verify that the tokens were actually sent successfully by checking the return value.
+
+## 9. Missing Input Validation
+Some functions lack input validation, such as `setRewardPerSecond` not verifying that `_rewardPerSecond` is reasonable.
+
+These vulnerabilities should be addressed to improve the security of the contract.","### **[H-04] Deleting `nft` Info can cause users' `nft.unpaidRewards` to be permanently erased**
+
+**Report Description**:  
+When `withdraw()` is called, `_sendRewardsForNft(_nftId, _to)` is invoked to send rewards. In `_sendRewardsForNft()`, if `address(this).balance` is insufficient, `nft.unpaidRewards = pending - balance` is recorded, allowing the user to retrieve the rewards later. However, at L244, the entire `nftInfo` is deleted, erasing `nft.unpaidRewards`. This makes it impossible for the user to recover these unpaid rewards.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of deleting `nftInfo` and its impact on `unpaidRewards`. This is a critical oversight, as it directly affects user funds and contract integrity.
+
+---
+
+### **[H-05] Users will lose a majority or even all of the rewards when the amount of total shares is too large, due to precision loss**
+
+**Report Description**:  
+In `getUpdatedAccTokenPerShare(address _baseToken)`, `accTokenPerShare` is calculated based on the total staked shares. If the total shares are too large, precision loss can occur, leading to users losing a significant portion or all of their rewards.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not mention precision loss in `getUpdatedAccTokenPerShare` or its impact on user rewards. This is a significant mathematical vulnerability that needs to be addressed.
+
+---
+
+### **[M-04] Owners have absolute control over protocol**
+
+**Report Description**:  
+Owners have full control over the protocol, including the ability to pause the contract, change reward rates, and withdraw tokens. This centralization poses a risk to users, as the owner can manipulate the protocol at any time.
+
+**Match in Response List**:  
+Matches with the issue titled **""Centralization Risks""**.
+
+**Validation**:  
+**Correct**. The response accurately identifies the centralization risks, including the owner's ability to pause the contract, change reward rates, and withdraw tokens. This aligns with the reported issue.
+
+---
+
+### **[M-06] DoS by gas limit**
+
+**Report Description**:  
+In the `deposit` function, an attacker can push too many NFTs to another user's `nftIdsStaked` array. When the user attempts to withdraw an NFT at the end of the list, the iteration over the array may exceed the gas limit, causing the transaction to revert.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the DoS risk caused by unbounded arrays in `nftIdsStaked`. This is a critical omission, as it directly impacts the usability of the contract.
+
+---
+
+### **[M-10] Call to non-existing contracts returns success**
+
+**Report Description**:  
+Low-level calls (`call`, `delegatecall`, `staticcall`) return success even if the called contract does not exist (e.g., not deployed or destructed). This allows users to send funds to non-existing addresses, resulting in permanent loss of funds.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of low-level calls returning success for non-existing contracts. This is a significant security concern that needs to be highlighted.
+
+---
+
+### **[M-14] LiquidityFarming.sol Unbounded for loops can potentially freeze users' funds in edge cases**
+
+**Report Description**:  
+In `withdraw()`, `_sendRewardsForNft()` is called, which in turn calls `updatePool()` and `getUpdatedAccTokenPerShare()`. `getUpdatedAccTokenPerShare()` loops over `rewardRateLog` to calculate `accTokenPerShare`. If `rewardRateLog` grows too large, the loop may exceed the gas limit, freezing users' funds.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of unbounded loops in `getUpdatedAccTokenPerShare` or their potential to freeze user funds. This is a critical vulnerability that needs to be addressed.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+
+- **[M-04] Owners have absolute control over protocol**
+
+**Partially Correct Matches**:
+
+- *None*
+
+**Missed Issues from Issue Report**:
+
+- **[H-04] Deleting `nft` Info can cause users' `nft.unpaidRewards` to be permanently erased**
+- **[H-05] Users will lose a majority or even all of the rewards when the amount of total shares is too large, due to precision loss**
+- **[M-06] DoS by gas limit**
+- **[M-10] Call to non-existing contracts returns success**
+- **[M-14] LiquidityFarming.sol Unbounded for loops can potentially freeze users' funds in edge cases**
+
+---
+
+The response list fails to address several critical issues, including precision loss, unbounded loops, and the deletion of `nftInfo`. These gaps highlight significant vulnerabilities that need to be resolved to ensure the security and functionality of the contract.",1,0,5,9,"```
+1. Centralization Risks
+```","To calculate the **Average Precision (AP)** for the given query, we follow these steps:
+
+1. **Identify the ranks of true positives in the ranked list of predictions**:
+   - The true positive `""Centralization Risks""` appears at rank **1** in the ranked list of predictions.
+
+2. **Calculate precision at each rank where a true positive appears**:
+   - At rank 1, there is 1 true positive out of 1 prediction: \( P@1 = \frac{1}{1} = 1.0 \).
+
+3. **Average the precision values**:
+   - Since there is only one true positive, the **Average Precision (AP)** is simply the precision at that rank: \( AP = 1.0 \).
+
+**Output**:
+```
+1.0
+```",1,26.677377939224200,5468.0,3.0
+WhitelistPeriodManager.sol,"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""../security/Pausable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+import ""./interfaces/ILiquidityProviders.sol"";
+import ""./interfaces/ITokenManager.sol"";
+import ""./interfaces/ILPToken.sol"";
+
+contract WhitelistPeriodManager is Initializable, OwnableUpgradeable, Pausable, ERC2771ContextUpgradeable {
+    ILiquidityProviders private liquidityProviders;
+    ITokenManager private tokenManager;
+    ILPToken private lpToken;
+    bool public areWhiteListRestrictionsEnabled;
+
+    /* LP Status */
+    // EOA? -> status, stores addresses that we want to ignore, like staking contracts.
+    mapping(address => bool) public isExcludedAddress;
+    // Token -> TVL
+    mapping(address => uint256) private totalLiquidity;
+    // Token -> TVL
+    mapping(address => mapping(address => uint256)) public totalLiquidityByLp;
+
+    /* Caps */
+    // Token Address -> Limit
+    mapping(address => uint256) public perTokenTotalCap;
+    // Token Address -> Limit
+    mapping(address => uint256) public perTokenWalletCap;
+
+    event ExcludedAddressStatusUpdated(address indexed lp, bool indexed status);
+    event TotalCapUpdated(address indexed token, uint256 totalCap);
+    event PerTokenWalletCap(address indexed token, uint256 perCommunityWalletCap);
+    event WhiteListStatusUpdated(bool status);
+
+    modifier onlyLiquidityPool() {
+        require(_msgSender() == address(liquidityProviders), ""ERR__UNAUTHORIZED"");
+        _;
+    }
+
+    modifier onlyLpNft() {
+        require(_msgSender() == address(lpToken), ""ERR__UNAUTHORIZED"");
+        _;
+    }
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(_isSupportedToken(tokenAddress), ""Token not supported"");
+        _;
+    }
+
+    /**
+     * @dev initalizes the contract, acts as constructor
+     * @param _trustedForwarder address of trusted forwarder
+     */
+    function initialize(
+        address _trustedForwarder,
+        address _liquidityProviders,
+        address _tokenManager,
+        address _lpToken,
+        address _pauser
+    ) public initializer {
+        __ERC2771Context_init(_trustedForwarder);
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        areWhiteListRestrictionsEnabled = true;
+        _setLiquidityProviders(_liquidityProviders);
+        _setTokenManager(_tokenManager);
+        _setLpToken(_lpToken);
+    }
+
+    function _isSupportedToken(address _token) internal view returns (bool) {
+        return tokenManager.getTokensInfo(_token).supportedToken;
+    }
+
+    /**
+     * @dev Internal Function which checks for various caps before allowing LP to add liqudity
+     */
+    function _beforeLiquidityAddition(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) internal {
+        if (isExcludedAddress[_lp]) {
+            return;
+        }
+        // Per Token Total Cap or PTTC
+        require(ifEnabled(totalLiquidity[_token] + _amount <= perTokenTotalCap[_token]), ""ERR__LIQUIDITY_EXCEEDS_PTTC"");
+        require(
+            ifEnabled(totalLiquidityByLp[_token][_lp] + _amount <= perTokenWalletCap[_token]),
+            ""ERR__LIQUIDITY_EXCEEDS_PTWC""
+        );
+        totalLiquidity[_token] += _amount;
+        totalLiquidityByLp[_token][_lp] += _amount;
+    }
+
+    /**
+     * @dev External Function which checks for various caps before allowing LP to add liqudity. Only callable by LiquidityPoolManager
+     */
+    function beforeLiquidityAddition(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) external onlyLiquidityPool whenNotPaused {
+        _beforeLiquidityAddition(_lp, _token, _amount);
+    }
+
+    /**
+     * @dev Internal Function which checks for various caps before allowing LP to remove liqudity
+     */
+    function _beforeLiquidityRemoval(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) internal {
+        if (isExcludedAddress[_lp]) {
+            return;
+        }
+        totalLiquidityByLp[_token][_lp] -= _amount;
+        totalLiquidity[_token] -= _amount;
+    }
+
+    /**
+     * @dev External Function which checks for various caps before allowing LP to remove liqudity. Only callable by LiquidityPoolManager
+     */
+    function beforeLiquidityRemoval(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) external onlyLiquidityPool whenNotPaused {
+        _beforeLiquidityRemoval(_lp, _token, _amount);
+    }
+
+    /**
+     * @dev External Function which checks for various caps before allowing LP to transfer their LpNFT. Only callable by LpNFT contract
+     */
+    function beforeLiquidityTransfer(
+        address _from,
+        address _to,
+        address _token,
+        uint256 _amount
+    ) external onlyLpNft whenNotPaused {
+        // Release limit from  _from
+        _beforeLiquidityRemoval(_from, _token, _amount);
+
+        // Block limit of _to
+        _beforeLiquidityAddition(_to, _token, _amount);
+    }
+
+    function _setTokenManager(address _tokenManager) internal {
+        tokenManager = ITokenManager(_tokenManager);
+    }
+
+    function setTokenManager(address _tokenManager) external onlyOwner {
+        _setTokenManager(_tokenManager);
+    }
+
+    function _setLiquidityProviders(address _liquidityProviders) internal {
+        liquidityProviders = ILiquidityProviders(_liquidityProviders);
+    }
+
+    function setLiquidityProviders(address _liquidityProviders) external onlyOwner {
+        _setLiquidityProviders(_liquidityProviders);
+    }
+
+    function _setLpToken(address _lpToken) internal {
+        lpToken = ILPToken(_lpToken);
+    }
+
+    function setLpToken(address _lpToken) external onlyOwner {
+        _setLpToken(_lpToken);
+    }
+
+    function setIsExcludedAddressStatus(address[] memory _addresses, bool[] memory _status) external onlyOwner {
+        require(_addresses.length == _status.length, ""ERR__LENGTH_MISMATCH"");
+        for (uint256 i = 0; i < _addresses.length; ++i) {
+            isExcludedAddress[_addresses[i]] = _status[i];
+            emit ExcludedAddressStatusUpdated(_addresses[i], _status[i]);
+        }
+    }
+
+    function setTotalCap(address _token, uint256 _totalCap) public tokenChecks(_token) onlyOwner {
+        require(totalLiquidity[_token] <= _totalCap, ""ERR__TOTAL_CAP_LESS_THAN_SL"");
+        require(_totalCap >= perTokenWalletCap[_token], ""ERR__TOTAL_CAP_LT_PTWC"");
+        if (perTokenTotalCap[_token] != _totalCap) {
+            perTokenTotalCap[_token] = _totalCap;
+            emit TotalCapUpdated(_token, _totalCap);
+        }
+    }
+
+    /**
+     * @dev Special care must be taken when calling this function
+     *      There are no checks for _perTokenWalletCap (since it's onlyOwner), but it's essential that it
+     *      should be >= max lp provided by an lp.
+     *      Checking this on chain will probably require implementing a bbst, which needs more bandwidth
+     *      Call the view function getMaxCommunityLpPositon() separately before changing this value
+     */
+    function setPerTokenWalletCap(address _token, uint256 _perTokenWalletCap) public tokenChecks(_token) onlyOwner {
+        require(_perTokenWalletCap <= perTokenTotalCap[_token], ""ERR__PWC_GT_PTTC"");
+        if (perTokenWalletCap[_token] != _perTokenWalletCap) {
+            perTokenWalletCap[_token] = _perTokenWalletCap;
+            emit PerTokenWalletCap(_token, _perTokenWalletCap);
+        }
+    }
+
+    function setCap(
+        address _token,
+        uint256 _totalCap,
+        uint256 _perTokenWalletCap
+    ) public onlyOwner {
+        setTotalCap(_token, _totalCap);
+        setPerTokenWalletCap(_token, _perTokenWalletCap);
+    }
+
+    function setCaps(
+        address[] memory _tokens,
+        uint256[] memory _totalCaps,
+        uint256[] memory _perTokenWalletCaps
+    ) external onlyOwner {
+        require(
+            _tokens.length == _totalCaps.length && _totalCaps.length == _perTokenWalletCaps.length,
+            ""ERR__LENGTH_MISMACH""
+        );
+        for (uint256 i = 0; i < _tokens.length; ++i) {
+            setCap(_tokens[i], _totalCaps[i], _perTokenWalletCaps[i]);
+        }
+    }
+
+    /**
+     * @dev Enables (or disables) reverts if liquidity exceeds caps.
+     *      Even if this is disabled, the contract will continue to track LP's positions
+     */
+    function setAreWhiteListRestrictionsEnabled(bool _status) external onlyOwner {
+        areWhiteListRestrictionsEnabled = _status;
+        emit WhiteListStatusUpdated(_status);
+    }
+
+    /**
+     * @dev Returns the maximum amount a single community LP has provided
+     */
+    function getMaxCommunityLpPositon(address _token) external view returns (uint256) {
+        uint256 totalSupply = lpToken.totalSupply();
+        uint256 maxLp = 0;
+        for (uint256 i = 1; i <= totalSupply; ++i) {
+            uint256 liquidity = totalLiquidityByLp[_token][lpToken.ownerOf(i)];
+            if (liquidity > maxLp) {
+                maxLp = liquidity;
+            }
+        }
+        return maxLp;
+    }
+
+    /**
+     * @dev returns the value of if (areWhiteListEnabled) then (_cond)
+     */
+    function ifEnabled(bool _cond) private view returns (bool) {
+        return !areWhiteListRestrictionsEnabled || (areWhiteListRestrictionsEnabled && _cond);
+    }
+
+    /**
+     * @dev Meta-Transaction Helper, returns msgSender
+     */
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    /**
+     * @dev Meta-Transaction Helper, returns msgData
+     */
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+}",2422.0,291.0,"[M-05] Frontrunning of setPerTokenWalletCap edge case
+The `setPerTokenWalletCap()` function in WhitelistPeriodManager.sol contains a comment stating:
+Special care must be taken when calling this function
+There are no checks for `_perTokenWalletCap (since it's onlyOwner)`, but it's essential that it should be >= max lp provided by an lp.
+Checking this on chain will probably require implementing a bbst, which needs more bandwidth
+Call the view function `getMaxCommunityLpPositon()` separately before changing this value
+
+[M-15] WhitelistPeriodManager: Improper state handling of exclusion removals
+The `totalLiquidity` and `totalLiquidityByLp` mappings are not updated when an address is removed from the `isExcludedAddress` mapping. While this affects the enforcement of the cap limits and the `getMaxCommunityLpPositon()` function, the worst impact this has is that the address cannot have liquidity removed / transferred due to subtraction overflow.
+In particular, users can be prevented from withdrawing their staked LP tokens from the liquidity farming contract should it become non-excluded.
+
+[M-16] WhitelistPeriodManager: Improper state handling of exclusion additions
+The `totalLiquidity` and `totalLiquidityByLp` mappings are not updated when an address is added to the `isExcludedAddress` mapping. This affects the enforcement of the cap limits and the `getMaxCommunityLpPositon()` function, which implicitly assumes that whitelisted addresses will have 0 liquidity, for addresses with non-zero liquidity at the time of addition to the whitelist.",3.0,"pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""../security/Pausable.sol"";
+import ""./metatx/ERC2771ContextUpgradeable.sol"";
+import ""./interfaces/ILiquidityProviders.sol"";
+import ""./interfaces/ITokenManager.sol"";
+import ""./interfaces/ILPToken.sol"";
+
+contract WhitelistPeriodManager is Initializable, OwnableUpgradeable, Pausable, ERC2771ContextUpgradeable {
+    ILiquidityProviders private liquidityProviders;
+    ITokenManager private tokenManager;
+    ILPToken private lpToken;
+    bool public areWhiteListRestrictionsEnabled;
+
+    
+    
+    mapping(address => bool) public isExcludedAddress;
+    
+    mapping(address => uint256) private totalLiquidity;
+    
+    mapping(address => mapping(address => uint256)) public totalLiquidityByLp;
+
+    
+    
+    mapping(address => uint256) public perTokenTotalCap;
+    
+    mapping(address => uint256) public perTokenWalletCap;
+
+    event ExcludedAddressStatusUpdated(address indexed lp, bool indexed status);
+    event TotalCapUpdated(address indexed token, uint256 totalCap);
+    event PerTokenWalletCap(address indexed token, uint256 perCommunityWalletCap);
+    event WhiteListStatusUpdated(bool status);
+
+    modifier onlyLiquidityPool() {
+        require(_msgSender() == address(liquidityProviders), ""ERR__UNAUTHORIZED"");
+        _;
+    }
+
+    modifier onlyLpNft() {
+        require(_msgSender() == address(lpToken), ""ERR__UNAUTHORIZED"");
+        _;
+    }
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(_isSupportedToken(tokenAddress), ""Token not supported"");
+        _;
+    }
+
+    
+    function initialize(
+        address _trustedForwarder,
+        address _liquidityProviders,
+        address _tokenManager,
+        address _lpToken,
+        address _pauser
+    ) public initializer {
+        __ERC2771Context_init(_trustedForwarder);
+        __Ownable_init();
+        __Pausable_init(_pauser);
+        areWhiteListRestrictionsEnabled = true;
+        _setLiquidityProviders(_liquidityProviders);
+        _setTokenManager(_tokenManager);
+        _setLpToken(_lpToken);
+    }
+
+    function _isSupportedToken(address _token) internal view returns (bool) {
+        return tokenManager.getTokensInfo(_token).supportedToken;
+    }
+
+    
+    function _beforeLiquidityAddition(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) internal {
+        if (isExcludedAddress[_lp]) {
+            return;
+        }
+        
+        require(ifEnabled(totalLiquidity[_token] + _amount <= perTokenTotalCap[_token]), ""ERR__LIQUIDITY_EXCEEDS_PTTC"");
+        require(
+            ifEnabled(totalLiquidityByLp[_token][_lp] + _amount <= perTokenWalletCap[_token]),
+            ""ERR__LIQUIDITY_EXCEEDS_PTWC""
+        );
+        totalLiquidity[_token] += _amount;
+        totalLiquidityByLp[_token][_lp] += _amount;
+    }
+
+    
+    function beforeLiquidityAddition(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) external onlyLiquidityPool whenNotPaused {
+        _beforeLiquidityAddition(_lp, _token, _amount);
+    }
+
+    
+    function _beforeLiquidityRemoval(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) internal {
+        if (isExcludedAddress[_lp]) {
+            return;
+        }
+        totalLiquidityByLp[_token][_lp] -= _amount;
+        totalLiquidity[_token] -= _amount;
+    }
+
+    
+    function beforeLiquidityRemoval(
+        address _lp,
+        address _token,
+        uint256 _amount
+    ) external onlyLiquidityPool whenNotPaused {
+        _beforeLiquidityRemoval(_lp, _token, _amount);
+    }
+
+    
+    function beforeLiquidityTransfer(
+        address _from,
+        address _to,
+        address _token,
+        uint256 _amount
+    ) external onlyLpNft whenNotPaused {
+        
+        _beforeLiquidityRemoval(_from, _token, _amount);
+
+        
+        _beforeLiquidityAddition(_to, _token, _amount);
+    }
+
+    function _setTokenManager(address _tokenManager) internal {
+        tokenManager = ITokenManager(_tokenManager);
+    }
+
+    function setTokenManager(address _tokenManager) external onlyOwner {
+        _setTokenManager(_tokenManager);
+    }
+
+    function _setLiquidityProviders(address _liquidityProviders) internal {
+        liquidityProviders = ILiquidityProviders(_liquidityProviders);
+    }
+
+    function setLiquidityProviders(address _liquidityProviders) external onlyOwner {
+        _setLiquidityProviders(_liquidityProviders);
+    }
+
+    function _setLpToken(address _lpToken) internal {
+        lpToken = ILPToken(_lpToken);
+    }
+
+    function setLpToken(address _lpToken) external onlyOwner {
+        _setLpToken(_lpToken);
+    }
+
+    function setIsExcludedAddressStatus(address[] memory _addresses, bool[] memory _status) external onlyOwner {
+        require(_addresses.length == _status.length, ""ERR__LENGTH_MISMATCH"");
+        for (uint256 i = 0; i < _addresses.length; ++i) {
+            isExcludedAddress[_addresses[i]] = _status[i];
+            emit ExcludedAddressStatusUpdated(_addresses[i], _status[i]);
+        }
+    }
+
+    function setTotalCap(address _token, uint256 _totalCap) public tokenChecks(_token) onlyOwner {
+        require(totalLiquidity[_token] <= _totalCap, ""ERR__TOTAL_CAP_LESS_THAN_SL"");
+        require(_totalCap >= perTokenWalletCap[_token], ""ERR__TOTAL_CAP_LT_PTWC"");
+        if (perTokenTotalCap[_token] != _totalCap) {
+            perTokenTotalCap[_token] = _totalCap;
+            emit TotalCapUpdated(_token, _totalCap);
+        }
+    }
+
+    
+    function setPerTokenWalletCap(address _token, uint256 _perTokenWalletCap) public tokenChecks(_token) onlyOwner {
+        require(_perTokenWalletCap <= perTokenTotalCap[_token], ""ERR__PWC_GT_PTTC"");
+        if (perTokenWalletCap[_token] != _perTokenWalletCap) {
+            perTokenWalletCap[_token] = _perTokenWalletCap;
+            emit PerTokenWalletCap(_token, _perTokenWalletCap);
+        }
+    }
+
+    function setCap(
+        address _token,
+        uint256 _totalCap,
+        uint256 _perTokenWalletCap
+    ) public onlyOwner {
+        setTotalCap(_token, _totalCap);
+        setPerTokenWalletCap(_token, _perTokenWalletCap);
+    }
+
+    function setCaps(
+        address[] memory _tokens,
+        uint256[] memory _totalCaps,
+        uint256[] memory _perTokenWalletCaps
+    ) external onlyOwner {
+        require(
+            _tokens.length == _totalCaps.length && _totalCaps.length == _perTokenWalletCaps.length,
+            ""ERR__LENGTH_MISMACH""
+        );
+        for (uint256 i = 0; i < _tokens.length; ++i) {
+            setCap(_tokens[i], _totalCaps[i], _perTokenWalletCaps[i]);
+        }
+    }
+
+    
+    function setAreWhiteListRestrictionsEnabled(bool _status) external onlyOwner {
+        areWhiteListRestrictionsEnabled = _status;
+        emit WhiteListStatusUpdated(_status);
+    }
+
+    
+    function getMaxCommunityLpPositon(address _token) external view returns (uint256) {
+        uint256 totalSupply = lpToken.totalSupply();
+        uint256 maxLp = 0;
+        for (uint256 i = 1; i <= totalSupply; ++i) {
+            uint256 liquidity = totalLiquidityByLp[_token][lpToken.ownerOf(i)];
+            if (liquidity > maxLp) {
+                maxLp = liquidity;
+            }
+        }
+        return maxLp;
+    }
+
+    
+    function ifEnabled(bool _cond) private view returns (bool) {
+        return !areWhiteListRestrictionsEnabled || (areWhiteListRestrictionsEnabled && _cond);
+    }
+
+    
+    function _msgSender()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (address)
+    {
+        return ERC2771ContextUpgradeable._msgSender();
+    }
+
+    
+    function _msgData()
+        internal
+        view
+        virtual
+        override(ContextUpgradeable, ERC2771ContextUpgradeable)
+        returns (bytes calldata)
+    {
+        return ERC2771ContextUpgradeable._msgData();
+    }
+}",1958.0,0,3,"<think>
+Let's analyze the contract for vulnerabilities:
+
+1. Reentrancy: The contract uses ReentrancyGuardUpgradeable by import but doesn't actually use it in any function. However, it doesn't make external calls that could lead to reentrancy, so this isn't a major concern.
+
+2. Underflow/Overflow: The contract uses Solidity 0.8.0 which has built-in overflow/underflow checks. However, let's check the subtraction operations:
+   - In `_beforeLiquidityRemoval`, it does:
+     ```solidity
+     totalLiquidityByLp[_token][_lp] -= _amount;
+     totalLiquidity[_token] -= _amount;
+     If the amount to be removed is greater than the available liquidity, this will revert, which is the expected behavior.
+
+3. Initialization: The contract is upgradeable and uses initializer pattern correctly.
+
+4. Access Control: The contract has proper modifiers for authorization checks.
+
+5. There's a potential issue in the `ifEnabled` function:
+   ```solidity
+   function ifEnabled(bool _cond) private view returns (bool) {
+       return !areWhiteListRestrictionsEnabled || (areWhiteListRestrictionsEnabled && _cond);
+   }
+   This function seems to be used to check if restrictions should be applied. If `areWhiteListRestrictionsEnabled` is false, it returns true regardless of the condition. If it's true, it checks the condition. The usage seems correct, but the logic could be simplified to:
+   ```solidity
+   return !areWhiteListRestrictionsEnabled || _cond;
+
+6. The `getMaxCommunityLpPositon` function iterates through all tokens to find the maximum, which can be gas-intensive if there are many tokens.
+
+7. The `setIsExcludedAddressStatus` function allows the owner to exclude addresses from restrictions, which could be misused.
+
+8. Dependencies on external contracts: The contract depends on several external contracts (tokenManager, liquidityProviders, lpToken) but doesn't handle the case where these contracts might misbehave.
+
+9. No contract existence check when setting addresses: When setting the addresses for tokenManager, liquidityProviders, and lpToken, there's no check to ensure the addresses correspond to valid, expected contracts.
+
+10. The `setCaps` function has a typo in the error message: `ERR__LENGTH_MISMACH` should be `ERR__LENGTH_MISMATCH`.
+
+11. Security for `isExcludedAddress`: If an address is excluded, it can provide unlimited liquidity, potentially leading to a situation where a small number of addresses control a large portion of the liquidity.
+
+12. The `getMaxCommunityLpPositon` function has a spelling error (it should be ""Position"" not ""Positon"") and is inefficient as it iterates through all tokenIds to find the maximum liquidity.
+</think># Vulnerabilities in the WhitelistPeriodManager Contract
+
+## 1. Inefficient Implementation in `getMaxCommunityLpPositon` Function
+The `getMaxCommunityLpPositon` function (misspelled, should be ""Position"") iterates through all token IDs sequentially, which could lead to excessive gas consumption or even transaction failures if the total supply is large. This is an O(n) operation that could be prohibitively expensive as the system grows.
+
+## 2. Lack of Zero Amount Checks 
+The contract does not check if the liquidity amount being added or removed is zero, which could lead to unnecessary state changes and event emissions for zero-value operations.
+
+## 3. Improper Validation in `_beforeLiquidityAddition` and `_beforeLiquidityRemoval`
+These functions operate even when the contract is paused (when called internally), potentially allowing manipulation of state during emergency situations.
+
+## 4. No Check for Contract Existence
+When setting contract addresses (tokenManager, liquidityProviders, lpToken), there's no verification that the addresses actually contain the expected contract code.
+
+## 5. Centralization Risk
+The contract gives significant power to the owner who can:
+- Exclude addresses from restrictions
+- Modify caps at any time
+- Enable/disable whitelist restrictions
+- Change core contract references
+
+## 6. Typo in Error Message
+The `setCaps` function has a typo in the error message: ""ERR__LENGTH_MISMACH"" should be ""ERR__LENGTH_MISMATCH"".
+
+## 7. No Time-bound Restrictions
+There's no mechanism to gradually phase out restrictions or implement time-bound whitelist periods, despite the contract name suggesting this functionality.
+
+## 8. Function Naming Inconsistency 
+The naming convention is inconsistent - some functions have camelCase while parameters use snake_case with underscores.
+
+## 9. Potential Front-running Vulnerabilities
+Cap changes could be front-run, allowing attackers to add liquidity before restrictions are tightened or remove liquidity before caps are lowered.
+
+## 10. Missing Input Validation
+Some functions like `beforeLiquidityAddition` and `beforeLiquidityRemoval` don't validate that `_amount` is greater than zero.
+
+## 11. Redundant Import
+The contract imports both `PausableUpgradeable` and a custom `Pausable`, but only uses the custom implementation, creating confusion.
+
+## 12. No ReentrancyGuard Implementation
+Despite importing `ReentrancyGuardUpgradeable`, the contract doesn't actually implement it in any functions that could potentially need it.
+
+These vulnerabilities range from potential gas inefficiencies to centralization risks that could affect the contract's operation and security.","### **Output Analysis**
+
+---
+
+#### **[M-05] Frontrunning of setPerTokenWalletCap edge case**
+
+**Report Description**:  
+The `setPerTokenWalletCap()` function in `WhitelistPeriodManager.sol` lacks checks to ensure that `_perTokenWalletCap` is greater than or equal to the maximum LP provided by an LP. This could lead to frontrunning vulnerabilities where an attacker could exploit the edge case by adding liquidity before the cap is updated. The report suggests calling the view function `getMaxCommunityLpPositon()` separately before changing this value to mitigate the risk.
+
+**Match in Response List**:  
+**No match found**. The response list does not address the specific frontrunning vulnerability related to `setPerTokenWalletCap()`.
+
+**Validation**:  
+**Incorrect**. The response list does not identify or address the frontrunning vulnerability described in the issue. This is a missed issue.
+
+---
+
+#### **[M-15] WhitelistPeriodManager: Improper state handling of exclusion removals**
+
+**Report Description**:  
+When an address is removed from the `isExcludedAddress` mapping, the `totalLiquidity` and `totalLiquidityByLp` mappings are not updated. This can lead to subtraction overflow issues, particularly when users attempt to withdraw their staked LP tokens from the liquidity farming contract. The worst-case impact is that users may be unable to withdraw their tokens if the address becomes non-excluded.
+
+**Match in Response List**:  
+Partially matches with **""Security for `isExcludedAddress`""** in the response list, which mentions that excluded addresses can provide unlimited liquidity but does not address the specific issue of improper state handling during exclusion removals.
+
+**Validation**:  
+**Partially Correct**. The response identifies the general risk associated with `isExcludedAddress` but fails to address the specific issue of improper state handling during exclusion removals, which is the core of the vulnerability.
+
+---
+
+#### **[M-16] WhitelistPeriodManager: Improper state handling of exclusion additions**
+
+**Report Description**:  
+When an address is added to the `isExcludedAddress` mapping, the `totalLiquidity` and `totalLiquidityByLp` mappings are not updated. This affects the enforcement of cap limits and the `getMaxCommunityLpPositon()` function, which assumes that whitelisted addresses will have zero liquidity. This can lead to incorrect calculations for addresses with non-zero liquidity at the time of addition to the whitelist.
+
+**Match in Response List**:  
+Partially matches with **""Security for `isExcludedAddress`""** in the response list, which mentions that excluded addresses can provide unlimited liquidity but does not address the specific issue of improper state handling during exclusion additions.
+
+**Validation**:  
+**Partially Correct**. The response identifies the general risk associated with `isExcludedAddress` but fails to address the specific issue of improper state handling during exclusion additions, which is the core of the vulnerability.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[M-15] WhitelistPeriodManager: Improper state handling of exclusion removals**  
+- **[M-16] WhitelistPeriodManager: Improper state handling of exclusion additions**
+
+**Missed Issues from Issue Report**:  
+- **[M-05] Frontrunning of setPerTokenWalletCap edge case**
+
+---
+
+### **Conclusion**  
+The response list partially addresses some issues related to `isExcludedAddress` but misses the specific vulnerabilities described in the issue report, particularly the frontrunning vulnerability in `setPerTokenWalletCap()` and the improper state handling during exclusion additions and removals. The response list could be improved by addressing these specific vulnerabilities in detail.",0,2,1,12,"```
+None.
+```","To calculate the **Average Precision (AP)** for the given query, we follow these steps:
+
+1. **Identify the ranks at which the true positives appear in the ranked list of predictions**:
+   - The true positives list is empty (`None`), meaning there are no true positives in the ranked predictions.
+
+2. **Calculate the precision at each rank where a true positive appears**:
+   - Since there are no true positives, there are no ranks to calculate precision for.
+
+3. **Average the precision values**:
+   - Since there are no true positives, the **Average Precision (AP)** is **0**.
+
+Thus, the **Average Precision (AP)** for the query is:
+
+**0**",0,24.08899998664860,4020.0,3.0
+TokenManager.sol,"// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+import ""@openzeppelin/contracts/security/Pausable.sol"";
+import ""../metatx/ERC2771Context.sol"";
+import ""../interfaces/ITokenManager.sol"";
+
+contract TokenManager is ITokenManager, ERC2771Context, Ownable, Pausable {
+    mapping(address => TokenInfo) public tokensInfo;
+
+    event FeeChanged(address indexed tokenAddress, uint256 indexed equilibriumFee, uint256 indexed maxFee);
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(tokensInfo[tokenAddress].supportedToken, ""Token not supported"");
+
+        _;
+    }
+
+    /**
+     * First key is toChainId and second key is token address being deposited on current chain
+     */
+    mapping(uint256 => mapping(address => TokenConfig)) public depositConfig;
+
+    /**
+     * Store min/max amount of token to transfer based on token address
+     */
+    mapping(address => TokenConfig) public transferConfig;
+
+    constructor(address trustedForwarder) ERC2771Context(trustedForwarder) {
+        // Empty Constructor
+    }
+
+    function getEquilibriumFee(address tokenAddress) public view override returns (uint256) {
+        return tokensInfo[tokenAddress].equilibriumFee;
+    }
+
+    function getMaxFee(address tokenAddress) public view override returns (uint256) {
+        return tokensInfo[tokenAddress].maxFee;
+    }
+
+    function changeFee(
+        address tokenAddress,
+        uint256 _equilibriumFee,
+        uint256 _maxFee
+    ) external override onlyOwner whenNotPaused {
+        require(_equilibriumFee != 0, ""Equilibrium Fee cannot be 0"");
+        require(_maxFee != 0, ""Max Fee cannot be 0"");
+        tokensInfo[tokenAddress].equilibriumFee = _equilibriumFee;
+        tokensInfo[tokenAddress].maxFee = _maxFee;
+        emit FeeChanged(tokenAddress, tokensInfo[tokenAddress].equilibriumFee, tokensInfo[tokenAddress].maxFee);
+    }
+
+    function setTokenTransferOverhead(address tokenAddress, uint256 gasOverhead)
+        external
+        tokenChecks(tokenAddress)
+        onlyOwner
+    {
+        tokensInfo[tokenAddress].transferOverhead = gasOverhead;
+    }
+
+    /**
+     * Set DepositConfig for the given combination of toChainId, tokenAddress.
+     * This is used while depositing token in Liquidity Pool. Based on the destination chainid
+     * min and max deposit amount is checked.
+     */
+    function setDepositConfig(
+        uint256[] memory toChainId,
+        address[] memory tokenAddresses,
+        TokenConfig[] memory tokenConfig
+    ) external onlyOwner {
+        require(
+            (toChainId.length == tokenAddresses.length) && (tokenAddresses.length == tokenConfig.length),
+            "" ERR_ARRAY_LENGTH_MISMATCH""
+        );
+        for (uint256 index = 0; index < tokenConfig.length; ++index) {
+            depositConfig[toChainId[index]][tokenAddresses[index]].min = tokenConfig[index].min;
+            depositConfig[toChainId[index]][tokenAddresses[index]].max = tokenConfig[index].max;
+        }
+    }
+
+    function addSupportedToken(
+        address tokenAddress,
+        uint256 minCapLimit,
+        uint256 maxCapLimit,
+        uint256 equilibriumFee,
+        uint256 maxFee
+    ) external onlyOwner {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(maxCapLimit > minCapLimit, ""maxCapLimit > minCapLimit"");
+        tokensInfo[tokenAddress].supportedToken = true;
+        transferConfig[tokenAddress].min = minCapLimit;
+        transferConfig[tokenAddress].max = maxCapLimit;
+        tokensInfo[tokenAddress].tokenConfig = transferConfig[tokenAddress];
+        tokensInfo[tokenAddress].equilibriumFee = equilibriumFee;
+        tokensInfo[tokenAddress].maxFee = maxFee;
+    }
+
+    function removeSupportedToken(address tokenAddress) external tokenChecks(tokenAddress) onlyOwner {
+        tokensInfo[tokenAddress].supportedToken = false;
+    }
+
+    function updateTokenCap(
+        address tokenAddress,
+        uint256 minCapLimit,
+        uint256 maxCapLimit
+    ) external tokenChecks(tokenAddress) onlyOwner {
+        require(maxCapLimit > minCapLimit, ""maxCapLimit > minCapLimit"");
+        transferConfig[tokenAddress].min = minCapLimit;
+        transferConfig[tokenAddress].max = maxCapLimit;
+    }
+
+    function getTokensInfo(address tokenAddress) public view override returns (TokenInfo memory) {
+        TokenInfo memory tokenInfo = TokenInfo(
+            tokensInfo[tokenAddress].transferOverhead,
+            tokensInfo[tokenAddress].supportedToken,
+            tokensInfo[tokenAddress].equilibriumFee,
+            tokensInfo[tokenAddress].maxFee,
+            transferConfig[tokenAddress]
+        );
+        return tokenInfo;
+    }
+
+    function getDepositConfig(uint256 toChainId, address tokenAddress)
+        public
+        view
+        override
+        returns (TokenConfig memory)
+    {
+        return depositConfig[toChainId][tokenAddress];
+    }
+
+    function getTransferConfig(address tokenAddress) public view override returns (TokenConfig memory) {
+        return transferConfig[tokenAddress];
+    }
+
+    function _msgSender() internal view virtual override(Context, ERC2771Context) returns (address sender) {
+        return ERC2771Context._msgSender();
+    }
+
+    function _msgData() internal view virtual override(Context, ERC2771Context) returns (bytes calldata) {
+        return ERC2771Context._msgData();
+    }
+}",1169.0,146.0,"***[M-09] Improper Upper Bound Definition on the Fee***
+The `equilibriumFee` and `maxFee` does not have any upper or lower bounds. Values that are too large will lead to reversions in several critical functions or the LP user will lost all funds when paying the fee.",1.0,"pragma solidity 0.8.0;
+
+import ""@openzeppelin/contracts/access/Ownable.sol"";
+import ""@openzeppelin/contracts/security/Pausable.sol"";
+import ""../metatx/ERC2771Context.sol"";
+import ""../interfaces/ITokenManager.sol"";
+
+contract TokenManager is ITokenManager, ERC2771Context, Ownable, Pausable {
+    mapping(address => TokenInfo) public tokensInfo;
+
+    event FeeChanged(address indexed tokenAddress, uint256 indexed equilibriumFee, uint256 indexed maxFee);
+
+    modifier tokenChecks(address tokenAddress) {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(tokensInfo[tokenAddress].supportedToken, ""Token not supported"");
+
+        _;
+    }
+
+    
+    mapping(uint256 => mapping(address => TokenConfig)) public depositConfig;
+
+    
+    mapping(address => TokenConfig) public transferConfig;
+
+    constructor(address trustedForwarder) ERC2771Context(trustedForwarder) {
+        
+    }
+
+    function getEquilibriumFee(address tokenAddress) public view override returns (uint256) {
+        return tokensInfo[tokenAddress].equilibriumFee;
+    }
+
+    function getMaxFee(address tokenAddress) public view override returns (uint256) {
+        return tokensInfo[tokenAddress].maxFee;
+    }
+
+    function changeFee(
+        address tokenAddress,
+        uint256 _equilibriumFee,
+        uint256 _maxFee
+    ) external override onlyOwner whenNotPaused {
+        require(_equilibriumFee != 0, ""Equilibrium Fee cannot be 0"");
+        require(_maxFee != 0, ""Max Fee cannot be 0"");
+        tokensInfo[tokenAddress].equilibriumFee = _equilibriumFee;
+        tokensInfo[tokenAddress].maxFee = _maxFee;
+        emit FeeChanged(tokenAddress, tokensInfo[tokenAddress].equilibriumFee, tokensInfo[tokenAddress].maxFee);
+    }
+
+    function setTokenTransferOverhead(address tokenAddress, uint256 gasOverhead)
+        external
+        tokenChecks(tokenAddress)
+        onlyOwner
+    {
+        tokensInfo[tokenAddress].transferOverhead = gasOverhead;
+    }
+
+    
+    function setDepositConfig(
+        uint256[] memory toChainId,
+        address[] memory tokenAddresses,
+        TokenConfig[] memory tokenConfig
+    ) external onlyOwner {
+        require(
+            (toChainId.length == tokenAddresses.length) && (tokenAddresses.length == tokenConfig.length),
+            "" ERR_ARRAY_LENGTH_MISMATCH""
+        );
+        for (uint256 index = 0; index < tokenConfig.length; ++index) {
+            depositConfig[toChainId[index]][tokenAddresses[index]].min = tokenConfig[index].min;
+            depositConfig[toChainId[index]][tokenAddresses[index]].max = tokenConfig[index].max;
+        }
+    }
+
+    function addSupportedToken(
+        address tokenAddress,
+        uint256 minCapLimit,
+        uint256 maxCapLimit,
+        uint256 equilibriumFee,
+        uint256 maxFee
+    ) external onlyOwner {
+        require(tokenAddress != address(0), ""Token address cannot be 0"");
+        require(maxCapLimit > minCapLimit, ""maxCapLimit > minCapLimit"");
+        tokensInfo[tokenAddress].supportedToken = true;
+        transferConfig[tokenAddress].min = minCapLimit;
+        transferConfig[tokenAddress].max = maxCapLimit;
+        tokensInfo[tokenAddress].tokenConfig = transferConfig[tokenAddress];
+        tokensInfo[tokenAddress].equilibriumFee = equilibriumFee;
+        tokensInfo[tokenAddress].maxFee = maxFee;
+    }
+
+    function removeSupportedToken(address tokenAddress) external tokenChecks(tokenAddress) onlyOwner {
+        tokensInfo[tokenAddress].supportedToken = false;
+    }
+
+    function updateTokenCap(
+        address tokenAddress,
+        uint256 minCapLimit,
+        uint256 maxCapLimit
+    ) external tokenChecks(tokenAddress) onlyOwner {
+        require(maxCapLimit > minCapLimit, ""maxCapLimit > minCapLimit"");
+        transferConfig[tokenAddress].min = minCapLimit;
+        transferConfig[tokenAddress].max = maxCapLimit;
+    }
+
+    function getTokensInfo(address tokenAddress) public view override returns (TokenInfo memory) {
+        TokenInfo memory tokenInfo = TokenInfo(
+            tokensInfo[tokenAddress].transferOverhead,
+            tokensInfo[tokenAddress].supportedToken,
+            tokensInfo[tokenAddress].equilibriumFee,
+            tokensInfo[tokenAddress].maxFee,
+            transferConfig[tokenAddress]
+        );
+        return tokenInfo;
+    }
+
+    function getDepositConfig(uint256 toChainId, address tokenAddress)
+        public
+        view
+        override
+        returns (TokenConfig memory)
+    {
+        return depositConfig[toChainId][tokenAddress];
+    }
+
+    function getTransferConfig(address tokenAddress) public view override returns (TokenConfig memory) {
+        return transferConfig[tokenAddress];
+    }
+
+    function _msgSender() internal view virtual override(Context, ERC2771Context) returns (address sender) {
+        return ERC2771Context._msgSender();
+    }
+
+    function _msgData() internal view virtual override(Context, ERC2771Context) returns (bytes calldata) {
+        return ERC2771Context._msgData();
+    }
+}",1066.0,0,1,"<think>
+Let's analyze this contract for potential vulnerabilities:
+
+1. Checking the Solidity version: It's using Solidity 0.8.0, which has built-in overflow and underflow protection, so that's good.
+
+2. State variables:
+   - `tokensInfo`: A mapping of token addresses to TokenInfo structs
+   - `depositConfig`: A nested mapping for token deposit configuration by chain ID and token address
+   - `transferConfig`: A mapping of token addresses to TokenConfig structs
+
+3. Function analysis:
+   - The contract inherits from Ownable, meaning only the owner can call functions with the `onlyOwner` modifier
+   - It inherits from Pausable, so functions with `whenNotPaused` can be paused by the owner
+   - The `tokenChecks` modifier ensures token addresses are valid and supported
+
+Let's look for potential issues:
+
+- Missing initialization: While not immediately obvious, the constructor doesn't initialize any state values.
+- Lack of input validation: In some places, there's validation, but missing in others.
+- Logic issues: Check for consistency in business logic.
+- Access control: Ensure only authorized users can perform sensitive operations.
+</think># Vulnerabilities in TokenManager Contract
+
+After analyzing the contract, I've identified the following vulnerabilities:
+
+## 1. Missing Zero Address Checks
+
+While some functions have zero address checks for `tokenAddress`, the `setDepositConfig` function doesn't validate that the token addresses in the array aren't zero addresses.
+
+## 2. Inconsistent State Updates
+
+In `updateTokenCap()` the function updates `transferConfig` but doesn't update `tokensInfo[tokenAddress].tokenConfig`, which was set in `addSupportedToken()`. This creates inconsistent state where `transferConfig[tokenAddress]` and `tokensInfo[tokenAddress].tokenConfig` can have different values.
+
+## 3. Uninitialized Storage Values
+
+The `TokenInfo` struct returned in `getTokensInfo()` uses `transferConfig[tokenAddress]` instead of `tokensInfo[tokenAddress].tokenConfig`, which could return incorrect data if they're out of sync.
+
+## 4. Missing Fee Validation
+
+In `changeFee()`, there's no validation that `_maxFee` >= `_equilibriumFee`, which could lead to logic errors in fee calculations.
+
+## 5. Missing Validation in `setDepositConfig()`
+
+No checks that minimum limits are less than maximum limits or that token addresses are supported tokens.
+
+## 6. No Events for Critical Operations
+
+Several important functions lack event emissions:
+- `addSupportedToken()`
+- `removeSupportedToken()`
+- `updateTokenCap()`
+- `setDepositConfig()`
+- `setTokenTransferOverhead()`
+
+## 7. Potential for Denial of Service (DoS)
+
+The `setDepositConfig()` function could run out of gas if the input arrays are too large, as it uses an unbounded loop.
+
+## 8. Lack of Pause/Unpause Functionality
+
+The contract inherits from Pausable but doesn't expose functions to actually pause/unpause the contract.
+
+## 9. Unbounded Token Registration
+
+No limit on how many tokens can be registered, potentially allowing the contract to grow very large.
+
+## 10. Missing Access Control for Pause/Unpause
+
+If pause/unpause functions are intended to be implemented, they should have appropriate access controls.
+
+These vulnerabilities could impact the security, consistency, and overall functionality of the contract, especially when managing tokens across different chains.","---
+
+**[M-09] Improper Upper Bound Definition on the Fee**
+
+**Report Description**:
+The `equilibriumFee` and `maxFee` do not have any upper or lower bounds. Values that are too large will lead to reversions in several critical functions or cause LP users to lose all funds when paying the fee. This lack of validation can result in unintended behavior, financial losses, and potential contract failures.
+
+**Match in Response List**:
+Matches with the issue titled **""Missing Fee Validation""** in the response list.
+
+**Validation**:
+**Partially Correct**. The response identifies the issue of missing fee validation in the `changeFee()` function, which aligns with the reported problem of improper upper bound definition on the fee. However, the response does not explicitly address the risk of reversions in critical functions or the potential loss of funds for LP users, which are key aspects of the reported issue. While the response correctly highlights the lack of validation, it misses critical details about the broader impact and risks associated with the vulnerability.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- **[M-09] Improper Upper Bound Definition on the Fee**
+
+**Missed Issues from Issue Report**:
+- *None*
+
+---",0,1,0,10,"```
+None.
+```",0.0,0,15.905869960784900,2263.0,3.0
+,,,,,,,,5,16,,,2,5,14,51,,,1.125,,,
