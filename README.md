@@ -1,4 +1,4 @@
-# SmartAuditFlow - Smart Contract Audit Platform 
+# SmartAuditFlow - Smart Contract Auditing Platform 
 
 <p>
 <img align="right" width="220"  src="./media/front_view.png"> 
@@ -18,6 +18,20 @@ Key innovations include:
 * **Integration with static analyzers** and **Retrieval-Augmented Generation (RAG)** for contextual enrichment.
 
 Experimental results show that SmartAuditFlow achieves **100% accuracy** on common vulnerability benchmarks and identifies **13 additional CVEs** missed by other methods, demonstrating superior adaptability and utility.
+
+<div align="center">
+  <img src="./media/plan_and_execute.png" alt="LLM-SmartAudit System" height="250">
+</div>
+
+
+## 📑 Quick Links
+| Resource | Description | Link |
+|----------|-------------|------|
+| 📊 Dataset | Explore our benchmark dataset | [View Dataset](https://github.com/JimmyLin-afk/SmartAuditFlow/tree/main/evaluation/contracts) |
+| 📈 Evaluation Results | See our tool's performance metrics | [View Results](https://github.com/JimmyLin-afk/SmartAuditFlow/tree/main/evaluation/results) |
+| 🛠️ Prompt Optimization | execute code for optimial prompt generate | [View Code](https://github.com/JimmyLin-afk/SmartAuditFlow/tree/main/promptOptimization) |
+| 📚 Documentation | Comprehensive guide | [Read Docs](https://github.com/JimmyLin-afk/SmartAuditFlow/wiki) |
+| 🐛 Issue Tracker | Report bugs or request features | [Issues](https://github.com/JimmyLin-afk/SmartAuditFlow/issues) |
 
 ===========================================
 ## Getting Started
