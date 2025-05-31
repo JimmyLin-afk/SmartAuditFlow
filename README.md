@@ -1,7 +1,7 @@
 # SmartAuditFlow - Smart Contract Audit Platform 
 
 <p>
-<img align="right" width="180"  src="./media/front_view.png"> 
+<img align="right" width="220"  src="./media/front_view.png"> 
 </p>
 
 **SmartAuditFlow** is a dynamic and adaptive framework for automated smart contract auditing, leveraging Large Language Models (LLMs) and workflow-driven strategies to deliver reliable, precise, and scalable security analysis.
