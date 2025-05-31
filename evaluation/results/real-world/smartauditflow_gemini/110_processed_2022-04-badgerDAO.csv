@@ -1,0 +1,4141 @@
+nameid,code,tokens,loc,issue,vulnumber,Unnamed: 6,code_snippet,processtokens,high_severity_count,medium_severity_count,audit_plan,initial_analysis,Findings,execution_time,total_tokens,total_steps,Comparison,matchList,MAP
+StakedCitadel.sol,"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.12;
+
+import {IERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import {AddressUpgradeable} from ""openzeppelin-contracts-upgradeable/utils/AddressUpgradeable.sol"";
+import {SafeERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import {ERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol"";
+import {PausableUpgradeable} from ""openzeppelin-contracts-upgradeable/security/PausableUpgradeable.sol"";
+import {ReentrancyGuardUpgradeable} from ""openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""./lib/SettAccessControl.sol"";
+
+import {IVault} from ""./interfaces/badger/IVault.sol"";
+import {IVesting} from ""./interfaces/citadel/IVesting.sol"";
+import {IStrategy} from ""./interfaces/badger/IStrategy.sol"";
+import {IERC20} from ""./interfaces/erc20/IERC20.sol"";
+import {IBadgerGuestlist} from ""./interfaces/badger/IBadgerGuestlist.sol"";
+
+/*
+    Source: https://github.com/iearn-finance/yearn-protocol/blob/develop/contracts/vaults/yVault.sol
+    
+    Changelog:
+
+    V1.1
+    * Strategist no longer has special function calling permissions
+    * Version function added to contract
+    * All write functions, with the exception of transfer, are pausable
+    * Keeper or governance can pause
+    * Only governance can unpause
+
+    V1.2
+    * Transfer functions are now pausable along with all other non-permissioned write functions
+    * All permissioned write functions, with the exception of pause() & unpause(), are pausable as well
+
+    V1.3
+    * Add guest list functionality
+    * All deposits can be optionally gated by external guestList approval logic on set guestList contract
+
+    V1.4
+    * Add depositFor() to deposit on the half of other users. That user will then be blockLocked.
+
+    V1.5
+    * Removed Controller
+        - Removed harvest from vault (only on strategy)
+    * Params added to track autocompounded rewards (lifeTimeEarned, lastHarvestedAt, lastHarvestAmount, assetsAtLastHarvest)
+      this would work in sync with autoCompoundRatio to help us track harvests better.
+    * Fees
+        - Strategy would report the autocompounded harvest amount to the vault
+        - Calculation performanceFeeGovernance, performanceFeeStrategist, withdrawalFee, managementFee moved to the vault.
+        - Vault mints shares for performanceFees and managementFee to the respective recipient (treasury, strategist)
+        - withdrawal fees is transferred to the rewards address set
+    * Permission:
+        - Strategist can now set performance, withdrawal and management fees
+        - Governance will determine maxPerformanceFee, maxWithdrawalFee, maxManagementFee that can be set to prevent rug of funds.
+    * Strategy would take the actors from the vault it is connected to
+    * All governance related fees goes to treasury
+*/
+
+contract StakedCitadel is
+    ERC20Upgradeable,
+    SettAccessControl,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+    using AddressUpgradeable for address;
+
+    uint256 constant ONE_ETH = 1e18;
+
+    /// ===== Storage Variables ====
+
+    IERC20Upgradeable public token; // Token used for deposits
+    IBadgerGuestlist public guestList; // guestlist when vault is in experiment/ guarded state
+
+    bool public pausedDeposit; // false by default Allows to only block deposits, use pause for the normal pause state
+
+    address public strategy; // address of the strategy connected to the vault
+    address public guardian; // guardian of vault and strategy
+    address public treasury; // set by governance ... any fees go there
+
+    address public badgerTree; // Address we send tokens too via reportAdditionalTokens
+    address public vesting; // Address of the vesting contract where after withdrawal we send CTDL to vest for 21 days
+
+    /// @dev name and symbol prefixes for lpcomponent token of vault
+    string internal constant _defaultNamePrefix = ""Staked "";
+    string internal constant _symbolSymbolPrefix = ""x"";
+
+    /// Params to track autocompounded rewards
+    uint256 public lifeTimeEarned; // keeps track of total earnings
+    uint256 public lastHarvestedAt; // timestamp of the last harvest
+    uint256 public lastHarvestAmount; // amount harvested during last harvest
+    uint256 public assetsAtLastHarvest; // assets for which the harvest took place.
+
+    mapping(address => uint256) public additionalTokensEarned;
+    mapping(address => uint256) public lastAdditionalTokenAmount;
+
+    /// Fees ///
+    /// @notice all fees will be in bps
+    uint256 public performanceFeeGovernance; // Perf fee sent to `treasury`
+    uint256 public performanceFeeStrategist; // Perf fee sent to `strategist`
+    uint256 public withdrawalFee; // fee issued to `treasury` on withdrawal
+    uint256 public managementFee; // fee issued to `treasury` on report (typically on harvest, but only if strat is autocompounding)
+
+    uint256 public maxPerformanceFee; // maximum allowed performance fees
+    uint256 public maxWithdrawalFee; // maximum allowed withdrawal fees
+    uint256 public maxManagementFee; // maximum allowed management fees
+
+    uint256 public toEarnBps; // NOTE: in BPS, minimum amount of token to deposit into strategy when earn is called
+
+    /// ===== Constants ====
+
+    uint256 public constant MAX_BPS = 10_000;
+    uint256 public constant SECS_PER_YEAR = 31_556_952; // 365.2425 days
+
+    uint256 public constant WITHDRAWAL_FEE_HARD_CAP = 200; // Never higher than 2%
+    uint256 public constant PERFORMANCE_FEE_HARD_CAP = 3_000; // Never higher than 30% // 30% maximum performance fee // We usually do 20, so this is insanely high already
+    uint256 public constant MANAGEMENT_FEE_HARD_CAP = 200; // Never higher than 2%
+
+    /// ===== Events ====
+
+    // Emitted when a token is sent to the badgerTree for emissions
+    event TreeDistribution(
+        address indexed token,
+        uint256 amount,
+        uint256 indexed blockNumber,
+        uint256 timestamp
+    );
+
+    // Emitted during a report, when there has been an increase in pricePerFullShare (ppfs)
+    event Harvested(
+        address indexed token,
+        uint256 amount,
+        uint256 indexed blockNumber,
+        uint256 timestamp
+    );
+
+    event SetTreasury(address indexed newTreasury);
+    event SetStrategy(address indexed newStrategy);
+    event SetToEarnBps(uint256 newEarnToBps);
+    event SetMaxWithdrawalFee(uint256 newMaxWithdrawalFee);
+    event SetMaxPerformanceFee(uint256 newMaxPerformanceFee);
+    event SetMaxManagementFee(uint256 newMaxManagementFee);
+    event SetGuardian(address indexed newGuardian);
+    event SetVesting(address indexed newVesting);
+    event SetGuestList(address indexed newGuestList);
+    event SetWithdrawalFee(uint256 newWithdrawalFee);
+    event SetPerformanceFeeStrategist(uint256 newPerformanceFeeStrategist);
+    event SetPerformanceFeeGovernance(uint256 newPerformanceFeeGovernance);
+    event SetManagementFee(uint256 newManagementFee);
+
+    event PauseDeposits(address indexed pausedBy);
+    event UnpauseDeposits(address indexed pausedBy);
+
+    /// @notice Initializes the Sett. Can only be called once, ideally when the contract is deployed.
+    /// @param _token Address of the token that can be deposited into the sett.
+    /// @param _governance Address authorized as governance.
+    /// @param _keeper Address authorized as keeper.
+    /// @param _guardian Address authorized as guardian.
+    /// @param _treasury Address to distribute governance fees/rewards to.
+    /// @param _strategist Address authorized as strategist.
+    /// @param _badgerTree Address of badgerTree used for emissions.
+    /// @param _name Specify a custom sett name. Leave empty for default value.
+    /// @param _symbol Specify a custom sett symbol. Leave empty for default value.
+    /// @param _feeConfig Values for the 4 different types of fees charges by the sett
+    ///         [performanceFeeGovernance, performanceFeeStrategist, withdrawToVault, managementFee]
+    ///         Each fee should be less than the constant hard-caps defined above.
+    function initialize(
+        address _token,
+        address _governance,
+        address _keeper,
+        address _guardian,
+        address _treasury,
+        address _strategist,
+        address _badgerTree,
+        address _vesting,
+        string memory _name,
+        string memory _symbol,
+        uint256[4] memory _feeConfig
+    ) public initializer whenNotPaused {
+        require(_token != address(0)); // dev: _token address should not be zero
+        require(_governance != address(0)); // dev: _governance address should not be zero
+        require(_keeper != address(0)); // dev: _keeper address should not be zero
+        require(_guardian != address(0)); // dev: _guardian address should not be zero
+        require(_treasury != address(0)); // dev: _treasury address should not be zero
+        require(_strategist != address(0)); // dev: _strategist address should not be zero
+        require(_badgerTree != address(0)); // dev: _badgerTree address should not be zero
+        require(_vesting != address(0)); // dev: _vesting address should not be zero
+
+        // Check for fees being reasonable (see below for interpretation)
+        require(
+            _feeConfig[0] <= PERFORMANCE_FEE_HARD_CAP,
+            ""performanceFeeGovernance too high""
+        );
+        require(
+            _feeConfig[1] <= PERFORMANCE_FEE_HARD_CAP,
+            ""performanceFeeStrategist too high""
+        );
+        require(
+            _feeConfig[2] <= WITHDRAWAL_FEE_HARD_CAP,
+            ""withdrawalFee too high""
+        );
+        require(
+            _feeConfig[3] <= MANAGEMENT_FEE_HARD_CAP,
+            ""managementFee too high""
+        );
+
+        string memory name;
+        string memory symbol;
+
+        // If they are non empty string we'll use the custom names
+        // Else just add the default prefix
+        IERC20 namedToken = IERC20(_token);
+
+        if (keccak256(abi.encodePacked(_name)) != keccak256("""")) {
+            name = _name;
+        } else {
+            name = string(
+                abi.encodePacked(_defaultNamePrefix, namedToken.name())
+            );
+        }
+
+        if (keccak256(abi.encodePacked(_symbol)) != keccak256("""")) {
+            symbol = _symbol;
+        } else {
+            symbol = string(
+                abi.encodePacked(_symbolSymbolPrefix, namedToken.symbol())
+            );
+        }
+
+        // Initializing the lpcomponent token
+        __ERC20_init(name, symbol);
+        // Initialize the other contracts
+        __Pausable_init();
+        __ReentrancyGuard_init();
+
+        token = IERC20Upgradeable(_token);
+        governance = _governance;
+        treasury = _treasury;
+        strategist = _strategist;
+        keeper = _keeper;
+        guardian = _guardian;
+        badgerTree = _badgerTree;
+        vesting = _vesting;
+
+        lastHarvestedAt = block.timestamp; // setting initial value to the time when the vault was deployed
+
+        performanceFeeGovernance = _feeConfig[0];
+        performanceFeeStrategist = _feeConfig[1];
+        withdrawalFee = _feeConfig[2];
+        managementFee = _feeConfig[3];
+        maxPerformanceFee = PERFORMANCE_FEE_HARD_CAP; // 30% max performance fee
+        maxWithdrawalFee = WITHDRAWAL_FEE_HARD_CAP; // 2% maximum withdrawal fee
+        maxManagementFee = MANAGEMENT_FEE_HARD_CAP; // 2% maximum management fee
+
+        toEarnBps = 9_500; // initial value of toEarnBps // 95% is invested to the strategy, 5% for cheap withdrawals
+    }
+
+    /// ===== Modifiers ====
+
+    /// @notice Checks whether a call is from guardian or governance.
+    function _onlyAuthorizedPausers() internal view {
+        require(
+            msg.sender == guardian || msg.sender == governance,
+            ""onlyPausers""
+        );
+    }
+
+    /// @notice Checks whether a call is from the strategy.
+    function _onlyStrategy() internal view {
+        require(msg.sender == strategy, ""onlyStrategy"");
+    }
+
+    /// ===== View Functions =====
+
+    /// @notice Used to track the deployed version of the contract.
+    /// @return Current version of the contract.
+    function version() external pure returns (string memory) {
+        return ""1.5"";
+    }
+
+    /// @notice Gives the price for a single Sett share.
+    /// @dev Sett starts with a price per share of 1.
+    /// @return Value of a single share.
+    function getPricePerFullShare() public view returns (uint256) {
+        if (totalSupply() == 0) {
+            return ONE_ETH;
+        }
+        return (balance() * ONE_ETH) / totalSupply();
+    }
+
+    /// @notice Gives the total balance of the underlying token within the sett and strategy system.
+    /// @return Balance of token handled by the sett.
+    function balance() public view returns (uint256) {
+        return token.balanceOf(address(this));
+    }
+
+    /// @notice Defines how much of the Setts' underlying is available for strategy to borrow.
+    /// @return Amount of tokens that the sett can provide to the strategy.
+    function available() public view returns (uint256) {
+        return (token.balanceOf(address(this)) * toEarnBps) / MAX_BPS;
+    }
+
+    /// ===== Public Actions =====
+
+    /// @notice Deposits `_amount` tokens, issuing shares.
+    ///         Note that deposits are not accepted when the Sett is paused or when `pausedDeposit` is true.
+    /// @dev See `_depositFor` for details on how deposit is implemented.
+    /// @param _amount Quantity of tokens to deposit.
+    function deposit(uint256 _amount) external whenNotPaused {
+        _depositWithAuthorization(_amount, new bytes32[](0));
+    }
+
+    /// @notice Deposits `_amount` tokens, issuing shares.
+    ///         Checks the guestlist to verify that the calling account is authorized to make a deposit for the specified `_amount`.
+    ///         Note that deposits are not accepted when the Sett is paused or when `pausedDeposit` is true.
+    /// @dev See `_depositForWithAuthorization` for details on guestlist authorization.
+    /// @param _amount Quantity of tokens to deposit.
+    /// @param proof Merkle proof to validate in the guestlist.
+    function deposit(uint256 _amount, bytes32[] memory proof)
+        external
+        whenNotPaused
+    {
+        _depositWithAuthorization(_amount, proof);
+    }
+
+    /// @notice Deposits all tokens, issuing shares.
+    ///         Note that deposits are not accepted when the Sett is paused or when `pausedDeposit` is true.
+    /// @dev See `_depositFor` for details on how deposit is implemented.
+    function depositAll() external whenNotPaused {
+        _depositWithAuthorization(
+            token.balanceOf(msg.sender),
+            new bytes32[](0)
+        );
+    }
+
+    /// @notice Deposits all tokens, issuing shares.
+    ///         Checks the guestlist to verify that the calling is authorized to make a full deposit.
+    ///         Note that deposits are not accepted when the Sett is paused or when `pausedDeposit` is true.
+    /// @dev See `_depositForWithAuthorization` for details on guestlist authorization.
+    /// @param proof Merkle proof to validate in the guestlist.
+    function depositAll(bytes32[] memory proof) external whenNotPaused {
+        _depositWithAuthorization(token.balanceOf(msg.sender), proof);
+    }
+
+    /// @notice Deposits `_amount` tokens, issuing shares to `recipient`.
+    ///         Note that deposits are not accepted when the Sett is paused or when `pausedDeposit` is true.
+    /// @dev See `_depositFor` for details on how deposit is implemented.
+    /// @param _recipient Address to issue the Sett shares to.
+    /// @param _amount Quantity of tokens to deposit.
+    function depositFor(address _recipient, uint256 _amount)
+        external
+        whenNotPaused
+    {
+        _depositForWithAuthorization(_recipient, _amount, new bytes32[](0));
+    }
+
+    /// @notice Deposits `_amount` tokens, issuing shares to `recipient`.
+    ///         Checks the guestlist to verify that `recipient` is authorized to make a deposit for the specified `_amount`.
+    ///         Note that deposits are not accepted when the Sett is paused or when `pausedDeposit` is true.
+    /// @dev See `_depositForWithAuthorization` for details on guestlist authorization.
+    /// @param _recipient Address to issue the Sett shares to.
+    /// @param _amount Quantity of tokens to deposit.
+    function depositFor(
+        address _recipient,
+        uint256 _amount,
+        bytes32[] memory proof
+    ) external whenNotPaused {
+        _depositForWithAuthorization(_recipient, _amount, proof);
+    }
+
+    /// @notice Redeems `_shares` for an appropriate amount of tokens.
+    ///         Note that withdrawals are not processed when the Sett is paused.
+    /// @dev See `_withdraw` for details on how withdrawals are processed.
+    /// @param _shares Quantity of shares to redeem.
+    function withdraw(uint256 _shares) external whenNotPaused {
+        _withdraw(_shares);
+    }
+
+    /// @notice Redeems all shares, issuing an appropriate amount of tokens.
+    ///         Note that withdrawals are not processed when the Sett is paused.
+    /// @dev See `_withdraw` for details on how withdrawals are processed.
+    function withdrawAll() external whenNotPaused {
+        _withdraw(balanceOf(msg.sender));
+    }
+
+    /// ===== Permissioned Actions: Strategy =====
+
+    /// @notice Used by the strategy to report a harvest to the sett.
+    ///         Issues shares for the strategist and treasury based on the performance fees and harvested amount.
+    ///         Issues shares for the treasury based on the management fee and the time elapsed since last harvest.
+    ///         Updates harvest variables for on-chain APR tracking.
+    ///         This can only be called by the strategy.
+    /// @dev This implicitly trusts that the strategy reports the correct amount.
+    ///      Pausing on this function happens at the strategy level.
+    /// @param _harvestedAmount Amount of underlying token harvested by the strategy.
+    function reportHarvest(uint256 _harvestedAmount) external nonReentrant {
+        _onlyStrategy();
+
+        uint256 harvestTime = block.timestamp;
+        uint256 assetsAtHarvest = balance() - _harvestedAmount; // Must be less than or equal or revert
+
+        _handleFees(_harvestedAmount, harvestTime);
+
+        // Updated lastHarvestAmount
+        lastHarvestAmount = _harvestedAmount;
+
+        // if we withdrawAll
+        // we will have some yield left
+        // having 0 for assets will inflate APY
+        // Instead, have the last harvest report with the previous assets
+        // And if you end up harvesting again, that report will have both 0s
+        if (assetsAtHarvest != 0) {
+            assetsAtLastHarvest = assetsAtHarvest;
+        } else if (_harvestedAmount == 0) {
+            // If zero
+            assetsAtLastHarvest = 0;
+        }
+
+        lifeTimeEarned = lifeTimeEarned + _harvestedAmount;
+        // Update time either way
+        lastHarvestedAt = harvestTime;
+
+        emit Harvested(
+            address(token),
+            _harvestedAmount,
+            block.number,
+            block.timestamp
+        );
+    }
+
+    /// @notice Used by the strategy to report harvest of additional tokens to the sett.
+    ///         Charges performance fees on the additional tokens and transfers fees to treasury and strategist.
+    ///         The remaining amount is sent to badgerTree for emissions.
+    ///         Updates harvest variables for on-chain APR tracking.
+    ///         This can only be called by the strategy.
+    /// @dev This function is called after the strategy sends the additional tokens to the sett.
+    ///      Pausing on this function happens at the strategy level.
+    /// @param _token Address of additional token harvested by the strategy.
+    function reportAdditionalToken(address _token) external nonReentrant {
+        _onlyStrategy();
+        require(address(token) != _token, ""No want"");
+        uint256 tokenBalance = IERC20Upgradeable(_token).balanceOf(
+            address(this)
+        );
+
+        additionalTokensEarned[_token] =
+            additionalTokensEarned[_token] +
+            tokenBalance;
+        lastAdditionalTokenAmount[_token] = tokenBalance;
+
+        // We may have more, but we still report only what the strat sent
+        uint256 governanceRewardsFee = _calculateFee(
+            tokenBalance,
+            performanceFeeGovernance
+        );
+        uint256 strategistRewardsFee = _calculateFee(
+            tokenBalance,
+            performanceFeeStrategist
+        );
+
+        IERC20Upgradeable(_token).safeTransfer(treasury, governanceRewardsFee);
+        IERC20Upgradeable(_token).safeTransfer(
+            strategist,
+            strategistRewardsFee
+        );
+
+        // Send rest to tree
+        uint256 newBalance = IERC20Upgradeable(_token).balanceOf(address(this));
+        IERC20Upgradeable(_token).safeTransfer(badgerTree, newBalance);
+        emit TreeDistribution(
+            _token,
+            newBalance,
+            block.number,
+            block.timestamp
+        );
+    }
+
+    /// ===== Permissioned Actions: Governance =====
+
+    /// @notice Changes the treasury address.
+    ///         Treasury is recipient of management and governance performance fees.
+    ///         This can only be called by governance.
+    ///         Note that this can only be called when sett is not paused.
+    /// @param _treasury Address of the new treasury.
+    function setTreasury(address _treasury) external whenNotPaused {
+        _onlyGovernance();
+        require(_treasury != address(0), ""Address 0"");
+
+        treasury = _treasury;
+        emit SetTreasury(_treasury);
+    }
+
+    /// @notice Changes the strategy address.
+    ///         This can only be called by governance.
+    ///         Note that this can only be called when sett is not paused.
+    /// @dev This is a rug vector, pay extremely close attention to the next strategy being set.
+    ///      Changing the strategy should happen only via timelock.
+    ///      This function must not be callable when the sett is paused as this would force depositors into a strategy they may not want to use.
+    /// @param _strategy Address of new strategy.
+    function setStrategy(address _strategy) external whenNotPaused {
+        _onlyGovernance();
+        require(_strategy != address(0), ""Address 0"");
+
+        /// NOTE: Migrate funds if settings strategy when already existing one
+        if (strategy != address(0)) {
+            require(
+                IStrategy(strategy).balanceOf() == 0,
+                ""Please withdrawToVault before changing strat""
+            );
+        }
+        strategy = _strategy;
+        emit SetStrategy(_strategy);
+    }
+
+    // === Setters that can be called by governance even when paused ===
+
+    /// @notice Sets the max withdrawal fee that can be charged by the Sett.
+    ///         This can only be called by governance.
+    /// @dev The input `_fees` should be less than the `WITHDRAWAL_FEE_HARD_CAP` hard-cap.
+    /// @param _fees The new maximum cap for withdrawal fee.
+    function setMaxWithdrawalFee(uint256 _fees) external {
+        _onlyGovernance();
+        require(_fees <= WITHDRAWAL_FEE_HARD_CAP, ""withdrawalFee too high"");
+
+        maxWithdrawalFee = _fees;
+        emit SetMaxWithdrawalFee(_fees);
+    }
+
+    /// @notice Sets the max performance fee that can be charged by the Sett.
+    ///         This can only be called by governance.
+    /// @dev The input `_fees` should be less than the `PERFORMANCE_FEE_HARD_CAP` hard-cap.
+    /// @param _fees The new maximum cap for performance fee.
+    function setMaxPerformanceFee(uint256 _fees) external {
+        _onlyGovernance();
+        require(
+            _fees <= PERFORMANCE_FEE_HARD_CAP,
+            ""performanceFeeStrategist too high""
+        );
+
+        maxPerformanceFee = _fees;
+        emit SetMaxPerformanceFee(_fees);
+    }
+
+    /// @notice Sets the max management fee that can be charged by the Sett.
+    ///         This can only be called by governance.
+    /// @dev The input `_fees` should be less than the `MANAGEMENT_FEE_HARD_CAP` hard-cap.
+    /// @param _fees The new maximum cap for management fee.
+    function setMaxManagementFee(uint256 _fees) external {
+        _onlyGovernance();
+        require(_fees <= MANAGEMENT_FEE_HARD_CAP, ""managementFee too high"");
+
+        maxManagementFee = _fees;
+        emit SetMaxManagementFee(_fees);
+    }
+
+    /// @notice Changes the guardian address.
+    ///         Guardian is an authorized actor that can pause the sett in case of an emergency.
+    ///         This can only be called by governance.
+    /// @param _guardian Address of the new guardian.
+    function setGuardian(address _guardian) external {
+        _onlyGovernance();
+        require(_guardian != address(0), ""Address cannot be 0x0"");
+
+        guardian = _guardian;
+        emit SetGuardian(_guardian);
+    }
+
+    /// @notice Changes the vesting contract address.
+    ///         Vesting contract is used to vest withdrawn tokens linearly over period of 21 days
+    ///         This can only be called by governance.
+    /// @param _vesting Address of the new guardian.
+    function setVesting(address _vesting) external {
+        _onlyGovernance();
+        require(_vesting != address(0), ""Address cannot be 0x0"");
+
+        vesting = _vesting;
+        emit SetVesting(_vesting);
+    }
+
+    /// ===== Permissioned Functions: Trusted Actors =====
+
+    /// @notice Sets the fraction of sett balance (in basis points) that the strategy can borrow.
+    ///         This can be called by either governance or strategist.
+    ///         Note that this can only be called when the sett is not paused.
+    /// @param _newToEarnBps The new maximum cap for management fee.
+    function setToEarnBps(uint256 _newToEarnBps) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        require(_newToEarnBps <= MAX_BPS, ""toEarnBps should be <= MAX_BPS"");
+
+        toEarnBps = _newToEarnBps;
+        emit SetToEarnBps(_newToEarnBps);
+    }
+
+    /// @notice Changes the guestlist address.
+    ///         The guestList is used to gate or limit deposits. If no guestlist is set then anyone can deposit any amount.
+    ///         This can be called by either governance or strategist.
+    ///         Note that this can only be called when the sett is not paused.
+    /// @param _guestList Address of the new guestlist.
+    function setGuestList(address _guestList) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        guestList = IBadgerGuestlist(_guestList);
+        emit SetGuestList(_guestList);
+    }
+
+    /// @notice Sets the withdrawal fee charged by the Sett.
+    ///         The fee is taken at the time of withdrawals in the underlying token which is then used to issue new shares for the treasury.
+    ///         The new withdrawal fee should be less than `maxWithdrawalFee`.
+    ///         This can be called by either governance or strategist.
+    /// @dev See `_withdraw` to see how withdrawal fee is charged.
+    /// @param _withdrawalFee The new withdrawal fee.
+    function setWithdrawalFee(uint256 _withdrawalFee) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        require(_withdrawalFee <= maxWithdrawalFee, ""Excessive withdrawal fee"");
+        withdrawalFee = _withdrawalFee;
+        emit SetWithdrawalFee(_withdrawalFee);
+    }
+
+    /// @notice Sets the performance fee taken by the strategist on the harvests.
+    ///         The fee is taken at the time of harvest reporting for both the underlying token and additional tokens.
+    ///         For the underlying token, the fee is used to issue new shares for the strategist.
+    ///         The new performance fee should be less than `maxPerformanceFee`.
+    ///         This can be called by either governance or strategist.
+    /// @dev See `reportHarvest` and `reportAdditionalToken` to see how performance fees are charged.
+    /// @param _performanceFeeStrategist The new performance fee.
+    function setPerformanceFeeStrategist(uint256 _performanceFeeStrategist)
+        external
+        whenNotPaused
+    {
+        _onlyGovernanceOrStrategist();
+        require(
+            _performanceFeeStrategist <= maxPerformanceFee,
+            ""Excessive strategist performance fee""
+        );
+        performanceFeeStrategist = _performanceFeeStrategist;
+        emit SetPerformanceFeeStrategist(_performanceFeeStrategist);
+    }
+
+    /// @notice Sets the performance fee taken by the treasury on the harvests.
+    ///         The fee is taken at the time of harvest reporting for both the underlying token and additional tokens.
+    ///         For the underlying token, the fee is used to issue new shares for the treasury.
+    ///         The new performance fee should be less than `maxPerformanceFee`.
+    ///         This can be called by either governance or strategist.
+    /// @dev See `reportHarvest` and `reportAdditionalToken` to see how performance fees are charged.
+    /// @param _performanceFeeGovernance The new performance fee.
+    function setPerformanceFeeGovernance(uint256 _performanceFeeGovernance)
+        external
+        whenNotPaused
+    {
+        _onlyGovernanceOrStrategist();
+        require(
+            _performanceFeeGovernance <= maxPerformanceFee,
+            ""Excessive governance performance fee""
+        );
+        performanceFeeGovernance = _performanceFeeGovernance;
+        emit SetPerformanceFeeGovernance(_performanceFeeGovernance);
+    }
+
+    /// @notice Sets the management fee taken by the treasury on the AUM in the sett.
+    ///         The fee is calculated at the time of `reportHarvest` and is used to issue new shares for the treasury.
+    ///         The new management fee should be less than `maxManagementFee`.
+    ///         This can be called by either governance or strategist.
+    /// @dev See `_handleFees` to see how the management fee is calculated.
+    /// @param _fees The new management fee.
+    function setManagementFee(uint256 _fees) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        require(_fees <= maxManagementFee, ""Excessive management fee"");
+        managementFee = _fees;
+        emit SetManagementFee(_fees);
+    }
+
+    /// === Strategist level operations that can be done even when paused ==
+
+    /// @notice Withdraws all funds from the strategy back to the sett.
+    ///         This can be called by either governance or strategist.
+    /// @dev This calls `_withdrawAll` on the strategy and transfers the balance to the sett.
+    function withdrawToVault() external {
+        _onlyGovernanceOrStrategist();
+        IStrategy(strategy).withdrawToVault();
+    }
+
+    /// @notice Sends balance of any extra token earned by the strategy (from airdrops, donations etc.)
+    ///         to the badgerTree for emissions.
+    ///         The `_token` should be different from any tokens managed by the strategy.
+    ///         This can only be called by either strategist or governance.
+    /// @dev See `BaseStrategy.emitNonProtectedToken` for details.
+    /// @param _token Address of the token to be emitted.
+    function emitNonProtectedToken(address _token) external {
+        _onlyGovernanceOrStrategist();
+
+        IStrategy(strategy).emitNonProtectedToken(_token);
+    }
+
+    /// @notice Sweeps the balance of an extra token from the vault and strategy and sends it to governance.
+    ///         The `_token` should be different from any tokens managed by the strategy.
+    ///         This can only be called by either strategist or governance.
+    /// @dev Sweeping doesn't take any fee.
+    /// @param _token Address of the token to be swept.
+    function sweepExtraToken(address _token) external {
+        _onlyGovernanceOrStrategist();
+        require(address(token) != _token, ""No want"");
+
+        IStrategy(strategy).withdrawOther(_token);
+        // Send all `_token` we have
+        // Safe because `withdrawOther` will revert on protected tokens
+        // Done this way works for both a donation to strategy or to vault
+        IERC20Upgradeable(_token).safeTransfer(
+            governance,
+            IERC20Upgradeable(_token).balanceOf(address(this))
+        );
+    }
+
+    /// @notice Deposits the available balance of the underlying token into the strategy.
+    ///         The strategy then uses the amount for yield-generating activities.
+    ///         This can be called by either the keeper or governance.
+    ///         Note that earn cannot be called when deposits are paused.
+    /// @dev Pause is enforced at the Strategy level (this allows to still earn yield when the Vault is paused)
+    function earn() external {
+        require(!pausedDeposit, ""pausedDeposit""); // dev: deposits are paused, we don't earn as well
+        _onlyAuthorizedActors();
+
+        uint256 _bal = available();
+        token.safeTransfer(strategy, _bal);
+        IStrategy(strategy).earn();
+    }
+
+    /// @notice Pauses only deposits.
+    ///         This can be called by either guardian or governance.
+    function pauseDeposits() external {
+        _onlyAuthorizedPausers();
+        pausedDeposit = true;
+        emit PauseDeposits(msg.sender);
+    }
+
+    /// @notice Unpauses deposits.
+    ///         This can only be called by governance.
+    function unpauseDeposits() external {
+        _onlyGovernance();
+        pausedDeposit = false;
+        emit UnpauseDeposits(msg.sender);
+    }
+
+    /// @notice Pauses everything.
+    ///         This can be called by either guardian or governance.
+    function pause() external {
+        _onlyAuthorizedPausers();
+        _pause();
+    }
+
+    /// @notice Unpauses everything
+    ///         This can only be called by governance.
+    function unpause() external {
+        _onlyGovernance();
+        _unpause();
+    }
+
+    /// ===== Internal Implementations =====
+
+    /// @notice Deposits `_amount` tokens, issuing shares to `recipient`.
+    ///         Note that deposits are not accepted when `pausedDeposit` is true.
+    /// @dev This is the actual deposit operation.
+    ///      Deposits are based on the realized value of underlying assets between Sett & associated Strategy
+    /// @param _recipient Address to issue the Sett shares to.
+    /// @param _amount Quantity of tokens to deposit.
+    function _depositFor(address _recipient, uint256 _amount)
+        internal
+        nonReentrant
+    {
+        require(_recipient != address(0), ""Address 0"");
+        require(_amount != 0, ""Amount 0"");
+        require(!pausedDeposit, ""pausedDeposit""); // dev: deposits are paused
+
+        uint256 _pool = balance();
+        uint256 _before = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), _amount);
+        uint256 _after = token.balanceOf(address(this));
+        _mintSharesFor(_recipient, _after - _before, _pool);
+    }
+
+    /// @dev See `_depositWithAuthorization`
+    function _depositWithAuthorization(uint256 _amount, bytes32[] memory proof)
+        internal
+    {
+        _depositForWithAuthorization(msg.sender, _amount, proof);
+    }
+
+    /// @dev Verifies that `_recipient` is authorized to deposit `_amount` based on the guestlist.
+    ///      See `_depositFor` for deposit details.
+    function _depositForWithAuthorization(
+        address _recipient,
+        uint256 _amount,
+        bytes32[] memory proof
+    ) internal {
+        if (address(guestList) != address(0)) {
+            require(
+                guestList.authorized(_recipient, _amount, proof),
+                ""GuestList: Not Authorized""
+            );
+        }
+        _depositFor(_recipient, _amount);
+    }
+
+    /// @notice Redeems `_shares` for an appropriate amount of tokens.
+    /// @dev This is the actual withdraw operation.
+    ///      Withdraws from strategy positions if sett doesn't contain enough tokens to process the withdrawal.
+    ///      Calculates withdrawal fees and issues corresponding shares to treasury.
+    ///      No rebalance implementation for lower fees and faster swaps
+    /// @param _shares Quantity of shares to redeem.
+    function _withdraw(uint256 _shares) internal nonReentrant {
+        require(_shares != 0, ""0 Shares"");
+
+        uint256 r = (balance() * _shares) / totalSupply();
+        _burn(msg.sender, _shares);
+
+        // Check balance
+        uint256 b = token.balanceOf(address(this));
+        if (b < r) {
+            uint256 _toWithdraw = r - b;
+            IStrategy(strategy).withdraw(_toWithdraw);
+            uint256 _after = token.balanceOf(address(this));
+            uint256 _diff = _after - b;
+            if (_diff < _toWithdraw) {
+                r = b + _diff;
+            }
+        }
+
+        uint256 _fee = _calculateFee(r, withdrawalFee);
+        uint256 _amount = r - _fee;
+
+        // Send funds to vesting contract and setup vesting
+        IVesting(vesting).setupVesting(msg.sender, _amount, block.timestamp);
+        token.safeTransfer(vesting, _amount);
+
+        // After you burned the shares, and you have sent the funds, adding here is equivalent to depositing
+        // Process withdrawal fee
+        if(_fee > 0) {
+            _mintSharesFor(treasury, _fee, balance() - _fee);
+        }
+    }
+
+    /// @dev Helper function to calculate fees.
+    /// @param amount Amount to calculate fee on.
+    /// @param feeBps The fee to be charged in basis points.
+    /// @return Amount of fees to take.
+    function _calculateFee(uint256 amount, uint256 feeBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (feeBps == 0) {
+            return 0;
+        }
+        uint256 fee = (amount * feeBps) / MAX_BPS;
+        return fee;
+    }
+
+    /// @dev Helper function to calculate governance and strategist performance fees. Make sure to use it to get paid!
+    /// @param _amount Amount to calculate fee on.
+    /// @return Tuple containing amount of (governance, strategist) fees to take.
+    function _calculatePerformanceFee(uint256 _amount)
+        internal
+        view
+        returns (uint256, uint256)
+    {
+        uint256 governancePerformanceFee = _calculateFee(
+            _amount,
+            performanceFeeGovernance
+        );
+
+        uint256 strategistPerformanceFee = _calculateFee(
+            _amount,
+            performanceFeeStrategist
+        );
+
+        return (governancePerformanceFee, strategistPerformanceFee);
+    }
+
+    /// @dev Helper function to issue shares to `recipient` based on an input `_amount` and `_pool` size.
+    /// @param recipient Address to issue shares to.
+    /// @param _amount Amount to issue shares on.
+    /// @param _pool Pool size to use while calculating amount of shares to mint.
+    function _mintSharesFor(
+        address recipient,
+        uint256 _amount,
+        uint256 _pool
+    ) internal {
+        uint256 shares;
+        if (totalSupply() == 0) {
+            shares = _amount;
+        } else {
+            shares = (_amount * totalSupply()) / _pool;
+        }
+        _mint(recipient, shares);
+    }
+
+    /// @dev Helper function that issues shares based on performance and management fee when a harvest is reported.
+    /// @param _harvestedAmount The harvested amount to take fee on.
+    /// @param harvestTime Time of harvest (block.timestamp).
+    function _handleFees(uint256 _harvestedAmount, uint256 harvestTime)
+        internal
+    {
+        (
+            uint256 feeGovernance,
+            uint256 feeStrategist
+        ) = _calculatePerformanceFee(_harvestedAmount);
+        uint256 duration = harvestTime - lastHarvestedAt;
+
+        // Management fee is calculated against the assets before harvest, to make it fair to depositors
+        uint256 management_fee = managementFee > 0
+            ? (managementFee * (balance() - _harvestedAmount) * duration) /
+                SECS_PER_YEAR /
+                MAX_BPS
+            : 0;
+        uint256 totalGovernanceFee = feeGovernance + management_fee;
+
+        // Pool size is the size of the pool minus the fees, this way
+        // it's equivalent to sending the tokens as rewards after the harvest
+        // and depositing them again
+        uint256 _pool = balance() - totalGovernanceFee - feeStrategist;
+
+        // uint != is cheaper and equivalent to >
+        if (totalGovernanceFee != 0) {
+            _mintSharesFor(treasury, totalGovernanceFee, _pool);
+        }
+
+        if (feeStrategist != 0 && strategist != address(0)) {
+            /// NOTE: adding feeGovernance backed to _pool as shares would have been issued for it.
+            _mintSharesFor(
+                strategist,
+                feeStrategist,
+                _pool + totalGovernanceFee
+            );
+        }
+    }
+}",9080,934,"[H-01] StakedCitadel doesn't use correct balance for internal accounting
+The StakedCitadel contract's `balance()` function is supposed to return the balance of the vault + the balance of the strategy. But, it only returns the balance of the vault. The balance is used to determine the number of shares that should be minted when depositing funds into the vault and the number of shares that should be burned when withdrawing funds from it.
+Since most of the funds will be located in the strategy, the vault's balance will be very low. Some of the issues that arise from this:
+  [H-02] StakedCitadel: wrong setupVesting function name
+In the `_withdraw` function of the StakedCitadel contract, the setupVesting function of vesting is called, while in the StakedCitadelVester contract, the function name is vest, which will cause the `_withdraw` function to fail, so that the user cannot withdraw the tokens.
+  [H-03] StakedCitadel depositors can be attacked by the first depositor with depressing of vault token denomination
+`deposit()` -> `_depositFor()` -> `_mintSharesFor()` call doesn't require minimum amount and mints according to the provided amount:
+Any deposit lower than total attacker's stake will be fully stolen from the depositor as 0 vault tokens will be issued in this case.",3,,"pragma solidity 0.8.12;
+
+import {IERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"";
+import {AddressUpgradeable} from ""openzeppelin-contracts-upgradeable/utils/AddressUpgradeable.sol"";
+import {SafeERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import {ERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol"";
+import {PausableUpgradeable} from ""openzeppelin-contracts-upgradeable/security/PausableUpgradeable.sol"";
+import {ReentrancyGuardUpgradeable} from ""openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""./lib/SettAccessControl.sol"";
+
+import {IVault} from ""./interfaces/badger/IVault.sol"";
+import {IVesting} from ""./interfaces/citadel/IVesting.sol"";
+import {IStrategy} from ""./interfaces/badger/IStrategy.sol"";
+import {IERC20} from ""./interfaces/erc20/IERC20.sol"";
+import {IBadgerGuestlist} from ""./interfaces/badger/IBadgerGuestlist.sol"";
+
+
+
+contract StakedCitadel is
+    ERC20Upgradeable,
+    SettAccessControl,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+    using AddressUpgradeable for address;
+
+    uint256 constant ONE_ETH = 1e18;
+
+    
+
+    IERC20Upgradeable public token; 
+    IBadgerGuestlist public guestList; 
+
+    bool public pausedDeposit; 
+
+    address public strategy; 
+    address public guardian; 
+    address public treasury; 
+
+    address public badgerTree; 
+    address public vesting; 
+
+    
+    string internal constant _defaultNamePrefix = ""Staked "";
+    string internal constant _symbolSymbolPrefix = ""x"";
+
+    
+    uint256 public lifeTimeEarned; 
+    uint256 public lastHarvestedAt; 
+    uint256 public lastHarvestAmount; 
+    uint256 public assetsAtLastHarvest; 
+
+    mapping(address => uint256) public additionalTokensEarned;
+    mapping(address => uint256) public lastAdditionalTokenAmount;
+
+    
+    
+    uint256 public performanceFeeGovernance; 
+    uint256 public performanceFeeStrategist; 
+    uint256 public withdrawalFee; 
+    uint256 public managementFee; 
+
+    uint256 public maxPerformanceFee; 
+    uint256 public maxWithdrawalFee; 
+    uint256 public maxManagementFee; 
+
+    uint256 public toEarnBps; 
+
+    
+
+    uint256 public constant MAX_BPS = 10_000;
+    uint256 public constant SECS_PER_YEAR = 31_556_952; 
+
+    uint256 public constant WITHDRAWAL_FEE_HARD_CAP = 200; 
+    uint256 public constant PERFORMANCE_FEE_HARD_CAP = 3_000; 
+    uint256 public constant MANAGEMENT_FEE_HARD_CAP = 200; 
+
+    
+
+    
+    event TreeDistribution(
+        address indexed token,
+        uint256 amount,
+        uint256 indexed blockNumber,
+        uint256 timestamp
+    );
+
+    
+    event Harvested(
+        address indexed token,
+        uint256 amount,
+        uint256 indexed blockNumber,
+        uint256 timestamp
+    );
+
+    event SetTreasury(address indexed newTreasury);
+    event SetStrategy(address indexed newStrategy);
+    event SetToEarnBps(uint256 newEarnToBps);
+    event SetMaxWithdrawalFee(uint256 newMaxWithdrawalFee);
+    event SetMaxPerformanceFee(uint256 newMaxPerformanceFee);
+    event SetMaxManagementFee(uint256 newMaxManagementFee);
+    event SetGuardian(address indexed newGuardian);
+    event SetVesting(address indexed newVesting);
+    event SetGuestList(address indexed newGuestList);
+    event SetWithdrawalFee(uint256 newWithdrawalFee);
+    event SetPerformanceFeeStrategist(uint256 newPerformanceFeeStrategist);
+    event SetPerformanceFeeGovernance(uint256 newPerformanceFeeGovernance);
+    event SetManagementFee(uint256 newManagementFee);
+
+    event PauseDeposits(address indexed pausedBy);
+    event UnpauseDeposits(address indexed pausedBy);
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    function initialize(
+        address _token,
+        address _governance,
+        address _keeper,
+        address _guardian,
+        address _treasury,
+        address _strategist,
+        address _badgerTree,
+        address _vesting,
+        string memory _name,
+        string memory _symbol,
+        uint256[4] memory _feeConfig
+    ) public initializer whenNotPaused {
+        require(_token != address(0)); 
+        require(_governance != address(0)); 
+        require(_keeper != address(0)); 
+        require(_guardian != address(0)); 
+        require(_treasury != address(0)); 
+        require(_strategist != address(0)); 
+        require(_badgerTree != address(0)); 
+        require(_vesting != address(0)); 
+
+        
+        require(
+            _feeConfig[0] <= PERFORMANCE_FEE_HARD_CAP,
+            ""performanceFeeGovernance too high""
+        );
+        require(
+            _feeConfig[1] <= PERFORMANCE_FEE_HARD_CAP,
+            ""performanceFeeStrategist too high""
+        );
+        require(
+            _feeConfig[2] <= WITHDRAWAL_FEE_HARD_CAP,
+            ""withdrawalFee too high""
+        );
+        require(
+            _feeConfig[3] <= MANAGEMENT_FEE_HARD_CAP,
+            ""managementFee too high""
+        );
+
+        string memory name;
+        string memory symbol;
+
+        
+        
+        IERC20 namedToken = IERC20(_token);
+
+        if (keccak256(abi.encodePacked(_name)) != keccak256("""")) {
+            name = _name;
+        } else {
+            name = string(
+                abi.encodePacked(_defaultNamePrefix, namedToken.name())
+            );
+        }
+
+        if (keccak256(abi.encodePacked(_symbol)) != keccak256("""")) {
+            symbol = _symbol;
+        } else {
+            symbol = string(
+                abi.encodePacked(_symbolSymbolPrefix, namedToken.symbol())
+            );
+        }
+
+        
+        __ERC20_init(name, symbol);
+        
+        __Pausable_init();
+        __ReentrancyGuard_init();
+
+        token = IERC20Upgradeable(_token);
+        governance = _governance;
+        treasury = _treasury;
+        strategist = _strategist;
+        keeper = _keeper;
+        guardian = _guardian;
+        badgerTree = _badgerTree;
+        vesting = _vesting;
+
+        lastHarvestedAt = block.timestamp; 
+
+        performanceFeeGovernance = _feeConfig[0];
+        performanceFeeStrategist = _feeConfig[1];
+        withdrawalFee = _feeConfig[2];
+        managementFee = _feeConfig[3];
+        maxPerformanceFee = PERFORMANCE_FEE_HARD_CAP; 
+        maxWithdrawalFee = WITHDRAWAL_FEE_HARD_CAP; 
+        maxManagementFee = MANAGEMENT_FEE_HARD_CAP; 
+
+        toEarnBps = 9_500; 
+    }
+
+    
+
+    
+    function _onlyAuthorizedPausers() internal view {
+        require(
+            msg.sender == guardian || msg.sender == governance,
+            ""onlyPausers""
+        );
+    }
+
+    
+    function _onlyStrategy() internal view {
+        require(msg.sender == strategy, ""onlyStrategy"");
+    }
+
+    
+
+    
+    
+    function version() external pure returns (string memory) {
+        return ""1.5"";
+    }
+
+    
+    
+    
+    function getPricePerFullShare() public view returns (uint256) {
+        if (totalSupply() == 0) {
+            return ONE_ETH;
+        }
+        return (balance() * ONE_ETH) / totalSupply();
+    }
+
+    
+    
+    function balance() public view returns (uint256) {
+        return token.balanceOf(address(this));
+    }
+
+    
+    
+    function available() public view returns (uint256) {
+        return (token.balanceOf(address(this)) * toEarnBps) / MAX_BPS;
+    }
+
+    
+
+    
+    
+    
+    
+    function deposit(uint256 _amount) external whenNotPaused {
+        _depositWithAuthorization(_amount, new bytes32[](0));
+    }
+
+    
+    
+    
+    
+    
+    
+    function deposit(uint256 _amount, bytes32[] memory proof)
+        external
+        whenNotPaused
+    {
+        _depositWithAuthorization(_amount, proof);
+    }
+
+    
+    
+    
+    function depositAll() external whenNotPaused {
+        _depositWithAuthorization(
+            token.balanceOf(msg.sender),
+            new bytes32[](0)
+        );
+    }
+
+    
+    
+    
+    
+    
+    function depositAll(bytes32[] memory proof) external whenNotPaused {
+        _depositWithAuthorization(token.balanceOf(msg.sender), proof);
+    }
+
+    
+    
+    
+    
+    
+    function depositFor(address _recipient, uint256 _amount)
+        external
+        whenNotPaused
+    {
+        _depositForWithAuthorization(_recipient, _amount, new bytes32[](0));
+    }
+
+    
+    
+    
+    
+    
+    
+    function depositFor(
+        address _recipient,
+        uint256 _amount,
+        bytes32[] memory proof
+    ) external whenNotPaused {
+        _depositForWithAuthorization(_recipient, _amount, proof);
+    }
+
+    
+    
+    
+    
+    function withdraw(uint256 _shares) external whenNotPaused {
+        _withdraw(_shares);
+    }
+
+    
+    
+    
+    function withdrawAll() external whenNotPaused {
+        _withdraw(balanceOf(msg.sender));
+    }
+
+    
+
+    
+    
+    
+    
+    
+    
+    
+    
+    function reportHarvest(uint256 _harvestedAmount) external nonReentrant {
+        _onlyStrategy();
+
+        uint256 harvestTime = block.timestamp;
+        uint256 assetsAtHarvest = balance() - _harvestedAmount; 
+
+        _handleFees(_harvestedAmount, harvestTime);
+
+        
+        lastHarvestAmount = _harvestedAmount;
+
+        
+        
+        
+        
+        
+        if (assetsAtHarvest != 0) {
+            assetsAtLastHarvest = assetsAtHarvest;
+        } else if (_harvestedAmount == 0) {
+            
+            assetsAtLastHarvest = 0;
+        }
+
+        lifeTimeEarned = lifeTimeEarned + _harvestedAmount;
+        
+        lastHarvestedAt = harvestTime;
+
+        emit Harvested(
+            address(token),
+            _harvestedAmount,
+            block.number,
+            block.timestamp
+        );
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    
+    function reportAdditionalToken(address _token) external nonReentrant {
+        _onlyStrategy();
+        require(address(token) != _token, ""No want"");
+        uint256 tokenBalance = IERC20Upgradeable(_token).balanceOf(
+            address(this)
+        );
+
+        additionalTokensEarned[_token] =
+            additionalTokensEarned[_token] +
+            tokenBalance;
+        lastAdditionalTokenAmount[_token] = tokenBalance;
+
+        
+        uint256 governanceRewardsFee = _calculateFee(
+            tokenBalance,
+            performanceFeeGovernance
+        );
+        uint256 strategistRewardsFee = _calculateFee(
+            tokenBalance,
+            performanceFeeStrategist
+        );
+
+        IERC20Upgradeable(_token).safeTransfer(treasury, governanceRewardsFee);
+        IERC20Upgradeable(_token).safeTransfer(
+            strategist,
+            strategistRewardsFee
+        );
+
+        
+        uint256 newBalance = IERC20Upgradeable(_token).balanceOf(address(this));
+        IERC20Upgradeable(_token).safeTransfer(badgerTree, newBalance);
+        emit TreeDistribution(
+            _token,
+            newBalance,
+            block.number,
+            block.timestamp
+        );
+    }
+
+    
+
+    
+    
+    
+    
+    
+    function setTreasury(address _treasury) external whenNotPaused {
+        _onlyGovernance();
+        require(_treasury != address(0), ""Address 0"");
+
+        treasury = _treasury;
+        emit SetTreasury(_treasury);
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function setStrategy(address _strategy) external whenNotPaused {
+        _onlyGovernance();
+        require(_strategy != address(0), ""Address 0"");
+
+        
+        if (strategy != address(0)) {
+            require(
+                IStrategy(strategy).balanceOf() == 0,
+                ""Please withdrawToVault before changing strat""
+            );
+        }
+        strategy = _strategy;
+        emit SetStrategy(_strategy);
+    }
+
+    
+
+    
+    
+    
+    
+    function setMaxWithdrawalFee(uint256 _fees) external {
+        _onlyGovernance();
+        require(_fees <= WITHDRAWAL_FEE_HARD_CAP, ""withdrawalFee too high"");
+
+        maxWithdrawalFee = _fees;
+        emit SetMaxWithdrawalFee(_fees);
+    }
+
+    
+    
+    
+    
+    function setMaxPerformanceFee(uint256 _fees) external {
+        _onlyGovernance();
+        require(
+            _fees <= PERFORMANCE_FEE_HARD_CAP,
+            ""performanceFeeStrategist too high""
+        );
+
+        maxPerformanceFee = _fees;
+        emit SetMaxPerformanceFee(_fees);
+    }
+
+    
+    
+    
+    
+    function setMaxManagementFee(uint256 _fees) external {
+        _onlyGovernance();
+        require(_fees <= MANAGEMENT_FEE_HARD_CAP, ""managementFee too high"");
+
+        maxManagementFee = _fees;
+        emit SetMaxManagementFee(_fees);
+    }
+
+    
+    
+    
+    
+    function setGuardian(address _guardian) external {
+        _onlyGovernance();
+        require(_guardian != address(0), ""Address cannot be 0x0"");
+
+        guardian = _guardian;
+        emit SetGuardian(_guardian);
+    }
+
+    
+    
+    
+    
+    function setVesting(address _vesting) external {
+        _onlyGovernance();
+        require(_vesting != address(0), ""Address cannot be 0x0"");
+
+        vesting = _vesting;
+        emit SetVesting(_vesting);
+    }
+
+    
+
+    
+    
+    
+    
+    function setToEarnBps(uint256 _newToEarnBps) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        require(_newToEarnBps <= MAX_BPS, ""toEarnBps should be <= MAX_BPS"");
+
+        toEarnBps = _newToEarnBps;
+        emit SetToEarnBps(_newToEarnBps);
+    }
+
+    
+    
+    
+    
+    
+    function setGuestList(address _guestList) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        guestList = IBadgerGuestlist(_guestList);
+        emit SetGuestList(_guestList);
+    }
+
+    
+    
+    
+    
+    
+    
+    function setWithdrawalFee(uint256 _withdrawalFee) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        require(_withdrawalFee <= maxWithdrawalFee, ""Excessive withdrawal fee"");
+        withdrawalFee = _withdrawalFee;
+        emit SetWithdrawalFee(_withdrawalFee);
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function setPerformanceFeeStrategist(uint256 _performanceFeeStrategist)
+        external
+        whenNotPaused
+    {
+        _onlyGovernanceOrStrategist();
+        require(
+            _performanceFeeStrategist <= maxPerformanceFee,
+            ""Excessive strategist performance fee""
+        );
+        performanceFeeStrategist = _performanceFeeStrategist;
+        emit SetPerformanceFeeStrategist(_performanceFeeStrategist);
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function setPerformanceFeeGovernance(uint256 _performanceFeeGovernance)
+        external
+        whenNotPaused
+    {
+        _onlyGovernanceOrStrategist();
+        require(
+            _performanceFeeGovernance <= maxPerformanceFee,
+            ""Excessive governance performance fee""
+        );
+        performanceFeeGovernance = _performanceFeeGovernance;
+        emit SetPerformanceFeeGovernance(_performanceFeeGovernance);
+    }
+
+    
+    
+    
+    
+    
+    
+    function setManagementFee(uint256 _fees) external whenNotPaused {
+        _onlyGovernanceOrStrategist();
+        require(_fees <= maxManagementFee, ""Excessive management fee"");
+        managementFee = _fees;
+        emit SetManagementFee(_fees);
+    }
+
+    
+
+    
+    
+    
+    function withdrawToVault() external {
+        _onlyGovernanceOrStrategist();
+        IStrategy(strategy).withdrawToVault();
+    }
+
+    
+    
+    
+    
+    
+    
+    function emitNonProtectedToken(address _token) external {
+        _onlyGovernanceOrStrategist();
+
+        IStrategy(strategy).emitNonProtectedToken(_token);
+    }
+
+    
+    
+    
+    
+    
+    function sweepExtraToken(address _token) external {
+        _onlyGovernanceOrStrategist();
+        require(address(token) != _token, ""No want"");
+
+        IStrategy(strategy).withdrawOther(_token);
+        
+        
+        
+        IERC20Upgradeable(_token).safeTransfer(
+            governance,
+            IERC20Upgradeable(_token).balanceOf(address(this))
+        );
+    }
+
+    
+    
+    
+    
+    
+    function earn() external {
+        require(!pausedDeposit, ""pausedDeposit""); 
+        _onlyAuthorizedActors();
+
+        uint256 _bal = available();
+        token.safeTransfer(strategy, _bal);
+        IStrategy(strategy).earn();
+    }
+
+    
+    
+    function pauseDeposits() external {
+        _onlyAuthorizedPausers();
+        pausedDeposit = true;
+        emit PauseDeposits(msg.sender);
+    }
+
+    
+    
+    function unpauseDeposits() external {
+        _onlyGovernance();
+        pausedDeposit = false;
+        emit UnpauseDeposits(msg.sender);
+    }
+
+    
+    
+    function pause() external {
+        _onlyAuthorizedPausers();
+        _pause();
+    }
+
+    
+    
+    function unpause() external {
+        _onlyGovernance();
+        _unpause();
+    }
+
+    
+
+    
+    
+    
+    
+    
+    
+    function _depositFor(address _recipient, uint256 _amount)
+        internal
+        nonReentrant
+    {
+        require(_recipient != address(0), ""Address 0"");
+        require(_amount != 0, ""Amount 0"");
+        require(!pausedDeposit, ""pausedDeposit""); 
+
+        uint256 _pool = balance();
+        uint256 _before = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), _amount);
+        uint256 _after = token.balanceOf(address(this));
+        _mintSharesFor(_recipient, _after - _before, _pool);
+    }
+
+    
+    function _depositWithAuthorization(uint256 _amount, bytes32[] memory proof)
+        internal
+    {
+        _depositForWithAuthorization(msg.sender, _amount, proof);
+    }
+
+    
+    
+    function _depositForWithAuthorization(
+        address _recipient,
+        uint256 _amount,
+        bytes32[] memory proof
+    ) internal {
+        if (address(guestList) != address(0)) {
+            require(
+                guestList.authorized(_recipient, _amount, proof),
+                ""GuestList: Not Authorized""
+            );
+        }
+        _depositFor(_recipient, _amount);
+    }
+
+    
+    
+    
+    
+    
+    
+    function _withdraw(uint256 _shares) internal nonReentrant {
+        require(_shares != 0, ""0 Shares"");
+
+        uint256 r = (balance() * _shares) / totalSupply();
+        _burn(msg.sender, _shares);
+
+        
+        uint256 b = token.balanceOf(address(this));
+        if (b < r) {
+            uint256 _toWithdraw = r - b;
+            IStrategy(strategy).withdraw(_toWithdraw);
+            uint256 _after = token.balanceOf(address(this));
+            uint256 _diff = _after - b;
+            if (_diff < _toWithdraw) {
+                r = b + _diff;
+            }
+        }
+
+        uint256 _fee = _calculateFee(r, withdrawalFee);
+        uint256 _amount = r - _fee;
+
+        
+        IVesting(vesting).setupVesting(msg.sender, _amount, block.timestamp);
+        token.safeTransfer(vesting, _amount);
+
+        
+        
+        if(_fee > 0) {
+            _mintSharesFor(treasury, _fee, balance() - _fee);
+        }
+    }
+
+    
+    
+    
+    
+    function _calculateFee(uint256 amount, uint256 feeBps)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (feeBps == 0) {
+            return 0;
+        }
+        uint256 fee = (amount * feeBps) / MAX_BPS;
+        return fee;
+    }
+
+    
+    
+    
+    function _calculatePerformanceFee(uint256 _amount)
+        internal
+        view
+        returns (uint256, uint256)
+    {
+        uint256 governancePerformanceFee = _calculateFee(
+            _amount,
+            performanceFeeGovernance
+        );
+
+        uint256 strategistPerformanceFee = _calculateFee(
+            _amount,
+            performanceFeeStrategist
+        );
+
+        return (governancePerformanceFee, strategistPerformanceFee);
+    }
+
+    
+    
+    
+    
+    function _mintSharesFor(
+        address recipient,
+        uint256 _amount,
+        uint256 _pool
+    ) internal {
+        uint256 shares;
+        if (totalSupply() == 0) {
+            shares = _amount;
+        } else {
+            shares = (_amount * totalSupply()) / _pool;
+        }
+        _mint(recipient, shares);
+    }
+
+    
+    
+    
+    function _handleFees(uint256 _harvestedAmount, uint256 harvestTime)
+        internal
+    {
+        (
+            uint256 feeGovernance,
+            uint256 feeStrategist
+        ) = _calculatePerformanceFee(_harvestedAmount);
+        uint256 duration = harvestTime - lastHarvestedAt;
+
+        
+        uint256 management_fee = managementFee > 0
+            ? (managementFee * (balance() - _harvestedAmount) * duration) /
+                SECS_PER_YEAR /
+                MAX_BPS
+            : 0;
+        uint256 totalGovernanceFee = feeGovernance + management_fee;
+
+        
+        
+        
+        uint256 _pool = balance() - totalGovernanceFee - feeStrategist;
+
+        
+        if (totalGovernanceFee != 0) {
+            _mintSharesFor(treasury, totalGovernanceFee, _pool);
+        }
+
+        if (feeStrategist != 0 && strategist != address(0)) {
+            
+            _mintSharesFor(
+                strategist,
+                feeStrategist,
+                _pool + totalGovernanceFee
+            );
+        }
+    }
+}",4603,3,0,"{
+  ""task_list"": [
+    {
+      ""Area"": ""Access Control"",
+      ""Tasks"": [
+        ""Verify the correct implementation of `SettAccessControl` and ensure that only authorized addresses can call privileged functions (e.g., `earn`, `setTreasury`, `setStrategy`, fee updates, pause/unpause)."",
+        ""Confirm that the `guardian` address can only pause and unpause the contract, and cannot perform other administrative actions."",
+        ""Ensure that the `_onlyGovernanceOrStrategist` modifier correctly restricts access to functions that should be accessible to either the governance or the strategist role."",
+        ""Verify that the check `IStrategy(strategy).balanceOf() == 0` in `setStrategy` prevents changing the strategy while it still holds assets, and assess potential vulnerabilities if the strategy is malicious or unresponsive."",
+        ""Analyze the interaction between `pauseDeposits` and the main `pause` function. Confirm that the intended behavior is that `pause` halts *all* activity while `pauseDeposits` only blocks new deposits.""
+      ]
+    },
+    {
+      ""Area"": ""Fee Calculation and Distribution"",
+      ""Tasks"": [
+        ""Thoroughly review the fee calculation logic in `_calculateFee`, `_calculatePerformanceFee`, and `_handleFees` for potential rounding errors, integer overflows, or division by zero."",
+        ""Confirm that the management fee calculation using `SECS_PER_YEAR` correctly annualizes the fee and that the `duration` calculation is accurate, especially across long time periods or initial harvests."",
+        ""Analyze the logic for minting shares to the `treasury` and `strategist` during fee distribution. Verify that the share calculation in `_mintSharesFor` accurately reflects the value being transferred without unintended dilution or inflation."",
+        ""Investigate potential edge cases or vulnerabilities related to the `assetsAtLastHarvest` state variable and its update logic in `reportHarvest`. Ensure it is consistent with the intended tracking of assets for management fee calculations."",
+        ""Assess the impact of setting fees to zero. Confirm this does not introduce unintended behavior or vulnerabilities.""
+      ]
+    },
+    {
+      ""Area"": ""Withdrawal and Vesting Logic"",
+      ""Tasks"": [
+        ""Review the withdrawal logic in `_withdraw` for potential reentrancy vulnerabilities, despite the `nonReentrant` modifier, considering interactions with the strategy and vesting contracts."",
+        ""Analyze the interaction with the `IVesting` contract and confirm that the `setupVesting` function behaves as expected and does not introduce vulnerabilities (e.g., ability to withdraw funds prematurely). Determine what the expected behaviour of the vesting contract is."",
+        ""Verify that the withdrawal fee is correctly applied and that the shares are minted to the treasury as intended. Confirm the value transfer and share calculation."",
+        ""Evaluate the potential for denial-of-service (DoS) attacks during withdrawals if the strategy becomes unresponsive or the vault is holding a large number of tokens.""
+      ],
+       ""Area"": ""Strategy Interaction and Trust Assumptions"",
+      ""Tasks"": [
+        ""Analyze all interactions with the `IStrategy` contract (e.g., `earn`, `reportHarvest`, `reportAdditionalToken`, `withdrawToVault`, `sweepExtraToken`). Identify any potential vulnerabilities arising from malicious or buggy strategy implementations."",
+        ""Verify that the `onlyStrategy` modifier is correctly used and prevents unauthorized addresses from calling strategy-specific functions."",
+        ""Assess the risks associated with trusting the `strategy` to accurately report harvested amounts and additional tokens in `reportHarvest` and `reportAdditionalToken`."",
+        ""Evaluate the potential for the `strategy` to manipulate the vault's state or steal funds, even with the existing access controls and checks."",
+        ""Consider the impact of a non-ERC20 compliant token being sent to `reportAdditionalToken` and whether `safeTransfer` calls could revert the transaction.""
+      ]
+    },
+    {
+      ""Area"": ""Deposit Authorization (Guest List)"",
+      ""Tasks"": [
+        ""If a `guestList` contract is used, analyze the authorization logic in `_depositForWithAuthorization` and ensure that it is secure and prevents unauthorized deposits."",
+        ""Assess potential vulnerabilities related to front-running or manipulation of the off-chain proof generation or on-chain verification in the `guestList` contract."",
+        ""Investigate whether the `guestList` contract can be bypassed or manipulated to allow unauthorized deposits.""
+      ]
+    },
+    {
+      ""Area"": ""Emergency Stop and Pause Functionality"",
+      ""Tasks"": [
+        ""Verify that the `pause` and `unpause` functions correctly disable and enable the intended functionalities."",
+        ""Analyze the impact of pausing the contract on existing deposits and ongoing yield generation."",
+        ""Evaluate the effectiveness of the emergency stop mechanism in preventing loss of funds in case of a critical vulnerability or attack.""
+      ]
+    },
+    {
+      ""Area"": ""Token Handling and Accounting"",
+      ""Tasks"": [
+        ""Review all token transfers using `safeTransfer` and `safeTransferFrom` to ensure they are handled correctly and do not introduce vulnerabilities."",
+        ""Check for potential integer overflows or underflows in calculations involving token balances and amounts."",
+        ""Verify that the contract's accounting is accurate and that the `balance` and `getPricePerFullShare` functions return the correct values.""
+      ]
+    },
+     {
+      ""Area"": ""Additional Reward Token Handling"",
+      ""Tasks"": [
+        ""Check that `reportAdditionalToken` function does not allow reporting of the underlying token, which is intended."",
+        ""Verify correct fee calculations within `reportAdditionalToken`, especially related to governance and strategist rewards."",
+        ""Verify that balance checks within `reportAdditionalToken` are safe against manipulation and the contract behaves as expected if there are no available tokens, before and after the transfer of fees.""
+      ]
+    }
+  ]
+}","{
+  ""ReviewingTheCode"": ""The contract `StakedCitadel` implements a yield-bearing vault system, likely part of the Badger/Citadel ecosystem. It allows users to deposit an ERC20 token and receive shares representing their stake in the vault. The deposited tokens are intended to be utilized by an external `strategy` contract to generate yield. The vault handles deposits, withdrawals (with potential vesting), fee collection (performance, withdrawal, management), and interactions with the strategy, treasury, and reward distribution contracts. It inherits standard OpenZeppelin upgradeable contracts for ERC20 functionality, pausable features, reentrancy protection, and relies on a custom `SettAccessControl` for role management. It includes mechanisms for handling primary yield (`token`) and additional reward tokens."",
+  ""IdentifyingKeyComponents"": {
+    ""ContractName"": ""StakedCitadel"",
+    ""Purpose"": ""Acts as an upgradeable yield aggregation vault (Sett) for a specific ERC20 token. Users deposit tokens, receive vault shares (xTokens), and earn yield generated by an associated strategy contract, minus fees."",
+    ""InheritanceAndImports"": {
+      ""InheritsFrom"": [
+        ""ERC20Upgradeable"",
+        ""SettAccessControl"",
+        ""PausableUpgradeable"",
+        ""ReentrancyGuardUpgradeable""
+      ],
+      ""Imports"": [
+        ""openzeppelin-contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol"",
+        ""openzeppelin-contracts-upgradeable/utils/AddressUpgradeable.sol"",
+        ""openzeppelin-contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"",
+        ""openzeppelin-contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol"",
+        ""openzeppelin-contracts-upgradeable/security/PausableUpgradeable.sol"",
+        ""openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"",
+        ""./lib/SettAccessControl.sol"",
+        ""./interfaces/badger/IVault.sol"",
+        ""./interfaces/citadel/IVesting.sol"",
+        ""./interfaces/badger/IStrategy.sol"",
+        ""./interfaces/erc20/IERC20.sol"",
+        ""./interfaces/badger/IBadgerGuestlist.sol""
+      ]
+    },
+    ""StateVariables"": [
+      {
+        ""Name"": ""token"",
+        ""Type"": ""IERC20Upgradeable"",
+        ""Purpose"": ""The underlying ERC20 token that is deposited into the vault.""
+      },
+      {
+        ""Name"": ""guestList"",
+        ""Type"": ""IBadgerGuestlist"",
+        ""Purpose"": ""Optional contract to enforce deposit authorization rules (e.g., whitelist).""
+      },
+      {
+        ""Name"": ""pausedDeposit"",
+        ""Type"": ""bool"",
+        ""Purpose"": ""Flag to specifically pause deposit functionality, separate from the main pause mechanism.""
+      },
+      {
+        ""Name"": ""strategy"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address of the contract that implements the yield generation strategy.""
+      },
+      {
+        ""Name"": ""guardian"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address authorized to pause the contract (along with governance).""
+      },
+      {
+        ""Name"": ""treasury"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address where governance fees (performance, withdrawal, management) are sent.""
+      },
+      {
+        ""Name"": ""badgerTree"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address where additional (non-primary) reward tokens are sent for distribution.""
+      },
+      {
+        ""Name"": ""vesting"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address of the vesting contract where withdrawn funds are sent for users.""
+      },
+      {
+        ""Name"": ""lifeTimeEarned"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Total amount of primary `token` harvested over the vault's lifetime.""
+      },
+      {
+        ""Name"": ""lastHarvestedAt"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Timestamp of the last harvest event.""
+      },
+      {
+        ""Name"": ""lastHarvestAmount"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Amount of primary `token` harvested in the last harvest event.""
+      },
+      {
+        ""Name"": ""assetsAtLastHarvest"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Total underlying assets managed by the vault *before* the last harvest was accounted for.""
+      },
+      {
+        ""Name"": ""additionalTokensEarned"",
+        ""Type"": ""mapping(address => uint256)"",
+        ""Purpose"": ""Tracks the total lifetime amount earned for each additional reward token.""
+      },
+      {
+        ""Name"": ""lastAdditionalTokenAmount"",
+        ""Type"": ""mapping(address => uint256)"",
+        ""Purpose"": ""Tracks the amount reported in the last `reportAdditionalToken` call for each token.""
+      },
+      {
+        ""Name"": ""performanceFeeGovernance"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Performance fee percentage (in BPS) distributed to the treasury.""
+      },
+      {
+        ""Name"": ""performanceFeeStrategist"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Performance fee percentage (in BPS) distributed to the strategist.""
+      },
+      {
+        ""Name"": ""withdrawalFee"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Withdrawal fee percentage (in BPS) charged on withdrawals.""
+      },
+      {
+        ""Name"": ""managementFee"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Management fee percentage (in BPS, annualized) charged on total assets.""
+      },
+      {
+        ""Name"": ""maxPerformanceFee"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Maximum allowable performance fee (gov + strategist combined cannot exceed this, although logic seems per-fee).""
+      },
+      {
+        ""Name"": ""maxWithdrawalFee"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Maximum allowable withdrawal fee.""
+      },
+      {
+        ""Name"": ""maxManagementFee"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Maximum allowable management fee.""
+      },
+      {
+        ""Name"": ""toEarnBps"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Basis points representing the target proportion of vault balance to be sent to the strategy via `earn()`.""
+      },
+      {
+        ""Name"": ""MAX_BPS"",
+        ""Type"": ""uint256 constant"",
+        ""Purpose"": ""Constant for basis points calculation (10,000).""
+      },
+      {
+        ""Name"": ""SECS_PER_YEAR"",
+        ""Type"": ""uint256 constant"",
+        ""Purpose"": ""Constant for annualization calculations.""
+      },
+      {
+        ""Name"": ""WITHDRAWAL_FEE_HARD_CAP"",
+        ""Type"": ""uint256 constant"",
+        ""Purpose"": ""Hard cap limit for withdrawal fees (2%).""
+      },
+      {
+        ""Name"": ""PERFORMANCE_FEE_HARD_CAP"",
+        ""Type"": ""uint256 constant"",
+        ""Purpose"": ""Hard cap limit for performance fees (30%).""
+      },
+      {
+        ""Name"": ""MANAGEMENT_FEE_HARD_CAP"",
+        ""Type"": ""uint256 constant"",
+        ""Purpose"": ""Hard cap limit for management fees (2%).""
+      }
+    ],
+    ""FunctionsAndModifiers"": [
+      {
+        ""Name"": ""initialize"",
+        ""Visibility"": ""public"",
+        ""Purpose"": ""Initializes the contract state, setting roles, fees, token, name, symbol. Uses `initializer` modifier for upgrade safety."",
+        ""Parameters"": [
+          ""_token"",
+          ""_governance"",
+          ""_keeper"",
+          ""_guardian"",
+          ""_treasury"",
+          ""_strategist"",
+          ""_badgerTree"",
+          ""_vesting"",
+          ""_name"",
+          ""_symbol"",
+          ""_feeConfig""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_onlyAuthorizedPausers"",
+        ""Visibility"": ""internal view"",
+        ""Purpose"": ""Modifier/check ensuring caller is governance or guardian."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_onlyStrategy"",
+        ""Visibility"": ""internal view"",
+        ""Purpose"": ""Modifier/check ensuring caller is the registered strategy."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""version"",
+        ""Visibility"": ""external pure"",
+        ""Purpose"": ""Returns the contract version string."",
+        ""Parameters"": [],
+        ""Returns"": [
+          ""string""
+        ]
+      },
+      {
+        ""Name"": ""getPricePerFullShare"",
+        ""Visibility"": ""public view"",
+        ""Purpose"": ""Calculates the value of one full share in terms of the underlying token."",
+        ""Parameters"": [],
+        ""Returns"": [
+          ""uint256""
+        ]
+      },
+      {
+        ""Name"": ""balance"",
+        ""Visibility"": ""public view"",
+        ""Purpose"": ""Returns the balance of the underlying token held directly by the vault contract."",
+        ""Parameters"": [],
+        ""Returns"": [
+          ""uint256""
+        ]
+      },
+      {
+        ""Name"": ""available"",
+        ""Visibility"": ""public view"",
+        ""Purpose"": ""Returns the amount of underlying token currently held by the vault that is available to be sent to the strategy via `earn()`."",
+        ""Parameters"": [],
+        ""Returns"": [
+          ""uint256""
+        ]
+      },
+      {
+        ""Name"": ""deposit"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows a user to deposit a specific amount of the underlying token. Uses `whenNotPaused`."",
+        ""Parameters"": [
+          ""_amount""
+        ],
+        ""Returns"": []
+      },
+       {
+        ""Name"": ""deposit (with proof)"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows a user to deposit a specific amount, potentially requiring proof for a guest list. Uses `whenNotPaused`."",
+        ""Parameters"": [
+          ""_amount"",
+          ""proof""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""depositAll"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows a user to deposit their entire balance of the underlying token. Uses `whenNotPaused`."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+       {
+        ""Name"": ""depositAll (with proof)"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows a user to deposit their entire balance, potentially requiring proof for a guest list. Uses `whenNotPaused`."",
+        ""Parameters"": [
+          ""proof""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""depositFor"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows depositing tokens on behalf of another recipient. Uses `whenNotPaused`."",
+        ""Parameters"": [
+          ""_recipient"",
+          ""_amount""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""depositFor (with proof)"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows depositing tokens on behalf of another recipient, potentially requiring proof. Uses `whenNotPaused`."",
+        ""Parameters"": [
+          ""_recipient"",
+          ""_amount"",
+          ""proof""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""withdraw"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows a user to withdraw underlying tokens by burning a specific amount of vault shares. Uses `whenNotPaused` and `nonReentrant`."",
+        ""Parameters"": [
+          ""_shares""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""withdrawAll"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows a user to withdraw all their underlying tokens by burning all their vault shares. Uses `whenNotPaused`."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""reportHarvest"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Called by the strategy to report earned underlying tokens (harvest). Calculates and distributes fees, updates tracking variables. Uses `nonReentrant`, `_onlyStrategy`."",
+        ""Parameters"": [
+          ""_harvestedAmount""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""reportAdditionalToken"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Called by the strategy to report earned tokens other than the primary underlying token. Distributes fees and sends remainder to BadgerTree. Uses `nonReentrant`, `_onlyStrategy`."",
+        ""Parameters"": [
+          ""_token""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setTreasury"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Updates the treasury address. Requires governance."",
+        ""Parameters"": [
+          ""_treasury""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setStrategy"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Updates the strategy address. Requires governance and that the old strategy has no balance."",
+        ""Parameters"": [
+          ""_strategy""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setMaxWithdrawalFee"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the maximum withdrawal fee. Requires governance."",
+        ""Parameters"": [
+          ""_fees""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setMaxPerformanceFee"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the maximum performance fee. Requires governance."",
+        ""Parameters"": [
+          ""_fees""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setMaxManagementFee"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the maximum management fee. Requires governance."",
+        ""Parameters"": [
+          ""_fees""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setGuardian"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the guardian address. Requires governance."",
+        ""Parameters"": [
+          ""_guardian""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setVesting"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the vesting contract address. Requires governance."",
+        ""Parameters"": [
+          ""_vesting""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setToEarnBps"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the `toEarnBps` parameter. Requires governance or strategist."",
+        ""Parameters"": [
+          ""_newToEarnBps""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setGuestList"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the guest list contract address. Requires governance or strategist."",
+        ""Parameters"": [
+          ""_guestList""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setWithdrawalFee"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the withdrawal fee (must be <= max). Requires governance or strategist."",
+        ""Parameters"": [
+          ""_withdrawalFee""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setPerformanceFeeStrategist"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the strategist performance fee (must be <= max). Requires governance or strategist."",
+        ""Parameters"": [
+          ""_performanceFeeStrategist""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setPerformanceFeeGovernance"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the governance performance fee (must be <= max). Requires governance or strategist."",
+        ""Parameters"": [
+          ""_performanceFeeGovernance""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setManagementFee"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the management fee (must be <= max). Requires governance or strategist."",
+        ""Parameters"": [
+          ""_fees""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""withdrawToVault"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Instructs the strategy to return all its funds to the vault. Requires governance or strategist."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""emitNonProtectedToken"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Instructs the strategy to potentially rescue/emit specific non-strategy tokens it might hold. Requires governance or strategist."",
+        ""Parameters"": [
+          ""_token""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""sweepExtraToken"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Withdraws a specified non-primary token from the strategy and sends it to governance. Requires governance or strategist."",
+        ""Parameters"": [
+          ""_token""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""earn"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sends available underlying tokens from the vault to the strategy to be put to work. Requires authorized actors (defined in SettAccessControl) and deposits not paused."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""pauseDeposits"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Pauses the deposit functionality. Requires guardian or governance."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""unpauseDeposits"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Unpauses the deposit functionality. Requires governance."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""pause"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Pauses all pausable functionality (deposits, withdrawals via `whenNotPaused`). Requires guardian or governance."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""unpause"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Unpauses the contract. Requires governance."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_depositFor"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Core logic for handling deposits, transferring tokens, and minting shares. Uses `nonReentrant`."",
+        ""Parameters"": [
+          ""_recipient"",
+          ""_amount""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_depositWithAuthorization"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Internal wrapper for deposits by `msg.sender`, potentially calling guest list check."",
+        ""Parameters"": [
+          ""_amount"",
+          ""proof""
+        ],
+        ""Returns"": []
+      },
+       {
+        ""Name"": ""_depositForWithAuthorization"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Internal wrapper for deposits for a recipient, potentially calling guest list check."",
+        ""Parameters"": [
+          ""_recipient"",
+          ""_amount"",
+          ""proof""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_withdraw"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Core logic for handling withdrawals, burning shares, calculating amounts, interacting with strategy if needed, calculating fees, and transferring funds to the vesting contract. Uses `nonReentrant`."",
+        ""Parameters"": [
+          ""_shares""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_calculateFee"",
+        ""Visibility"": ""internal pure"",
+        ""Purpose"": ""Helper function to calculate a fee based on an amount and basis points."",
+        ""Parameters"": [
+          ""amount"",
+          ""feeBps""
+        ],
+        ""Returns"": [
+          ""uint256""
+        ]
+      },
+      {
+        ""Name"": ""_calculatePerformanceFee"",
+        ""Visibility"": ""internal view"",
+        ""Purpose"": ""Calculates both governance and strategist performance fees."",
+        ""Parameters"": [
+          ""_amount""
+        ],
+        ""Returns"": [
+          ""uint256"",
+          ""uint256""
+        ]
+      },
+      {
+        ""Name"": ""_mintSharesFor"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Calculates and mints vault shares for a recipient based on the amount of underlying token added and the current pool state."",
+        ""Parameters"": [
+          ""recipient"",
+          ""_amount"",
+          ""_pool""
+        ],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""_handleFees"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Calculates performance and management fees during harvest and mints corresponding shares to treasury and strategist."",
+        ""Parameters"": [
+          ""_harvestedAmount"",
+          ""harvestTime""
+        ],
+        ""Returns"": []
+      }
+    ]
+  },
+  ""ExternalInteractions"": [
+    ""Underlying `token` (IERC20Upgradeable): `balanceOf`, `safeTransferFrom`, `safeTransfer`."",
+    ""Strategy (`strategy` address implementing `IStrategy`): `balanceOf`, `withdrawToVault`, `earn`, `withdraw`, `emitNonProtectedToken`, `withdrawOther`. Receives calls from vault, calls `reportHarvest`, `reportAdditionalToken` back to vault."",
+    ""Guest List (`guestList` address implementing `IBadgerGuestlist`): `authorized` (called during deposit)."",
+    ""Vesting Contract (`vesting` address implementing `IVesting`): `setupVesting` (called during withdrawal). Receives withdrawn tokens."",
+    ""Treasury (`treasury` address): Receives shares minted for fees."",
+    ""Strategist (`strategist` address): Receives shares minted for performance fees."",
+    ""Badger Tree (`badgerTree` address): Receives additional reward tokens via `safeTransfer`."",
+    ""Governance (`governance` address): Implicitly involved via `SettAccessControl` for admin functions. Receives swept tokens."",
+    ""Keeper (`keeper` address): Implicitly involved via `SettAccessControl` (likely for `earn`)."",
+    ""Any arbitrary ERC20 token (`_token` in `reportAdditionalToken`, `sweepExtraToken`, `emitNonProtectedToken`): `balanceOf`, `safeTransfer`.""
+  ],
+  ""SpecialMechanisms"": [
+    ""Upgradeable Contract Pattern: Utilizes OpenZeppelin Upgradeable contracts and `initializer`."",
+    ""Yield Aggregation Vault Pattern: Standard model of depositing assets, deploying to a strategy, and sharing yield."",
+    ""Complex Fee Structure: Implements performance fees (governance & strategist), withdrawal fees, and management fees. Fees are often paid by minting new vault shares to the fee recipient."",
+    ""Dual Pause Mechanism: Features both a global pause (`PausableUpgradeable`) and a specific deposit pause (`pausedDeposit`)."",
+    ""Role-Based Access Control: Uses `SettAccessControl` (governance, keeper, strategist roles) and a dedicated `guardian` role for pausing."",
+    ""Optional Guest List: Can integrate with an `IBadgerGuestlist` contract for deposit authorization."",
+    ""Vesting on Withdrawal: Withdrawals are routed through a separate `vesting` contract instead of directly to the user."",
+    ""Additional Reward Token Handling: Mechanism to process and distribute non-primary reward tokens via `reportAdditionalToken` and `badgerTree`."",
+    ""Reentrancy Guard: Applied to critical state-changing functions like deposit, withdraw, and harvest reporting.""
+  ],
+  ""Questions"": [
+    ""What are the specific roles and permissions defined in the imported `SettAccessControl` contract (e.g., `_onlyGovernance`, `_onlyAuthorizedActors`, `_onlyGovernanceOrStrategist`)?"",
+    ""What is the exact behavior of the `IVesting(vesting).setupVesting(user, amount, timestamp)` function? Does it impose a lockup or linear vest, and what are the implications for users withdrawing funds?"",
+    ""Are there potential edge cases or precision issues in the management fee calculation, especially concerning the `duration` and `assetsAtLastHarvest` updates around the very first harvest or long intervals between harvests?"",
+    ""The withdrawal fee is paid by minting shares to the treasury. Confirm the share calculation basis (`_mintSharesFor(treasury, _fee, balance() - _fee)`) correctly reflects the value transfer without unintended dilution."",
+    ""How is the `assetsAtLastHarvest` state variable used elsewhere? Its update logic in `reportHarvest` seems slightly complex and might need review depending on its usage."",
+    ""Given the potential for multiple external calls in `_withdraw` (strategy, token transfer, vesting), what are the gas cost implications and potential risks (e.g., out-of-gas)?"",
+    ""If a `guestList` is used, what measures are in place to prevent potential front-running or manipulation related to the off-chain proof generation or on-chain verification?"",
+    ""Is there a mechanism to handle the case where the strategy becomes unresponsive or malicious, beyond `withdrawToVault` which still relies on the strategy cooperating?""
+  ]
+}","{
+  ""Findings"": [
+    {
+      ""Issue"": ""Potential Reentrancy Vulnerability in `_withdraw` Function"",
+      ""Severity"": ""High"",
+      ""Description"": ""The `_withdraw` function calls `IVesting(vesting).setupVesting` before transferring tokens. If `setupVesting` or the token transfer in it performs a callback to the StakedCitadel contract, it can re-enter `_withdraw`, potentially leading to state inconsistencies and double withdrawals.  Additionally, the `sweepExtraToken` function allows governance/strategist to transfer out tokens, and if the `_token` is malicious or the governance contract is malicious, the `safeTransfer` call could trigger a reentrancy attack."",
+      ""Impact"": ""Loss of funds, state manipulation, denial of service due to reentrancy exploits."",
+      ""Location"": ""Function `_withdraw` in `StakedCitadel.sol`, sweepExtraToken function""
+    },
+    {
+      ""Issue"": ""Potential Reentrancy in `reportAdditionalToken`"",
+      ""Severity"": ""High"",
+      ""Description"": ""The `reportAdditionalToken` function transfers tokens using `safeTransfer` to the treasury, strategist, and `badgerTree`. The `nonReentrant` modifier doesn't protect against a malicious token contract calling back into `StakedCitadel` during these transfers. This allows a re-entry and manipulation of state before the initial transfer is completed, leading to unintended consequences."",
+      ""Impact"": ""Potential loss of funds or unexpected state changes due to reentrancy vulnerability. A malicious or compromised strategy could take advantage of this. The impact can be severe, as it permits the attacker to drain the contract of the `_token` being transferred."",
+      ""Location"": ""reportAdditionalToken function, lines 333-345, StakedCitadel.sol:309, StakedCitadel.sol:455, StakedCitadel.sol:467""
+    },
+    {
+      ""Issue"": ""Missing Access Control for `earn` Function"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `earn` function is protected by `_onlyAuthorizedActors()`. However, the logic for `_onlyAuthorizedActors()` is missing or unclear. This allows potentially unauthorized users to trigger `earn`, leading to unintended transfers of assets to the strategy. Also, `pause` and `unpause` functionalities have different access controls, where `pauseDeposits` can be called by `guardian` or `governance` but `unpauseDeposits` can only be called by `governance`. If the `governance` address is compromised or unavailable, the contract can remain permanently paused. The unprotected `pause` function allows it to be indefinitely paused by the guardian."",
+      ""Impact"": ""Unauthorized users could trigger `earn`, disrupting vault operations and potentially causing financial loss. The guardian may cause indefinite pauses."",
+      ""Location"": ""Function `earn` in `StakedCitadel.sol`, pause() and unpause(), StakedCitadel.sol:482-486, StakedCitadel.sol:494-498, StakedCitadel.sol:pauseDeposits""
+    },
+    {
+      ""Issue"": ""Missing Input Validation on Fee Configurations"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `initialize` function checks if provided fee configurations are less than or equal to hard caps, but does not check if they are non-negative, or if the *sum* of `performanceFeeGovernance` and `performanceFeeStrategist` is reasonable. `setMaxWithdrawalFee`, `setMaxPerformanceFee`, and `setMaxManagementFee` lack input validation beyond checking against their respective hard caps, potentially allowing a malicious governance/strategist to set excessively high fees. The `setGuestList` function does not validate if the provided `_guestList` address is a contract, leading to potential bypass of access control."",
+      ""Impact"": ""Excessive fees, potential for incorrect fee calculations, denial of service, bypass of deposit authorization checks, and exploits."",
+      ""Location"": ""initialize function, setMaxWithdrawalFee, setMaxPerformanceFee, setMaxManagementFee, setPerformanceFeeGovernance, setPerformanceFeeStrategist, setGuestList function, StakedCitadel.sol:488""
+    },
+    {
+      ""Issue"": ""Lack of Slippage Control"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `earn` function directly transfers tokens to the strategy without considering potential slippage. Also, the `reportHarvest` function has no mechanism to verify the reported amount against the actual increase. The `withdraw` function attempts to retrieve tokens from the strategy, there is no slippage protection, which may cause the withdrawal to fail."",
+      ""Impact"": ""Loss of funds due to slippage in strategy operations, potential for a compromised strategy to manipulate harvest reporting and excessive fees, withdrawal may fail."",
+      ""Location"": ""StakedCitadel.sol:earn, reportHarvest function, lines 300, withdraw function, StakedCitadel.sol:477-480""
+    },
+    {
+      ""Issue"": ""Potential for DoS"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `earn()` function could revert and halt operation due to transfer failures. The `_withdraw` function could revert if the strategy's `withdraw` function reverts. A deposit can fail if the `safeTransferFrom` reverts because of insufficient user balance."",
+      ""Impact"": ""System becomes unresponsive, preventing further earning or withdrawals, and gas wasted."",
+      ""Location"": ""earn() function, StakedCitadel.sol:607, StakedCitadel.sol:_depositFor""
+    },
+    {
+      ""Issue"": ""Lack of Input Validation for Fees"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""While `setMaxWithdrawalFee`, `setMaxPerformanceFee`, and `setMaxManagementFee` have hard caps, the functions setting the actual fees (`setWithdrawalFee`, `setPerformanceFeeStrategist`, `setPerformanceFeeGovernance`, `setManagementFee`) only check against the maximum allowed value. Malicious actor could observe a transaction setting a lower fee and submit a transaction with a slightly higher gas price to have their transaction executed first."",
+      ""Impact"": ""Potential for significant fee extraction by malicious actors, users may be charged higher fees than intended."",
+      ""Location"": ""setWithdrawalFee, setPerformanceFeeStrategist, setPerformanceFeeGovernance, setManagementFee""
+    },
+    {
+      ""Issue"": ""Potential Reentrancy in `sweepExtraToken` Function"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `sweepExtraToken` function allows a governance/strategist-controlled strategy contract to withdraw tokens and transfer them to the governance address. The governance address might be a contract, and if that contract implements a fallback function that calls back into this contract, it could lead to a reentrancy issue."",
+      ""Impact"": ""Potential for malicious governance/strategist-controlled contracts to drain funds or manipulate the contract state due to reentrancy."",
+      ""Location"": ""sweepExtraToken function""
+    },
+    {
+      ""Issue"": ""Potential Front-Running on Fee Updates"",
+      ""Severity"": ""Low"",
+      ""Description"": ""Functions like `setWithdrawalFee`, `setPerformanceFeeStrategist`, `setPerformanceFeeGovernance`, and `setManagementFee` can be front-run. A malicious actor could observe a transaction setting a lower fee and submit a transaction with a slightly higher gas price to have their transaction executed first, potentially setting a higher fee than intended and exploiting users."",
+      ""Impact"": ""Possible financial exploitation of users due to unexpected fee changes."",
+      ""Location"": ""setWithdrawalFee, setPerformanceFeeStrategist, setPerformanceFeeGovernance, setManagementFee functions""
+    },
+    {
+      ""Issue"": ""Precision Loss in Calculations"",
+      ""Severity"": ""Low"",
+      ""Description"": ""Share calculations in `_mintSharesFor` and fee calculations in `_handleFees` and `_calculateFee` can lead to precision loss due to integer division. This can impact reward distribution, user balances, and treasury/strategist revenue, especially for small deposits or large fees."",
+      ""Impact"": ""Slight inaccuracies in share representation, potentially disadvantaging users making small deposits or leading to a minor loss of revenue for the treasury/strategist."",
+      ""Location"": ""_mintSharesFor function, _handleFees, _calculateFee, StakedCitadel.sol:_calculateFee""
+    },
+    {
+      ""Issue"": ""Incorrect Accounting and Handling of Assets at Last Harvest"",
+      ""Severity"": ""Low"",
+      ""Description"": ""In the `reportHarvest` function, incorrect logic may lead to `assetsAtLastHarvest` being set to zero in unintended scenarios, leading to incorrect calculations based on stale state or incorrect calculations for APY."",
+      ""Impact"": ""Potentially incorrect calculation of yield or other metrics that rely on `assetsAtLastHarvest`, making it harder to calculate performance of the underlying strategy."",
+      ""Location"": ""reportHarvest function""
+    },
+    {
+      ""Issue"": ""Redundant Check in `reportAdditionalToken` function"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The `reportAdditionalToken` function includes a check `require(address(token) != _token, \\""No want\\"");`. This check prevents the strategy from reporting the main underlying token of the vault as an additional token. However, because this function should only be called by the strategy it may not necessarily be an attack vector, and so could be viewed as redundant. If the strategy *did* somehow call this function with the `token` address, it\'s likely an issue with the strategy itself."",
+      ""Impact"": ""N/A"",
+      ""Location"": ""reportAdditionalToken function""
+    },
+    {
+      ""Issue"": ""Unbounded Approval in `deposit` functions"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The deposit functions (`deposit`, `depositAll`, `depositFor`) use `token.safeTransferFrom(msg.sender, address(this), _amount)`. If the user has not already approved the StakedCitadel contract for the `_amount` of tokens, they will need to grant approval.  It\'s generally recommended to approve only the necessary amount of tokens to mitigate the risk of an attacker draining a user\'s wallet if the StakedCitadel contract is compromised."",
+      ""Impact"": ""If the user approves a large amount and the StakedCitadel contract is compromised, the attacker could drain the user\'s tokens."",
+      ""Location"": ""Functions `_depositFor` in `StakedCitadel.sol`""
+    },
+    {
+      ""Issue"": ""Potential Integer Overflow in Management Fee Calculation"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The `management_fee` calculation uses the formula `(managementFee * (balance() - _harvestedAmount) * duration) / SECS_PER_YEAR / MAX_BPS`.  If `managementFee`, `balance()`, and `duration` are large enough, the intermediate multiplication `(managementFee * (balance() - _harvestedAmount) * duration)` could potentially overflow, leading to an incorrect (smaller) management fee being calculated and paid out."",
+      ""Impact"": ""The treasury might not receive the correct management fee due to integer overflow, leading to a small financial loss over time."",
+      ""Location"": ""Function `_handleFees` in `StakedCitadel.sol`""
+    },
+    {
+      ""Issue"": ""Missing Check for Zero Address in `setGuestList`"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The `setGuestList` function allows the governance or strategist to update the `guestList` address. However, it lacks a check to prevent setting the `guestList` to the zero address. This could lead to a situation where guest list authorization is effectively disabled, potentially bypassing intended restrictions on deposits."",
+      ""Impact"": ""Bypass of guest list authorization leading to unintended deposits. This can break the logic of whitelisted deposits."",
+      ""Location"": ""setGuestList function""
+    },
+    {
+      ""Issue"": ""Potential Front-Running in Fee Setting Functions"",
+      ""Severity"": ""Low"",
+      ""Description"": ""Functions like `setWithdrawalFee`, `setPerformanceFeeStrategist`, `setPerformanceFeeGovernance`, and `setManagementFee` can be front-run. A malicious actor could observe a transaction setting a lower fee and submit a transaction with a slightly higher gas price to have their transaction executed first, potentially setting a higher fee than intended and exploiting users."",
+      ""Impact"": ""Possible financial exploitation of users due to unexpected fee changes."",
+      ""Location"": ""setWithdrawalFee, setPerformanceFeeStrategist, setPerformanceFeeGovernance, setManagementFee functions""
+    },
+    {
+      ""Issue"": ""Unprotected `version()` function."",
+      ""Severity"": ""Info"",
+      ""Description"": ""The `version()` function returns a hardcoded string value. This is not inherently a security concern, but can be spoofed by malicious contracts. In a world where it\'s important to have clear visibility of which version is deployed, and interacting with a given contract, a protected method would probably better suit this use case."",
+      ""Impact"": ""None"",
+      ""Location"": ""version function""
+    }
+  ],
+  ""IssueNumber"": 41,
+  ""OutputList"": 17
+}",260.2276780605316,18815.0,33.0,"### **Output**
+
+---
+
+**[H-01] StakedCitadel doesn't use correct balance for internal accounting**
+
+**Report Description**:
+The `balance()` function in the StakedCitadel contract is supposed to return the balance of the vault + the balance of the strategy. However, it only returns the balance of the vault. Since most of the funds are located in the strategy, the vault's balance will be very low. This incorrect accounting can lead to issues in determining the number of shares to mint or burn during deposits and withdrawals, potentially causing financial discrepancies.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of incorrect balance accounting in the `balance()` function. This is a critical oversight as it directly impacts the contract's financial logic and user funds.
+
+---
+
+**[H-02] StakedCitadel: wrong setupVesting function name**
+
+**Report Description**:
+In the `_withdraw` function of the StakedCitadel contract, the `setupVesting` function of the vesting contract is called. However, the correct function name in the StakedCitadelVester contract is `vest`. This mismatch will cause the `_withdraw` function to fail, preventing users from withdrawing their tokens.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of the incorrect function name in the `_withdraw` function. This is a critical bug that prevents users from withdrawing their tokens, leading to a denial of service.
+
+---
+
+**[H-03] StakedCitadel depositors can be attacked by the first depositor with depressing of vault token denomination**
+
+**Report Description**:
+The `deposit()` -> `_depositFor()` -> `_mintSharesFor()` call does not require a minimum amount and mints shares according to the provided amount. If the first depositor stakes a large amount, any subsequent deposit lower than the attacker's stake will result in 0 vault tokens being issued, effectively stealing the depositor's funds.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The response list does not address the issue of potential attacks by the first depositor due to the lack of a minimum deposit requirement. This is a significant vulnerability that can lead to loss of funds for subsequent depositors.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[H-01] StakedCitadel doesn't use correct balance for internal accounting**
+- **[H-02] StakedCitadel: wrong setupVesting function name**
+- **[H-03] StakedCitadel depositors can be attacked by the first depositor with depressing of vault token denomination**
+
+---
+
+### **Conclusion**
+The `response_list` does not adequately address the issues reported in the `issue` list. All three issues in the `issue` report are critical vulnerabilities that are either completely missed or misrepresented in the `response_list`. This indicates a significant gap in the coverage and accuracy of the responses provided.","```
+None.
+```",0.0
+Funding.sol,"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.12;
+
+import {SafeERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import {ReentrancyGuardUpgradeable} from ""openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""./interfaces/badger/IVault.sol"";
+import ""./interfaces/erc20/IERC20.sol"";
+import ""./lib/GlobalAccessControlManaged.sol"";
+import ""./lib/SafeERC20.sol"";
+import ""./interfaces/citadel/IMedianOracle.sol"";
+
+/**
+ * @notice Sells a token at a predetermined price to whitelisted buyers.
+ * TODO: Better revert strings
+ */
+contract Funding is GlobalAccessControlManaged, ReentrancyGuardUpgradeable {
+    using SafeERC20 for IERC20;
+
+    // Roles used from GAC
+    bytes32 public constant CONTRACT_GOVERNANCE_ROLE =
+        keccak256(""CONTRACT_GOVERNANCE_ROLE"");
+    bytes32 public constant POLICY_OPERATIONS_ROLE =
+        keccak256(""POLICY_OPERATIONS_ROLE"");
+    bytes32 public constant TREASURY_OPERATIONS_ROLE = keccak256(""TREASURY_OPERATIONS_ROLE"");
+    bytes32 public constant TREASURY_VAULT_ROLE =
+        keccak256(""TREASURY_VAULT_ROLE"");
+    bytes32 public constant KEEPER_ROLE = keccak256(""KEEPER_ROLE"");
+
+    uint256 public constant MAX_BPS = 10000;
+
+    IERC20 public citadel; /// token to distribute (in vested xCitadel form)
+    IVault public xCitadel; /// wrapped citadel form that is actually distributed
+    IERC20 public asset; /// token to take in WBTC / bibbtc LP / CVX / bveCVX
+
+    uint256 public citadelPriceInAsset; /// asset per citadel price eg. 1 WBTC (8 decimals) = 40,000 CTDL ==> price = 10^8 / 40,000
+    uint256 public minCitadelPriceInAsset; /// Lower bound on expected citadel price in asset terms. Used as circuit breaker oracle.
+    uint256 public maxCitadelPriceInAsset; /// Upper bound on expected citadel price in asset terms. Used as circuit breaker oracle.
+    bool public citadelPriceFlag; /// Flag citadel price for review by guardian if it exceeds min and max bounds;
+
+    uint256 public assetDecimalsNormalizationValue;
+
+    address public citadelPriceInAssetOracle;
+    address public saleRecipient;
+
+    struct FundingParams {
+        uint256 discount;
+        uint256 minDiscount;
+        uint256 maxDiscount;
+        address discountManager;
+        uint256 assetCumulativeFunded; /// persistent sum of asset amount in over lifetime of contract.
+        uint256 assetCap; /// Max asset token that can be taken in by the contract (defines the cap for citadel sold)
+    }
+
+    FundingParams public funding;
+
+    /// ==================
+    /// ===== Events =====
+    /// ==================
+
+    // TODO: we should conform to some interface here
+    event Deposit(
+        address indexed buyer,
+        uint256 assetIn,
+        uint256 citadelOutValue
+    );
+
+    event CitadelPriceInAssetUpdated(uint256 citadelPrice);
+
+    event CitadelPriceBoundsSet(uint256 minPrice, uint256 maxPrice);
+    event CitadelPriceFlag(uint256 price, uint256 minPrice, uint256 maxPrice);
+
+    event SaleRecipientUpdated(address indexed recipient);
+    event AssetCapUpdated(uint256 assetCap);
+
+    event Sweep(address indexed token, uint256 amount);
+    event ClaimToTreasury(address indexed token, uint256 amount);
+
+    modifier onlyCitadelPriceInAssetOracle() {
+        require(
+            msg.sender == citadelPriceInAssetOracle,
+            ""onlyCitadelPriceInAssetOracle""
+        );
+        _;
+    }
+
+    event DiscountLimitsSet(uint256 minDiscount, uint256 maxDiscount);
+    event DiscountSet(uint256 discount);
+    event DiscountManagerSet(address discountManager);
+
+    /// =======================
+    /// ===== Initializer =====
+    /// =======================
+
+    /**
+     * @notice Initializer.
+     * @param _gac Global access control
+     * @param _citadel The token this contract will return in a trade
+     * @param _asset The token this contract will receive in a trade
+     * @param _xCitadel Staked citadel, citadel will be granted to funders in this form
+     * @param _saleRecipient The address receiving the proceeds of the sale - will be citadel multisig
+     * @param _assetCap The max asset that the contract can take
+     */
+    function initialize(
+        address _gac,
+        address _citadel,
+        address _asset,
+        address _xCitadel,
+        address _saleRecipient,
+        address _citadelPriceInAssetOracle,
+        uint256 _assetCap
+    ) external initializer {
+        require(
+            _saleRecipient != address(0),
+            ""Funding: 0 sale""
+        );
+        require(
+            _citadelPriceInAssetOracle != address(0),
+            ""Funding: 0 oracle""
+        );
+
+        __GlobalAccessControlManaged_init(_gac);
+        __ReentrancyGuard_init();
+
+        citadel = IERC20(_citadel);
+        xCitadel = IVault(_xCitadel);
+        asset = IERC20(_asset);
+        saleRecipient = _saleRecipient;
+
+        citadelPriceInAssetOracle = _citadelPriceInAssetOracle;
+
+        funding = FundingParams(0, 0, 0, address(0), 0, _assetCap);
+
+        assetDecimalsNormalizationValue = 10**asset.decimals();
+
+        // No circuit breaker on price by default
+        minCitadelPriceInAsset = 0;
+        maxCitadelPriceInAsset = type(uint256).max;
+
+        // Allow to deposit in vault
+        // Done last for reEntrancy concerns
+        IERC20(_citadel).safeApprove(address(_xCitadel), type(uint256).max);
+    }
+
+    modifier onlyWhenPriceNotFlagged() {
+        require(
+            citadelPriceFlag == false,
+            ""Funding: citadel price from oracle flagged and pending review""
+        );
+        _;
+    }
+
+    /// ==========================
+    /// ===== Public actions =====
+    /// ==========================
+
+    /**
+     * @notice Exchange `_assetAmountIn` of `asset` for `citadel`
+     * @param _assetAmountIn Amount of `asset` to give
+     * @param _minCitadelOut ID of DAO to vote for
+     * @return citadelAmount_ Amount of `xCitadel` bought
+     */
+    function deposit(uint256 _assetAmountIn, uint256 _minCitadelOut)
+        external
+        onlyWhenPriceNotFlagged
+        gacPausable
+        nonReentrant
+        returns (uint256 citadelAmount_)
+    {
+        require(_assetAmountIn > 0, ""_assetAmountIn must not be 0"");
+        require(
+            funding.assetCumulativeFunded + _assetAmountIn <= funding.assetCap,
+            ""asset funding cap exceeded""
+        );
+        funding.assetCumulativeFunded = funding.assetCumulativeFunded + _assetAmountIn;
+        // Take in asset from user
+        citadelAmount_ = getAmountOut(_assetAmountIn);
+        require(citadelAmount_ >= _minCitadelOut, ""minCitadelOut"");
+
+        asset.safeTransferFrom(msg.sender, saleRecipient, _assetAmountIn);
+        
+        // Deposit xCitadel and send to user
+        // TODO: Check gas costs. How does this relate to market buying if you do want to deposit to xCTDL?
+        xCitadel.depositFor(msg.sender, citadelAmount_);
+
+        emit Deposit(
+            msg.sender,
+            _assetAmountIn,
+            citadelAmount_
+        );
+    }
+
+    /// =======================
+    /// ===== Public view =====
+    /// =======================
+
+    /**
+     * @notice Get the amount received when exchanging `asset`
+     * @param _assetAmountIn Amount of `asset` to exchange
+     * @return citadelAmount_ Amount of `citadel` received
+     */
+    function getAmountOut(uint256 _assetAmountIn)
+        public
+        view
+        returns (uint256 citadelAmount_)
+    {
+        uint256 citadelAmountWithoutDiscount = _assetAmountIn * citadelPriceInAsset;
+
+        if (funding.discount > 0) {
+            citadelAmount_ =
+                (citadelAmountWithoutDiscount * MAX_BPS) /
+                (MAX_BPS - funding.discount);
+        }
+
+        citadelAmount_ = citadelAmount_ / assetDecimalsNormalizationValue;
+    }
+
+    /**
+     * @notice Get the amount received when exchanging `asset`, in terms of xCitadel at current price per share
+     * @param _assetAmountIn Amount of `asset` to exchange
+     * @return xCitadelAmount_ Amount of `xCitadel` received at current price per share
+     */
+    function getStakedCitadelAmountOut(uint256 _assetAmountIn) public view returns (uint256 xCitadelAmount_) {
+        uint citadelAmount = getAmountOut(_assetAmountIn);
+        xCitadelAmount_ = citadelAmount * 10**citadel.decimals() / xCitadel.getPricePerFullShare();
+    }
+
+    /**
+     * @notice Check how much `asset` can still be taken in, based on cap and cumulative amount funded
+     * @return limitLeft_ Amount of `asset` that can still be exchanged for citadel
+     */
+    function getRemainingFundable() external view returns (uint256 limitLeft_) {
+        uint256 assetCumulativeFunded = funding.assetCumulativeFunded;
+        uint256 assetCap = funding.assetCap;
+        if (assetCumulativeFunded < assetCap) {
+            limitLeft_ = assetCap - assetCumulativeFunded;
+        }
+    }
+
+    /**
+     * @notice Get all funding params
+     * @return funding all funding params
+     */
+    function getFundingParams() external view returns (FundingParams memory) {
+        return funding;
+    }
+
+    /**
+     * @notice Convenience function to get current discount rate
+     * @return discount current discount rate
+     */
+    function getDiscount() external view returns (uint256) {
+        return funding.discount;
+    }
+
+    /// ==============================
+    /// ===== Policy Ops actions =====
+    /// ==============================
+
+    /**
+     * @notice Set discount manually, within the constraints of min and max discount values
+     * @dev managed by policy operations for rapid response to market conditions
+     * @param _discount active discount (in bps)
+     */
+    function setDiscount(uint256 _discount)
+        external
+        gacPausable
+        onlyRoleOrAddress(POLICY_OPERATIONS_ROLE, funding.discountManager)
+    {
+        require(_discount >= funding.minDiscount, ""discount < minDiscount"");
+        require(_discount <= funding.maxDiscount, ""discount > maxDiscount"");
+
+        funding.discount = _discount;
+
+        emit DiscountSet(_discount);
+    }
+
+    function clearCitadelPriceFlag()
+        external
+        gacPausable
+        onlyRole(POLICY_OPERATIONS_ROLE)
+    {
+        citadelPriceFlag = false;
+    }
+
+    /**
+     * @notice Modify the max asset amount that this contract can take. Managed by policy governance.
+     * @dev This is cumulative asset cap, so must take into account the asset amount already funded.
+     * @param _assetCap New max cumulatiive amountIn
+     */
+    function setAssetCap(uint256 _assetCap)
+        external
+        gacPausable
+        onlyRole(POLICY_OPERATIONS_ROLE)
+    {
+        require(
+            _assetCap > funding.assetCumulativeFunded,
+            ""cannot decrease cap below global sum of assets in""
+        );
+        funding.assetCap = _assetCap;
+        emit AssetCapUpdated(_assetCap);
+    }
+
+    /// ================================
+    /// ===== Treasury Ops actions =====
+    /// ================================
+
+    /**
+     * @notice Transfers out any tokens accidentally sent to the contract. Can only be called by owner
+     * @dev The contract transfers all `asset` directly to `saleRecipient` during a sale so it's safe
+     *      to sweep `asset`. For `citadel`, the function only sweeps the extra amount
+     *      (current contract balance - amount left to be claimed)
+     * @param _token The token to sweep
+     */
+    function sweep(address _token)
+        external
+        gacPausable
+        nonReentrant
+        onlyRole(TREASURY_OPERATIONS_ROLE)
+    {
+        uint256 amount = IERC20(_token).balanceOf(address(this));
+        require(amount > 0, ""nothing to sweep"");
+        require(
+            _token != address(asset),
+            ""cannot sweep funding asset, use claimAssetToTreasury()""
+        );
+
+        emit Sweep(_token, amount);
+        IERC20(_token).safeTransfer(saleRecipient, amount);
+    }
+
+    /// @notice Claim accumulated asset token to treasury
+    /// @dev We let assets accumulate and batch transfer to treasury (rather than transfer atomically on each deposi)t for user gas savings
+    function claimAssetToTreasury()
+        external
+        gacPausable
+        onlyRole(TREASURY_OPERATIONS_ROLE)
+    {
+        uint256 amount = asset.balanceOf(address(this));
+        require(amount > 0, ""nothing to claim"");
+        asset.safeTransfer(saleRecipient, amount);
+
+        emit ClaimToTreasury(address(asset), amount);
+    }
+
+    /// ==============================
+    /// ===== Governance actions =====
+    /// ==============================
+
+    /**
+     * @notice Set minimum and maximum discount
+     * @dev managed by contract governance to place constraints around the parameter for policy operations to play within
+     * @param _minDiscount minimum discount (in bps)
+     * @param _maxDiscount maximum discount (in bps)
+     */
+    function setDiscountLimits(uint256 _minDiscount, uint256 _maxDiscount)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        require(_maxDiscount < MAX_BPS , ""maxDiscount >= MAX_BPS"");
+        funding.minDiscount = _minDiscount;
+        funding.maxDiscount = _maxDiscount;
+
+        emit DiscountLimitsSet(_minDiscount, _maxDiscount);
+    }
+
+    /**
+     * @notice Set a discount manager address
+     * @dev This is intended to be used for an automated discount manager contract to supplement or replace manual calls
+     * @param _discountManager discount manager address
+     */
+    function setDiscountManager(address _discountManager)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        funding.discountManager = _discountManager;
+
+        emit DiscountManagerSet(_discountManager);
+    }
+
+    function setSaleRecipient(address _saleRecipient)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        require(
+            _saleRecipient != address(0),
+            ""Funding: sale recipient should not be zero""
+        );
+
+        saleRecipient = _saleRecipient;
+        emit SaleRecipientUpdated(_saleRecipient);
+    }
+
+    function setCitadelAssetPriceBounds(uint256 _minPrice, uint256 _maxPrice)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        minCitadelPriceInAsset = _minPrice;
+        maxCitadelPriceInAsset = _maxPrice;
+
+        emit CitadelPriceBoundsSet(_minPrice, _maxPrice);
+    }
+
+    /// ==========================
+    /// ===== Oracle actions =====
+    /// ==========================
+
+    /// @notice Update citadel price in asset terms from oracle source
+    /// @dev Note that the oracle mechanics are abstracted to the oracle address
+    function updateCitadelPriceInAsset()
+        external
+        gacPausable
+        onlyRole(KEEPER_ROLE)
+    {   
+        uint _citadelPriceInAsset;
+        bool _valid;
+
+        (_citadelPriceInAsset, _valid) = IMedianOracle(citadelPriceInAssetOracle).getData();
+
+        require(_citadelPriceInAsset > 0, ""citadel price must not be zero"");
+        require(_valid, ""oracle data must be valid"");
+
+        if (
+            _citadelPriceInAsset < minCitadelPriceInAsset ||
+            _citadelPriceInAsset > maxCitadelPriceInAsset
+        ) {
+            citadelPriceFlag = true;
+            emit CitadelPriceFlag(
+                _citadelPriceInAsset,
+                minCitadelPriceInAsset,
+                maxCitadelPriceInAsset
+            );
+        } else {
+            citadelPriceInAsset = _citadelPriceInAsset;
+            emit CitadelPriceInAssetUpdated(_citadelPriceInAsset);
+        }
+    }
+
+
+    /// @dev OUT OF AUDIT SCOPE: This is a test function that will be removed in final code
+    /// @notice Update citadel price in asset terms from oracle source
+    /// @dev Note that the oracle mechanics are abstracted to the oracle address
+    function updateCitadelPriceInAsset(uint256 _citadelPriceInAsset)
+        external
+        gacPausable
+        onlyCitadelPriceInAssetOracle
+    {
+        require(_citadelPriceInAsset > 0, ""citadel price must not be zero"");
+
+        if (
+            _citadelPriceInAsset < minCitadelPriceInAsset ||
+            _citadelPriceInAsset > maxCitadelPriceInAsset
+        ) {
+            citadelPriceFlag = true;
+            emit CitadelPriceFlag(
+                _citadelPriceInAsset,
+                minCitadelPriceInAsset,
+                maxCitadelPriceInAsset
+            );
+        } else {
+            citadelPriceInAsset = _citadelPriceInAsset;
+            emit CitadelPriceInAssetUpdated(_citadelPriceInAsset);
+        }
+    }
+}",3777,469,"[M-02] Funding.deposit() doesn't work if there is no discount set
+The Funding contract's `deposit()` function uses the `getAmountOut()` function to determine how many citadel tokens the user should receive for their deposit. But, if no discount is set, the function always returns 0. Now the `deposit()` function tries to deposit 0 tokens for the user through the StakedCitadel contract. But, that function requires the number of tokens to be `!= 0`. The transaction reverts.
+",1,,"pragma solidity 0.8.12;
+
+import {SafeERC20Upgradeable} from ""openzeppelin-contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import {ReentrancyGuardUpgradeable} from ""openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+
+import ""./interfaces/badger/IVault.sol"";
+import ""./interfaces/erc20/IERC20.sol"";
+import ""./lib/GlobalAccessControlManaged.sol"";
+import ""./lib/SafeERC20.sol"";
+import ""./interfaces/citadel/IMedianOracle.sol"";
+
+
+contract Funding is GlobalAccessControlManaged, ReentrancyGuardUpgradeable {
+    using SafeERC20 for IERC20;
+
+    
+    bytes32 public constant CONTRACT_GOVERNANCE_ROLE =
+        keccak256(""CONTRACT_GOVERNANCE_ROLE"");
+    bytes32 public constant POLICY_OPERATIONS_ROLE =
+        keccak256(""POLICY_OPERATIONS_ROLE"");
+    bytes32 public constant TREASURY_OPERATIONS_ROLE = keccak256(""TREASURY_OPERATIONS_ROLE"");
+    bytes32 public constant TREASURY_VAULT_ROLE =
+        keccak256(""TREASURY_VAULT_ROLE"");
+    bytes32 public constant KEEPER_ROLE = keccak256(""KEEPER_ROLE"");
+
+    uint256 public constant MAX_BPS = 10000;
+
+    IERC20 public citadel; 
+    IVault public xCitadel; 
+    IERC20 public asset; 
+
+    uint256 public citadelPriceInAsset; 
+    uint256 public minCitadelPriceInAsset; 
+    uint256 public maxCitadelPriceInAsset; 
+    bool public citadelPriceFlag; 
+
+    uint256 public assetDecimalsNormalizationValue;
+
+    address public citadelPriceInAssetOracle;
+    address public saleRecipient;
+
+    struct FundingParams {
+        uint256 discount;
+        uint256 minDiscount;
+        uint256 maxDiscount;
+        address discountManager;
+        uint256 assetCumulativeFunded; 
+        uint256 assetCap; 
+    }
+
+    FundingParams public funding;
+
+    
+    
+    
+
+    
+    event Deposit(
+        address indexed buyer,
+        uint256 assetIn,
+        uint256 citadelOutValue
+    );
+
+    event CitadelPriceInAssetUpdated(uint256 citadelPrice);
+
+    event CitadelPriceBoundsSet(uint256 minPrice, uint256 maxPrice);
+    event CitadelPriceFlag(uint256 price, uint256 minPrice, uint256 maxPrice);
+
+    event SaleRecipientUpdated(address indexed recipient);
+    event AssetCapUpdated(uint256 assetCap);
+
+    event Sweep(address indexed token, uint256 amount);
+    event ClaimToTreasury(address indexed token, uint256 amount);
+
+    modifier onlyCitadelPriceInAssetOracle() {
+        require(
+            msg.sender == citadelPriceInAssetOracle,
+            ""onlyCitadelPriceInAssetOracle""
+        );
+        _;
+    }
+
+    event DiscountLimitsSet(uint256 minDiscount, uint256 maxDiscount);
+    event DiscountSet(uint256 discount);
+    event DiscountManagerSet(address discountManager);
+
+    
+    
+    
+
+    
+    function initialize(
+        address _gac,
+        address _citadel,
+        address _asset,
+        address _xCitadel,
+        address _saleRecipient,
+        address _citadelPriceInAssetOracle,
+        uint256 _assetCap
+    ) external initializer {
+        require(
+            _saleRecipient != address(0),
+            ""Funding: 0 sale""
+        );
+        require(
+            _citadelPriceInAssetOracle != address(0),
+            ""Funding: 0 oracle""
+        );
+
+        __GlobalAccessControlManaged_init(_gac);
+        __ReentrancyGuard_init();
+
+        citadel = IERC20(_citadel);
+        xCitadel = IVault(_xCitadel);
+        asset = IERC20(_asset);
+        saleRecipient = _saleRecipient;
+
+        citadelPriceInAssetOracle = _citadelPriceInAssetOracle;
+
+        funding = FundingParams(0, 0, 0, address(0), 0, _assetCap);
+
+        assetDecimalsNormalizationValue = 10**asset.decimals();
+
+        
+        minCitadelPriceInAsset = 0;
+        maxCitadelPriceInAsset = type(uint256).max;
+
+        
+        
+        IERC20(_citadel).safeApprove(address(_xCitadel), type(uint256).max);
+    }
+
+    modifier onlyWhenPriceNotFlagged() {
+        require(
+            citadelPriceFlag == false,
+            ""Funding: citadel price from oracle flagged and pending review""
+        );
+        _;
+    }
+
+    
+    
+    
+
+    
+    function deposit(uint256 _assetAmountIn, uint256 _minCitadelOut)
+        external
+        onlyWhenPriceNotFlagged
+        gacPausable
+        nonReentrant
+        returns (uint256 citadelAmount_)
+    {
+        require(_assetAmountIn > 0, ""_assetAmountIn must not be 0"");
+        require(
+            funding.assetCumulativeFunded + _assetAmountIn <= funding.assetCap,
+            ""asset funding cap exceeded""
+        );
+        funding.assetCumulativeFunded = funding.assetCumulativeFunded + _assetAmountIn;
+        
+        citadelAmount_ = getAmountOut(_assetAmountIn);
+        require(citadelAmount_ >= _minCitadelOut, ""minCitadelOut"");
+
+        asset.safeTransferFrom(msg.sender, saleRecipient, _assetAmountIn);
+        
+        
+        
+        xCitadel.depositFor(msg.sender, citadelAmount_);
+
+        emit Deposit(
+            msg.sender,
+            _assetAmountIn,
+            citadelAmount_
+        );
+    }
+
+    
+    
+    
+
+    
+    function getAmountOut(uint256 _assetAmountIn)
+        public
+        view
+        returns (uint256 citadelAmount_)
+    {
+        uint256 citadelAmountWithoutDiscount = _assetAmountIn * citadelPriceInAsset;
+
+        if (funding.discount > 0) {
+            citadelAmount_ =
+                (citadelAmountWithoutDiscount * MAX_BPS) /
+                (MAX_BPS - funding.discount);
+        }
+
+        citadelAmount_ = citadelAmount_ / assetDecimalsNormalizationValue;
+    }
+
+    
+    function getStakedCitadelAmountOut(uint256 _assetAmountIn) public view returns (uint256 xCitadelAmount_) {
+        uint citadelAmount = getAmountOut(_assetAmountIn);
+        xCitadelAmount_ = citadelAmount * 10**citadel.decimals() / xCitadel.getPricePerFullShare();
+    }
+
+    
+    function getRemainingFundable() external view returns (uint256 limitLeft_) {
+        uint256 assetCumulativeFunded = funding.assetCumulativeFunded;
+        uint256 assetCap = funding.assetCap;
+        if (assetCumulativeFunded < assetCap) {
+            limitLeft_ = assetCap - assetCumulativeFunded;
+        }
+    }
+
+    
+    function getFundingParams() external view returns (FundingParams memory) {
+        return funding;
+    }
+
+    
+    function getDiscount() external view returns (uint256) {
+        return funding.discount;
+    }
+
+    
+    
+    
+
+    
+    function setDiscount(uint256 _discount)
+        external
+        gacPausable
+        onlyRoleOrAddress(POLICY_OPERATIONS_ROLE, funding.discountManager)
+    {
+        require(_discount >= funding.minDiscount, ""discount < minDiscount"");
+        require(_discount <= funding.maxDiscount, ""discount > maxDiscount"");
+
+        funding.discount = _discount;
+
+        emit DiscountSet(_discount);
+    }
+
+    function clearCitadelPriceFlag()
+        external
+        gacPausable
+        onlyRole(POLICY_OPERATIONS_ROLE)
+    {
+        citadelPriceFlag = false;
+    }
+
+    
+    function setAssetCap(uint256 _assetCap)
+        external
+        gacPausable
+        onlyRole(POLICY_OPERATIONS_ROLE)
+    {
+        require(
+            _assetCap > funding.assetCumulativeFunded,
+            ""cannot decrease cap below global sum of assets in""
+        );
+        funding.assetCap = _assetCap;
+        emit AssetCapUpdated(_assetCap);
+    }
+
+    
+    
+    
+
+    
+    function sweep(address _token)
+        external
+        gacPausable
+        nonReentrant
+        onlyRole(TREASURY_OPERATIONS_ROLE)
+    {
+        uint256 amount = IERC20(_token).balanceOf(address(this));
+        require(amount > 0, ""nothing to sweep"");
+        require(
+            _token != address(asset),
+            ""cannot sweep funding asset, use claimAssetToTreasury()""
+        );
+
+        emit Sweep(_token, amount);
+        IERC20(_token).safeTransfer(saleRecipient, amount);
+    }
+
+    
+    
+    function claimAssetToTreasury()
+        external
+        gacPausable
+        onlyRole(TREASURY_OPERATIONS_ROLE)
+    {
+        uint256 amount = asset.balanceOf(address(this));
+        require(amount > 0, ""nothing to claim"");
+        asset.safeTransfer(saleRecipient, amount);
+
+        emit ClaimToTreasury(address(asset), amount);
+    }
+
+    
+    
+    
+
+    
+    function setDiscountLimits(uint256 _minDiscount, uint256 _maxDiscount)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        require(_maxDiscount < MAX_BPS , ""maxDiscount >= MAX_BPS"");
+        funding.minDiscount = _minDiscount;
+        funding.maxDiscount = _maxDiscount;
+
+        emit DiscountLimitsSet(_minDiscount, _maxDiscount);
+    }
+
+    
+    function setDiscountManager(address _discountManager)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        funding.discountManager = _discountManager;
+
+        emit DiscountManagerSet(_discountManager);
+    }
+
+    function setSaleRecipient(address _saleRecipient)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        require(
+            _saleRecipient != address(0),
+            ""Funding: sale recipient should not be zero""
+        );
+
+        saleRecipient = _saleRecipient;
+        emit SaleRecipientUpdated(_saleRecipient);
+    }
+
+    function setCitadelAssetPriceBounds(uint256 _minPrice, uint256 _maxPrice)
+        external
+        gacPausable
+        onlyRole(CONTRACT_GOVERNANCE_ROLE)
+    {
+        minCitadelPriceInAsset = _minPrice;
+        maxCitadelPriceInAsset = _maxPrice;
+
+        emit CitadelPriceBoundsSet(_minPrice, _maxPrice);
+    }
+
+    
+    
+    
+
+    
+    
+    function updateCitadelPriceInAsset()
+        external
+        gacPausable
+        onlyRole(KEEPER_ROLE)
+    {   
+        uint _citadelPriceInAsset;
+        bool _valid;
+
+        (_citadelPriceInAsset, _valid) = IMedianOracle(citadelPriceInAssetOracle).getData();
+
+        require(_citadelPriceInAsset > 0, ""citadel price must not be zero"");
+        require(_valid, ""oracle data must be valid"");
+
+        if (
+            _citadelPriceInAsset < minCitadelPriceInAsset ||
+            _citadelPriceInAsset > maxCitadelPriceInAsset
+        ) {
+            citadelPriceFlag = true;
+            emit CitadelPriceFlag(
+                _citadelPriceInAsset,
+                minCitadelPriceInAsset,
+                maxCitadelPriceInAsset
+            );
+        } else {
+            citadelPriceInAsset = _citadelPriceInAsset;
+            emit CitadelPriceInAssetUpdated(_citadelPriceInAsset);
+        }
+    }
+
+
+    
+    
+    
+    function updateCitadelPriceInAsset(uint256 _citadelPriceInAsset)
+        external
+        gacPausable
+        onlyCitadelPriceInAssetOracle
+    {
+        require(_citadelPriceInAsset > 0, ""citadel price must not be zero"");
+
+        if (
+            _citadelPriceInAsset < minCitadelPriceInAsset ||
+            _citadelPriceInAsset > maxCitadelPriceInAsset
+        ) {
+            citadelPriceFlag = true;
+            emit CitadelPriceFlag(
+                _citadelPriceInAsset,
+                minCitadelPriceInAsset,
+                maxCitadelPriceInAsset
+            );
+        } else {
+            citadelPriceInAsset = _citadelPriceInAsset;
+            emit CitadelPriceInAssetUpdated(_citadelPriceInAsset);
+        }
+    }
+}",2553,0,1,"{
+  ""task_list"": [
+    {
+      ""Area"": ""Access Control"",
+      ""Tasks"": [
+        ""Verify that `GlobalAccessControlManaged` contract is correctly implemented and provides the expected role-based access control functionality."",
+        ""Confirm that all functions requiring specific roles (`CONTRACT_GOVERNANCE_ROLE`, `POLICY_OPERATIONS_ROLE`, `TREASURY_OPERATIONS_ROLE`, `KEEPER_ROLE`) correctly enforce these roles using `onlyRole` or `onlyRoleOrAddress` modifiers."",
+        ""Check the initial setup of roles in the `GlobalAccessControlManaged` contract to ensure proper assignment of administrative privileges."",
+        ""Verify that `funding.discountManager` is used correctly in the `setDiscount` function's `onlyRoleOrAddress` modifier and that only the specified manager or the `POLICY_OPERATIONS_ROLE` can set the discount."",
+        ""Confirm that no sensitive functions are missing access control modifiers, potentially allowing unauthorized access.""
+      ]
+    },
+    {
+      ""Area"": ""Price Oracle Integrity and Validation"",
+      ""Tasks"": [
+        ""Analyze the implementation of `IMedianOracle` contract and the trustworthiness of the data source."",
+        ""Verify that the returned values from `IMedianOracle.getData()` are properly validated (including checking the `_valid` flag) before being used."",
+        ""Investigate potential vulnerabilities related to price manipulation in the `IMedianOracle` contract or its underlying data source."",
+        ""Assess the impact of stale or inaccurate price data on the `deposit` function and the overall system."",
+        ""Confirm that the `minCitadelPriceInAsset` and `maxCitadelPriceInAsset` bounds are set appropriately to prevent extreme price fluctuations."",
+        ""Check if the `citadelPriceFlag` mechanism effectively pauses deposits when the oracle price is out of bounds and requires manual intervention."",
+        ""Analyze potential race conditions or unintended consequences if both `updateCitadelPriceInAsset` functions (with and without price parameter) are called concurrently or in rapid succession."",
+        ""Determine the potential impact and handling of oracle downtime or unavailability."",
+        ""Verify that zero price value returned by the oracle is correctly handled, as the require statement only flags zero prices, but doesn't revert."",
+        ""Simulate price feed updates with values outside the min/max bounds to confirm `citadelPriceFlag` functionality and event emission."",
+        ""Inspect whether the price bounds are inclusive or exclusive. It's probably meant to be inclusive, but best to clarify with the project team."",
+        ""Explore the consequences of delayed or infrequent price updates from the oracle.""
+      ]
+    },
+    {
+      ""Area"": ""Funding Cap and Discount Logic"",
+      ""Tasks"": [
+        ""Verify that the `assetCap` is enforced correctly and that the `deposit` function prevents users from exceeding the cap."",
+        ""Analyze the calculation of `citadelAmount_` in the `getAmountOut` function, ensuring that the discount is applied correctly and no rounding errors occur."",
+        ""Confirm that the `minDiscount` and `maxDiscount` are validated properly in the `setDiscount` function to prevent invalid discount values."",
+        ""Investigate potential attack vectors related to manipulating the discount value to gain an unfair advantage."",
+        ""Check if the `assetCumulativeFunded` is updated atomically with the asset transfer to prevent race conditions."",
+        ""Assess the risk of integer overflows or underflows in the discount calculation, especially with large `_assetAmountIn` or `citadelPriceInAsset` values."",
+        ""Examine the relationship between `citadelPriceInAsset`, `assetDecimalsNormalizationValue`, and the actual exchange rate to ensure accurate price conversions."",
+        ""Verify if the contract could be bricked if `MAX_BPS - funding.discount` becomes zero. This could happen if a malicious actor sets `discount` equal to `MAX_BPS`.""
+      ]
+    },
+    {
+      ""Area"": ""Token Handling and External Interactions"",
+      ""Tasks"": [
+        ""Confirm that the `safeTransfer` and `safeTransferFrom` functions are used correctly to prevent common ERC-20 transfer vulnerabilities."",
+        ""Verify that the contract has sufficient allowance to transfer `citadel` tokens to the `xCitadel` contract in the `initialize` function."",
+        ""Analyze the potential risks associated with the `xCitadel.depositFor` function and ensure that it behaves as expected."",
+        ""Check that the `saleRecipient` address is validated correctly in the `initialize` and `setSaleRecipient` functions to prevent accidental or malicious transfers to the zero address."",
+        ""Investigate the potential for reentrancy attacks in the `deposit` and `sweep` functions, even with the `nonReentrant` modifier."",
+        ""Verify the behavior of `xCitadel.getPricePerFullShare()` in the `getStakedCitadelAmountOut` function and its impact on the calculated `xCitadelAmount_`."",
+        ""Confirm that the `sweep` function correctly prevents sweeping the `asset` token and only allows sweeping other tokens."",
+        ""Examine the potential for front-running attacks on the `deposit` function by monitoring pending transactions and adjusting the `_minCitadelOut` parameter."",
+         ""What happens if the xCitadel contract is paused? Will deposited assets be stuck?"",
+        ""Investigate the behaviour of the xCitadel.depositFor function, and if it reverts under certain circumstances, make sure that the asset transfer is also reverted to the msg.sender. Possible loss of funds.""
+
+      ]
+    },
+    {
+      ""Area"": ""Initialization and Upgradeability"",
+      ""Tasks"": [
+        ""Verify that the `initialize` function can only be called once and that all critical state variables are properly initialized."",
+        ""Assess the potential risks associated with upgradeability and ensure that the upgrade process is secure and well-defined."",
+        ""Check if the contract's storage layout is compatible with future upgrades and that no data corruption occurs during upgrades."",
+        ""Confirm that the `__ReentrancyGuard_init()` is called in the initialize function to properly initialize the reentrancy guard."",
+        ""If the GlobalAccessControl contract is upgradeable, make sure a potential upgrade cannot break the access control setup.""
+      ]
+    },
+    {
+      ""Area"": ""Unused or Potentially Problematic Functionality"",
+      ""Tasks"": [
+        ""Investigate the purpose and intended use of the `TREASURY_VAULT_ROLE`, which is defined but not used in the code. Is this intentional?"",
+        ""Review the necessity of the `claimAssetToTreasury` function. If the `saleRecipient` is meant to be the treasury, is a separate function necessary?"",
+        ""Assess the impact of pausing the contract via the `gacPausable` modifier and ensure that all critical functions can be paused and unpaused correctly."",
+        ""Evaluate the gas costs associated with each function and identify potential areas for optimization.""
+      ]
+    }
+  ]
+}","{
+  ""ReviewingTheCode"": ""The contract `Funding` facilitates purchasing staked `citadel` tokens (`xCitadel`) using a specified `asset`. It integrates with an external price oracle, applies discounts, manages funding caps, and uses role-based access control for administration. The contract is upgradeable and includes reentrancy protection. Received assets are forwarded to a `saleRecipient`. It includes safety mechanisms like price bounds checks."",
+  ""IdentifyingKeyComponents"": {
+    ""ContractName"": ""Funding"",
+    ""Purpose"": ""To allow users to deposit a specific 'asset' token and receive staked 'citadel' ('xCitadel') tokens in return, potentially at a discount. Manages funding limits, oracle price feeds, discounts, and administrative controls."",
+    ""InheritanceAndImports"": {
+      ""InheritsFrom"": [
+        ""GlobalAccessControlManaged"",
+        ""ReentrancyGuardUpgradeable""
+      ],
+      ""Imports"": [
+        ""openzeppelin-contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"",
+        ""openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"",
+        ""./interfaces/badger/IVault.sol"",
+        ""./interfaces/erc20/IERC20.sol"",
+        ""./lib/GlobalAccessControlManaged.sol"",
+        ""./lib/SafeERC20.sol"",
+        ""./interfaces/citadel/IMedianOracle.sol""
+      ]
+    },
+    ""StateVariables"": [
+      {
+        ""Name"": ""CONTRACT_GOVERNANCE_ROLE"",
+        ""Type"": ""bytes32"",
+        ""Purpose"": ""Role identifier for contract governance functions.""
+      },
+      {
+        ""Name"": ""POLICY_OPERATIONS_ROLE"",
+        ""Type"": ""bytes32"",
+        ""Purpose"": ""Role identifier for policy-related operations (e.g., setting discounts, caps).""
+      },
+      {
+        ""Name"": ""TREASURY_OPERATIONS_ROLE"",
+        ""Type"": ""bytes32"",
+        ""Purpose"": ""Role identifier for treasury operations (e.g., sweeping tokens).""
+      },
+      {
+        ""Name"": ""TREASURY_VAULT_ROLE"",
+        ""Type"": ""bytes32"",
+        ""Purpose"": ""Role identifier, defined but not used in the provided snippet.""
+      },
+      {
+        ""Name"": ""KEEPER_ROLE"",
+        ""Type"": ""bytes32"",
+        ""Purpose"": ""Role identifier for keeper actions (e.g., updating price from oracle).""
+      },
+      {
+        ""Name"": ""MAX_BPS"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Constant representing 100% (10000 basis points) for discount calculations.""
+      },
+      {
+        ""Name"": ""citadel"",
+        ""Type"": ""IERC20"",
+        ""Purpose"": ""The Citadel token contract instance.""
+      },
+      {
+        ""Name"": ""xCitadel"",
+        ""Type"": ""IVault"",
+        ""Purpose"": ""The xCitadel (staked Citadel) vault contract instance.""
+      },
+      {
+        ""Name"": ""asset"",
+        ""Type"": ""IERC20"",
+        ""Purpose"": ""The asset token contract instance used for purchasing xCitadel.""
+      },
+      {
+        ""Name"": ""citadelPriceInAsset"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""The current price of Citadel relative to the asset, likely scaled by asset decimals.""
+      },
+      {
+        ""Name"": ""minCitadelPriceInAsset"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""The minimum acceptable price from the oracle.""
+      },
+      {
+        ""Name"": ""maxCitadelPriceInAsset"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""The maximum acceptable price from the oracle.""
+      },
+      {
+        ""Name"": ""citadelPriceFlag"",
+        ""Type"": ""bool"",
+        ""Purpose"": ""Flag indicating if the oracle price is outside the acceptable bounds (true = flagged/halted).""
+      },
+      {
+        ""Name"": ""assetDecimalsNormalizationValue"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Value (10**asset.decimals()) used for normalizing calculations involving the asset price.""
+      },
+      {
+        ""Name"": ""citadelPriceInAssetOracle"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address of the medianizer oracle contract providing the Citadel/Asset price.""
+      },
+      {
+        ""Name"": ""saleRecipient"",
+        ""Type"": ""address"",
+        ""Purpose"": ""Address where the deposited 'asset' tokens are sent.""
+      },
+      {
+        ""Name"": ""funding"",
+        ""Type"": ""FundingParams (struct)"",
+        ""Purpose"": ""Struct holding parameters related to the funding/sale mechanics (discount, caps, etc.).""
+      }
+    ],
+    ""FunctionsAndModifiers"": [
+      {
+        ""Name"": ""FundingParams"",
+        ""Visibility"": ""struct (internal)"",
+        ""Purpose"": ""Defines the structure for funding parameters."",
+        ""Parameters"": [""uint256 discount"", ""uint256 minDiscount"", ""uint256 maxDiscount"", ""address discountManager"", ""uint256 assetCumulativeFunded"", ""uint256 assetCap""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""initialize"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Initializes the contract state (for upgradeable contracts). Sets up roles, tokens, addresses, caps, and approves xCitadel."",
+        ""Parameters"": [""address _gac"", ""address _citadel"", ""address _asset"", ""address _xCitadel"", ""address _saleRecipient"", ""address _citadelPriceInAssetOracle"", ""uint256 _assetCap""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""deposit"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows users to deposit 'asset' to receive 'xCitadel'. Checks caps, price flag, calculates amount out, transfers asset, and calls xCitadel vault."",
+        ""Parameters"": [""uint256 _assetAmountIn"", ""uint256 _minCitadelOut""],
+        ""Returns"": [""uint256 citadelAmount_""]
+      },
+      {
+        ""Name"": ""getAmountOut"",
+        ""Visibility"": ""public view"",
+        ""Purpose"": ""Calculates the amount of 'citadel' (pre-staking) a user would receive for a given 'asset' amount, considering the current price and discount."",
+        ""Parameters"": [""uint256 _assetAmountIn""],
+        ""Returns"": [""uint256 citadelAmount_""]
+      },
+      {
+        ""Name"": ""getStakedCitadelAmountOut"",
+        ""Visibility"": ""public view"",
+        ""Purpose"": ""Calculates the amount of 'xCitadel' a user would receive for a given 'asset' amount, using getAmountOut and the xCitadel price per share."",
+        ""Parameters"": [""uint256 _assetAmountIn""],
+        ""Returns"": [""uint256 xCitadelAmount_""]
+      },
+      {
+        ""Name"": ""getRemainingFundable"",
+        ""Visibility"": ""external view"",
+        ""Purpose"": ""Returns the remaining amount of 'asset' that can be deposited before hitting the cap."",
+        ""Parameters"": [],
+        ""Returns"": [""uint256 limitLeft_""]
+      },
+      {
+        ""Name"": ""getFundingParams"",
+        ""Visibility"": ""external view"",
+        ""Purpose"": ""Returns the current funding parameters struct."",
+        ""Parameters"": [],
+        ""Returns"": [""FundingParams memory""]
+      },
+      {
+        ""Name"": ""getDiscount"",
+        ""Visibility"": ""external view"",
+        ""Purpose"": ""Returns the current discount percentage in BPS."",
+        ""Parameters"": [],
+        ""Returns"": [""uint256""]
+      },
+      {
+        ""Name"": ""setDiscount"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the discount BPS. Requires POLICY_OPERATIONS_ROLE or discountManager address."",
+        ""Parameters"": [""uint256 _discount""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""clearCitadelPriceFlag"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Clears the price flag, re-enabling deposits. Requires POLICY_OPERATIONS_ROLE."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setAssetCap"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Updates the maximum 'asset' funding cap. Requires POLICY_OPERATIONS_ROLE."",
+        ""Parameters"": [""uint256 _assetCap""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""sweep"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows TREASURY_OPERATIONS_ROLE to withdraw any accumulated tokens (except 'asset') to the saleRecipient."",
+        ""Parameters"": [""address _token""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""claimAssetToTreasury"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows TREASURY_OPERATIONS_ROLE to withdraw accumulated 'asset' tokens to the saleRecipient."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setDiscountLimits"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the minimum and maximum allowed discount BPS. Requires CONTRACT_GOVERNANCE_ROLE."",
+        ""Parameters"": [""uint256 _minDiscount"", ""uint256 _maxDiscount""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setDiscountManager"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets a specific address that can manage the discount (alongside POLICY_OPERATIONS_ROLE). Requires CONTRACT_GOVERNANCE_ROLE."",
+        ""Parameters"": [""address _discountManager""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setSaleRecipient"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Updates the address where deposited 'asset' is sent. Requires CONTRACT_GOVERNANCE_ROLE."",
+        ""Parameters"": [""address _saleRecipient""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""setCitadelAssetPriceBounds"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Sets the minimum and maximum acceptable oracle prices. Requires CONTRACT_GOVERNANCE_ROLE."",
+        ""Parameters"": [""uint256 _minPrice"", ""uint256 _maxPrice""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""updateCitadelPriceInAsset (no params)"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Updates the Citadel price by querying the oracle. Sets flag if price is out of bounds. Requires KEEPER_ROLE."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""updateCitadelPriceInAsset (with price param)"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Updates the Citadel price based on a provided value. Sets flag if price is out of bounds. Requires caller to be the oracle address."",
+        ""Parameters"": [""uint256 _citadelPriceInAsset""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""onlyCitadelPriceInAssetOracle"",
+        ""Visibility"": ""modifier (internal)"",
+        ""Purpose"": ""Restricts function access to the designated oracle address."",
+        ""Parameters"": [],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""onlyWhenPriceNotFlagged"",
+        ""Visibility"": ""modifier (internal)"",
+        ""Purpose"": ""Ensures the function can only execute when the oracle price is not flagged as out of bounds."",
+        ""Parameters"": [],
+        ""Returns"": []
+      }
+    ]
+  },
+  ""ExternalInteractions"": [
+    ""Reads decimals from `asset` and `citadel` (IERC20)."",
+    ""Transfers `asset` from user to `saleRecipient` via `safeTransferFrom`."",
+    ""Transfers `asset` from contract to `saleRecipient` via `safeTransfer` (`claimAssetToTreasury`)."",
+    ""Transfers other tokens (`_token`) from contract to `saleRecipient` via `safeTransfer` (`sweep`)."",
+    ""Calls `depositFor` on `xCitadel` (IVault)."",
+    ""Calls `getPricePerFullShare` on `xCitadel` (IVault)."",
+    ""Approves `xCitadel` to spend contract's `citadel` (IERC20 `safeApprove`)."",
+    ""Calls `getData` on `citadelPriceInAssetOracle` (IMedianOracle)."",
+    ""Interacts with `GlobalAccessControlManaged` contract (specified by `_gac`) for role checks and pausing (`onlyRole`, `onlyRoleOrAddress`, `gacPausable`)."",
+    ""Reads `balanceOf` for `asset` and other tokens (IERC20).""
+  ],
+  ""SpecialMechanisms"": [
+    ""Upgradeable Contract Pattern: Uses OpenZeppelin Upgradeable contracts and `initializer`."",
+    ""Role-Based Access Control (RBAC): Leverages `GlobalAccessControlManaged` for granular permissions."",
+    ""Oracle Integration: Uses `IMedianOracle` to fetch external price data."",
+    ""Price Safety Check: Implements min/max price bounds and a `citadelPriceFlag` to halt operations if the price is outside the accepted range."",
+    ""Discount Mechanism: Applies a configurable discount to the purchase price."",
+    ""Funding Cap: Enforces a limit (`assetCap`) on the total `asset` that can be deposited."",
+    ""Direct Staking: Deposits funds directly into the `xCitadel` vault, providing users with staked tokens."",
+    ""Reentrancy Guard: Protects key state-changing functions (`deposit`, `sweep`) from reentrancy attacks."",
+    ""Dual Price Update Methods: Allows price updates via keeper (pull) or oracle (push).""
+  ],
+  ""Questions"": [
+    ""The `deposit` function transfers the incoming `asset` to `saleRecipient` *before* calling `xCitadel.depositFor(msg.sender, citadelAmount_)`. Where does the `citadel` required by `xCitadel.depositFor` come from? The contract approves `xCitadel` to spend its `citadel` in `initialize`, but the contract doesn't appear to receive or hold `citadel` tokens during the `deposit` flow. Does `xCitadel.depositFor` mint the required `citadel` or pull it from another source based on this contract's call?"",
+    ""Is the `citadelPriceInAsset` scaling assumption correct? It seems to represent `(Citadel Units / Asset Unit) * assetDecimalsNormalizationValue` based on its usage in `getAmountOut`. Confirming this definition is important."",
+    ""What is the specific implementation and behavior of the external `GlobalAccessControlManaged` contract?"",
+    ""What is the intended use of the `TREASURY_VAULT_ROLE`? It's defined but not used in this code snippet."",
+    ""Are there potential race conditions or conflicting states possible if both keeper-triggered and oracle-pushed price updates (`updateCitadelPriceInAsset`) are used concurrently?""
+  ]
+}","{
+  ""Findings"": [
+    {
+      ""Issue"": ""Potential Division by Zero in `getAmountOut` when `discount` equals `MAX_BPS`"",
+      ""Severity"": ""High"",
+      ""Description"": ""The `getAmountOut` function calculates the citadel amount using the formula `(citadelAmountWithoutDiscount * MAX_BPS) / (MAX_BPS - funding.discount)`. If `funding.discount` is set to `MAX_BPS`, this results in a division by zero, causing the transaction to revert. This can be caused by an administrator error."",
+      ""Impact"": ""Denial of service. Users will be unable to deposit assets if the discount is misconfigured to equal MAX_BPS."",
+      ""Location"": ""Funding.sol:154, getAmountOut function""
+    },
+    {
+      ""Issue"": ""Reentrancy vulnerability in `claimAssetToTreasury` function"",
+      ""Severity"": ""High"",
+      ""Description"": ""The `sweep()` and `claimAssetToTreasury()` functions transfer tokens to the `saleRecipient`. If the `saleRecipient` is a malicious contract, it could potentially re-enter the contract during the token transfer and cause unexpected state changes. Even though `nonReentrant` modifier is used, it only prevents reentrancy to functions with this modifier and not from external calls. The `claimAssetToTreasury` function transfers asset to the `saleRecipient`. Since the contract interacts with an external token contract using `asset.safeTransfer(saleRecipient, amount)`, a malicious or compromised `saleRecipient` can implement a fallback function that calls back into the `claimAssetToTreasury` function before the initial transfer is completed, potentially draining the contract."",
+      ""Impact"": ""The malicious contract could potentially drain the Funding contract of tokens if the `saleRecipient` is compromised, allows an attacker to repeatedly withdraw assets from the contract leading to loss of funds."",
+      ""Location"": ""sweep() function, claimAssetToTreasury() function, Funding.sol:claimAssetToTreasury""
+    },
+    {
+      ""Issue"": ""Sale Recipient Can Be Changed To Zero Address"",
+      ""Severity"": ""High"",
+      ""Description"": ""The `setSaleRecipient` function allows the contract governance to change the sale recipient. However, despite the check at the initialization function, there is no similar check in the `setSaleRecipient` function. So the governance can change to zero address and the deposited asset will be lost."",
+      ""Impact"": ""The governance can change the recipient to zero address and lose the assets deposited into the contract."",
+      ""Location"": ""Funding.sol:327 - setSaleRecipient()""
+    },
+    {
+      ""Issue"": ""Potential Price Manipulation due to Oracle Data"",
+      ""Severity"": ""High"",
+      ""Description"": ""The `updateCitadelPriceInAsset` function fetches price data from an oracle. While there are checks for zero values and a `valid` flag, there\'s no mechanism to ensure the oracle isn\'t compromised or providing stale/manipulated data within the accepted bounds (`minCitadelPriceInAsset` and `maxCitadelPriceInAsset`). If the oracle returns a valid but incorrect price within the bounds, the contract will use it, potentially leading to significant financial losses for users who deposit."",
+      ""Impact"": ""Users may receive less Citadel than they should if the oracle data is inaccurate but still within the allowed price bounds. An attacker could manipulate the price, potentially draining funds from the contract."",
+      ""Location"": ""Funding.sol:376 - updateCitadelPriceInAsset()""
+    },
+    {
+      ""Issue"": ""Potential Reentrancy Vulnerability in `deposit` function when interacting with `xCitadel.depositFor`"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `deposit` function calls `xCitadel.depositFor` which is an external call. If `xCitadel` or any contract it interacts with during the deposit process allows a reentrant call back into the `Funding` contract, it could potentially lead to issues. Although ReentrancyGuardUpgradeable is used, it only protects against reentrancy in the Funding contract itself. If `xCitadel.depositFor` reenters through a different contract that calls back into Funding, the ReentrancyGuardUpgradeable will not prevent the reentrancy. If the `xCitadel.depositFor` function has a reentrancy vulnerability, an attacker could potentially re-enter the `deposit` function before the state is updated. This could lead to exceeding the `assetCap` and minting more xCitadel than intended, or bypassing checks."",
+      ""Impact"": ""Loss of funds for users or the contract owner if an attacker can manipulate the deposit process through reentrancy, Loss of funds for the protocol, inflation of xCitadel, violation of intended economic model."",
+      ""Location"": ""Funding.sol:166 - xCitadel.depositFor(msg.sender, citadelAmount_), Funding.sol:152, calls xCitadel.depositFor(msg.sender, citadelAmount_)""
+    },
+    {
+      ""Issue"": ""Lack of slippage control in deposit()"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `deposit()` function calculates the amount of Citadel tokens to be given to the user based on the current `citadelPriceInAsset` and the configured discount. It only checks that the amount of Citadel tokens is greater than or equal to `_minCitadelOut`. However, the actual transaction may fail or result in a significantly lower Citadel amount if the price changes significantly between the transaction submission and execution, even if it's still >= `_minCitadelOut`. The deposit function has a `_minCitadelOut` parameter. While it protects users from receiving significantly less Citadel than expected, it doesn\'t provide adequate slippage control. A sudden price change can cause the `getAmountOut` to return a lower value, leading to transaction failure."",
+      ""Impact"": ""Users may receive less Citadel than expected if the price fluctuates unfavorably between transaction submission and execution, User's deposits are more likely to fail in periods of high price volatility, Users may pay more asset tokens than intended if the price of the asset changes unfavorably between the approval and the transfer."",
+      ""Location"": ""deposit() function, deposit function, Funding.sol:deposit, Funding.sol:deposit""
+    },
+    {
+      ""Issue"": ""Discount Logic Errors and Front Running Vulnerability"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The contract allows setting the discount using `setDiscount`, which can potentially be front-run. An attacker could observe a transaction setting a higher discount and then immediately execute their deposit to take advantage of the increased discount before other legitimate users can. In the `getAmountOut` function, the code calculates the discount using `(citadelAmountWithoutDiscount * MAX_BPS) / (MAX_BPS - funding.discount)`. This formula applies the discount in reverse. It should be `citadelAmountWithoutDiscount * (MAX_BPS - funding.discount) / MAX_BPS`."",
+      ""Impact"": ""Users might receive less Citadel tokens than they expected due to front-running. This can lead to financial loss for users interacting with the contract, The discount calculation is incorrect, leading to users receiving more citadel than expected. This essentially devalues citadel and leads to the fund raising operation being a loss."",
+      ""Location"": ""setDiscount function, Funding.sol:getAmountOut""
+    },
+    {
+      ""Issue"": ""Potential for denial-of-service if Citadel Price is persistently flagged."",
+      ""Severity"": ""Medium"",
+      ""Description"": ""If the oracle consistently returns a price outside of the set bounds (minCitadelPriceInAsset, maxCitadelPriceInAsset), the `citadelPriceFlag` will always be set. The `deposit` function uses `onlyWhenPriceNotFlagged` modifier, effectively pausing deposits. The only way to clear is `clearCitadelPriceFlag`, which needs `POLICY_OPERATIONS_ROLE`. If this role is compromised or slow, this poses a risk."",
+      ""Impact"": ""Users will be unable to deposit if the Citadel price is flagged and the policy operation isn't executed"",
+      ""Location"": ""updateCitadelPriceInAsset, deposit, Funding.sol:35, Funding.sol:290, Funding.sol:141""
+    },
+    {
+      ""Issue"": ""Potential Front-Running Vulnerability in `updateCitadelPriceInAsset`"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `updateCitadelPriceInAsset` function, when called by the `KEEPER_ROLE`, reads price data from an oracle. The period between fetching the price and its actual use in `deposit` creates a window where a malicious actor could front-run the `deposit` transaction. There is a potential race condition if the price changes significantly between the time the keeper reads the price and when a user calls the `deposit` function. This could allow a front-runner to exploit the price difference."",
+      ""Impact"": ""If an attacker can influence the oracle and front-run transactions, they could potentially purchase Citadel at a more favorable price than intended, potential for users to purchase citadel at an outdated price, disadvantaging the protocol."",
+      ""Location"": ""Funding.sol:374-411, Funding.sol:276, Funding.sol:128""
+    },
+    {
+      ""Issue"": ""Incorrect Calculation of `xCitadelAmount_` in `getStakedCitadelAmountOut`"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The function `getStakedCitadelAmountOut` calculates `xCitadelAmount_` using the formula `citadelAmount * 10**citadel.decimals() / xCitadel.getPricePerFullShare()`. This calculation assumes that the `xCitadel.getPricePerFullShare()` returns value with same decimals as Citadel token. However, the `getPricePerFullShare()` can have different decimals which can result in an inaccurate `xCitadelAmount_`."",
+      ""Impact"": ""Incorrect calculation of xCitadel amount, potentially leading to loss of funds or incorrect token distribution."",
+      ""Location"": ""Funding.sol:175, Funding.sol:175""
+    },
+    {
+      ""Issue"": ""Inconsistent Token Decimals Can Cause Unexpected Behavior"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The contract assumes `assetDecimalsNormalizationValue` is sufficient to normalize calculations involving asset and Citadel tokens. If the Citadel token has a significantly different number of decimals than the Asset token, the calculated amountOut can be significantly off. `getStakedCitadelAmountOut` performs a direct calculation assuming both citadel and xCitadel have the same decimals, which may not be the case."",
+      ""Impact"": ""Users may receive a significantly different number of Citadel than anticipated, due to incorrect handling of token decimals, Incorrect xCitadel calculation, leading to users receiving the wrong amount of staked citadel."",
+      ""Location"": ""Funding.sol: 214, 219, Funding.sol:getStakedCitadelAmountOut""
+    },
+    {
+      ""Issue"": ""Unchecked Multiplication in `getAmountOut` can lead to incorrect citadelAmount"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""In the `getAmountOut` function, the calculation `_assetAmountIn * citadelPriceInAsset` can potentially lead to an overflow if the values are large enough. While the result is later divided by `assetDecimalsNormalizationValue`, it doesn\'t prevent the overflow from happening initially."",
+      ""Impact"": ""Users might receive less Citadel than expected due to integer overflow, potentially causing dissatisfaction or financial loss."",
+      ""Location"": ""Funding.sol:202""
+    },
+    {
+      ""Issue"": ""Missing Input Validation for `_assetAmountIn` in `deposit` function"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The `deposit` function checks that `_assetAmountIn > 0`, but it doesn't check for excessively large values of `_assetAmountIn` that might lead to integer overflow when calculating `citadelAmount_` within the `getAmountOut` function."",
+      ""Impact"": ""Potential integer overflow leading to incorrect `citadelAmount_` calculation, resulting in users receiving less citadel than intended, or even reverting the transaction."",
+      ""Location"": ""Funding.sol:128, Funding.sol:147, Funding.sol:154""
+    },
+    {
+      ""Issue"": ""Potential for griefing/DoS in `updateCitadelPriceInAsset(uint256 _citadelPriceInAsset)`"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The `updateCitadelPriceInAsset(uint256 _citadelPriceInAsset)` function (called by the oracle) has a price check that can set `citadelPriceFlag = true`. If the oracle is malicious or compromised and reports a price outside of the acceptable range, this will disable the `deposit()` function until the flag is cleared by `clearCitadelPriceFlag()`. The `updateCitadelPriceInAsset` called by `KEEPER_ROLE` also calls the oracle and sets the `citadelPriceFlag` in case the oracle price is out of the boundaries. If `minCitadelPriceInAsset` and `maxCitadelPriceInAsset` are set to the same value, any deviation from that value by the oracle would immediately trigger the `citadelPriceFlag` and halt deposits until the flag is cleared."",
+      ""Impact"": ""Potential denial of service if oracle is malicious, Potential for temporary denial of service by manipulating the oracle to return a price outside of the narrow bounds."",
+      ""Location"": ""updateCitadelPriceInAsset(uint256 _citadelPriceInAsset) function, updateCitadelPriceInAsset() function (both versions)""
+    },
+    {
+      ""Issue"": ""Unsafe Division in `getAmountOut` can lead to unexpected behavior"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The `getAmountOut` function calculates the citadel amount with a discount. It performs `(citadelAmountWithoutDiscount * MAX_BPS) / (MAX_BPS - funding.discount)`. If `funding.discount` is close to `MAX_BPS`, `(MAX_BPS - funding.discount)` can be a small number. This can lead to an unexpectedly high `citadelAmount_` due to integer division, potentially exceeding the expected amount."",
+      ""Impact"": ""Unexpected calculation of citadel output amount, potentially leading to loss of funds or incorrect token distribution."",
+      ""Location"": ""Funding.sol:169""
+    },
+    {
+      ""Issue"": ""Race condition in assetCap update"",
+      ""Severity"": ""Low"",
+      ""Description"": ""A race condition can occur when multiple calls to `deposit` happen concurrently. Even if `funding.assetCumulativeFunded + _assetAmountIn <= funding.assetCap` is checked, if two transactions pass this check simultaneously, the `assetCap` can be exceeded."",
+      ""Impact"": ""The contract can exceed the asset cap, potentially leading to more Citadel being sold than intended."",
+      ""Location"": ""deposit function""
+    },
+    {
+      ""Issue"": ""Lack of Input Validation in `setCitadelAssetPriceBounds` Function"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The `setCitadelAssetPriceBounds` function doesn't check if `_minPrice` is less than or equal to `_maxPrice`. Setting `_minPrice` greater than `_maxPrice` will lead to incorrect price bounds, and can potentially halt the contract operation, because the price always flags."",
+      ""Impact"": ""Incorrect price bounds that may halt deposits if oracle price falls in between the incorrectly set min/max bounds.The contract could become unusable if the price bounds are incorrectly set, preventing users from depositing assets and receiving Citadel."",
+      ""Location"": ""Funding.sol:266, Funding.sol:353-356""
+    },
+    {
+      ""Issue"": ""Missing checks for address(0) in setter functions"",
+      ""Severity"": ""Low"",
+      ""Description"": ""Several setter functions such as `setDiscountManager` could be exploited by setting key contract parameter addresses to address(0)."",
+      ""Impact"": ""Possible contract malfunction or DOS"",
+      ""Location"": ""Funding.sol""
+    },
+    {
+      ""Issue"": ""SafeApprove for a large amount can be front-run and Inconsistent use of safeApprove and safeTransfer"",
+      ""Severity"": ""Low"",
+      ""Description"": ""When initializing the contract, `IERC20(_citadel).safeApprove(address(_xCitadel), type(uint256).max);` is called. This gives the vault infinite approval for the citadel token, which means it can be front-run for malicious purposes. While this approves `xCitadel` to spend `citadel`, there are no functions to decrease this allowance if needed."",
+      ""Impact"": ""There can be a potential to be front-run,  Minor potential for unexpected ERC20 approval issues."",
+      ""Location"": ""Initialize function, Funding.sol:112, initialize() function, sweep() function, claimAssetToTreasury() function""
+    },
+    {
+      ""Issue"": ""Potential precision loss in `getStakedCitadelAmountOut` function"",
+      ""Severity"": ""Low"",
+      ""Description"": ""In the function `getStakedCitadelAmountOut`, the amount of Citadel is multiplied by `10**citadel.decimals()` and then divided by `xCitadel.getPricePerFullShare()`. If `xCitadel.getPricePerFullShare()` is significantly larger than `10**citadel.decimals()`, the division might result in precision loss, potentially leading to a lower `xCitadelAmount_` than expected."",
+      ""Impact"": ""Users may receive slightly less xCitadel than expected due to precision loss."",
+      ""Location"": ""getStakedCitadelAmountOut function""
+    },
+    {
+      ""Issue"": ""Discount Application Logic Error in `getAmountOut`"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The discount is applied using the formula `(citadelAmountWithoutDiscount * MAX_BPS) / (MAX_BPS - funding.discount)`.  If `funding.discount` is close to `MAX_BPS` (10000), then `MAX_BPS - funding.discount` can be a small number, leading to a very large intermediate result after multiplication before the division. Intuitively, a discount should *reduce* the amount, but this implementation effectively *increases* the amount."",
+      ""Impact"": ""Users might receive significantly more Citadel than intended when a large discount is set, potentially draining the Citadel supply faster than expected. This deviates from the intended behavior of a \'discount\'."",
+      ""Location"": ""Funding.sol:205-207""
+    }
+  ],
+  ""IssueNumber"": 50,
+  ""OutputList"": 20
+}",254.58590507507324,4253.0,33.0,"---
+
+**[M-02] Funding.deposit() doesn't work if there is no discount set**
+
+**Report Description**:
+The `deposit()` function in the Funding contract uses the `getAmountOut()` function to determine how many Citadel tokens the user should receive for their deposit. However, if no discount is set, the `getAmountOut()` function always returns 0. Consequently, the `deposit()` function attempts to deposit 0 tokens for the user through the StakedCitadel contract, which requires the number of tokens to be `!= 0`. This causes the transaction to revert, rendering the `deposit()` function non-functional when no discount is set.
+
+**Match in Response List**:
+**No match found**.
+
+**Validation**:
+**Incorrect**. The issue described in the report is not addressed in the `response_list`. The `response_list` contains various issues related to the `getAmountOut()` function, such as division by zero, incorrect discount logic, and potential overflow, but none of these responses specifically address the scenario where no discount is set, leading to a return value of 0 and a subsequent transaction revert. This is a critical oversight, as it directly impacts the functionality of the `deposit()` function under specific conditions.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+- *None*
+
+**Partially Correct Matches**:
+- *None*
+
+**Missed Issues from Issue Report**:
+- **[M-02] Funding.deposit() doesn't work if there is no discount set**
+
+---","```
+None.
+```",0.0
