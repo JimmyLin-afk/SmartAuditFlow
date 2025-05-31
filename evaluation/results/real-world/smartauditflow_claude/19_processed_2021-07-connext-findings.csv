@@ -1,0 +1,1875 @@
+nameid,code,tokens,loc,issue,vulnumber,Unnamed: 6,code_snippet,processtokens,high_severity_count,medium_severity_count,audit_plan,initial_analysis,Findings,execution_time,total_tokens,total_steps,Comparison,matchList,MAP
+TransactionManager.sol,"// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.4;
+
+import ""./interfaces/IFulfillHelper.sol"";
+import ""./interfaces/ITransactionManager.sol"";
+import ""./lib/LibAsset.sol"";
+import ""./lib/LibERC20.sol"";
+import ""@openzeppelin/contracts/security/ReentrancyGuard.sol"";
+import ""@openzeppelin/contracts/utils/cryptography/ECDSA.sol"";
+
+// Outstanding qs:
+// - what happens if you have unique user data, but duplicate tx ids?
+//   no requires here would catch this, the tx would be properly prepared
+//
+// - we validate all the inputs but the amount, bidSignature, and encodedBid.
+//   bidSignature and encodedBid could be used as slashing later, and their
+//   validation is out of scope of this function. But, do we want to be able
+//   to use this to send 0-value amounts? basically as some incentivized
+//   relayer? would that break bidding?
+
+
+/// @title TransactionManager
+/// @author Connext <support@connext.network>
+/// @notice This contract holds the logic to facilitate crosschain transactions.
+///         Transactions go through three phases:
+///
+///         1. Route Auction: User broadcasts to our network signalling their 
+///         desired route. Routers respond with sealed bids containing 
+///         commitments to fulfilling the transaction within a certain time and 
+///         price range.
+///
+///         2. Prepare: Once the auction is completed, the transaction can be 
+///         prepared. The user submits a transaction to `TransactionManager` 
+///         contract on sender-side chain containing router's signed bid. This 
+///         transaction locks up the users funds on the sending chiain. Upon 
+///         detecting an event containing their signed bid from the chain, 
+///         router submits the same transaction to `TransactionManager` on the 
+///         receiver-side chain, and locks up a corresponding amount of 
+///         liquidity. The amount locked on the receiving chain is `sending 
+///         amount - auction fee` so the router is incentivized to complete the 
+///         transaction.
+///
+///         3. Fulfill: Upon detecting the `TransactionPrepared` event on the 
+///         receiver-side chain, the user signs a message and sends it to a 
+///         relayer, who will earn a fee for submission. The relayer (which may 
+///         be the router) then submits the message to the `TransactionManager` 
+///         to complete their transaction on receiver-side chain and claim the 
+///         funds locked by the router. A relayer is used here to allow users 
+///         to submit transactions with arbitrary calldata on the receiving 
+///         chain without needing gas to do so. The router then submits the 
+///         same signed message and completes transaction on sender-side, 
+///         unlocking the original `amount`.
+///
+///         If a transaction is not fulfilled within a fixed timeout, it 
+///         reverts and can be reclaimed by the party that called `prepare` on 
+///         each chain (initiator). Additionally, transactions can be cancelled 
+///         unilaterally by the person owed funds on that chain (router for 
+///         sending chain, user for receiving chain) prior to expiry.
+
+contract TransactionManager is ReentrancyGuard, ITransactionManager {
+  /// @dev Mapping of router to balance specific to asset
+  mapping(address => mapping(address => uint256)) public routerBalances;
+
+  /// @dev Mapping of user address to blocks where active transfers
+  ///      were created.
+  mapping(address => uint256[]) public activeTransactionBlocks;
+
+  /// @dev Mapping of hash of `InvariantTransactionData` to the hash
+  //       of the `VariantTransactionData`
+  mapping(bytes32 => bytes32) public variantTransactionData;
+
+  /// @dev The chain id of the contract, is passed in to avoid any evm issues
+  uint256 public immutable chainId;
+
+  /// @dev Minimum timeout (will be the lowest on the receiving chain)
+  uint256 public constant MIN_TIMEOUT = 24 hours;
+
+  constructor(uint256 _chainId) {
+    chainId = _chainId;
+  }
+
+  /// @notice This is used by any router to increase their available
+  ///         liquidity for a given asset.
+  /// @param amount The amount of liquidity to add for the router
+  /// @param assetId The address (or `address(0)` if native asset) of the
+  ///                asset you're adding liquidity for
+  /// @param router The router you are adding liquidity on behalf of
+  function addLiquidity(uint256 amount, address assetId, address router) external payable override nonReentrant {
+    // Sanity check: nonzero amounts
+    require(amount > 0, ""addLiquidity: AMOUNT_IS_ZERO"");
+
+    // Validate correct amounts are transferred
+    if (LibAsset.isEther(assetId)) {
+      require(msg.value == amount, ""addLiquidity: VALUE_MISMATCH"");
+    } else {
+      require(msg.value == 0, ""addLiquidity: ETH_WITH_ERC_TRANSFER"");
+      require(LibERC20.transferFrom(assetId, router, address(this), amount), ""addLiquidity: ERC20_TRANSFER_FAILED"");
+    }
+
+    // Update the router balances
+    routerBalances[router][assetId] += amount;
+
+    // Emit event
+    emit LiquidityAdded(router, assetId, amount, msg.sender);
+  }
+
+  /// @notice This is used by any router to decrease their available
+  ///         liquidity for a given asset.
+  /// @param amount The amount of liquidity to remove for the router
+  /// @param assetId The address (or `address(0)` if native asset) of the
+  ///                asset you're removing liquidity for
+  /// @param recipient The address that will receive the liquidity being removed
+  function removeLiquidity(
+    uint256 amount,
+    address assetId,
+    address payable recipient
+  ) external override nonReentrant {
+    // Sanity check: nonzero amounts
+    require(amount > 0, ""removeLiquidity: AMOUNT_IS_ZERO"");
+
+    // Sanity check: amount can be deducted for the router
+    require(routerBalances[msg.sender][assetId] >= amount, ""removeLiquidity: INSUFFICIENT_FUNDS"");
+
+    // Update router balances
+    routerBalances[msg.sender][assetId] -= amount;
+
+    // Transfer from contract to specified recipient
+    require(LibAsset.transferAsset(assetId, recipient, amount), ""removeLiquidity: TRANSFER_FAILED"");
+
+    // Emit event
+    emit LiquidityRemoved(msg.sender, assetId, amount, recipient);
+  }
+
+  /// @notice This function creates a crosschain transaction. When called on
+  ///         the sending chain, the user is expected to lock up funds. When
+  ///         called on the receiving chain, the router deducts the transfer
+  ///         amount from the available liquidity. The majority of the
+  ///         information about a given transfer does not change between chains,
+  ///         with three notable exceptions: `amount`, `expiry`, and 
+  ///         `preparedBlock`. The `amount` and `expiry` are decremented
+  ///         between sending and receiving chains to provide an incentive for 
+  ///         the router to complete the transaction and time for the router to
+  ///         fulfill the transaction on the sending chain after the unlocking
+  ///         signature is revealed, respectively.
+  /// @param invariantData The data for a crosschain transaction that will
+  ///                      not change between sending and receiving chains.
+  ///                      The hash of this data is used as the key to store 
+  ///                      the inforamtion that does change between chains 
+  ///                      (amount, expiry,preparedBlock) for verification
+  /// @param amount The amount of the transaction on this chain
+  /// @param expiry The block.timestamp when the transaction will no longer be
+  ///               fulfillable and is freely cancellable on this chain
+  /// @param encryptedCallData The calldata to be executed when the tx is
+  ///                          fulfilled. Used in the function to allow the user
+  ///                          to reconstruct the tx from events. Hash is stored
+  ///                          onchain to prevent shenanigans.
+  /// @param encodedBid The encoded bid that was accepted by the user for this
+  ///                   crosschain transfer. It is supplied as a param to the
+  ///                   function but is only used in event emission
+  /// @param bidSignature The signature of the bidder on the encoded bid for
+  ///                     this transaction. Only used within the function for
+  ///                     event emission. The validity of the bid and
+  ///                     bidSignature are enforced offchain
+  function prepare(
+    InvariantTransactionData calldata invariantData,
+    uint256 amount,
+    uint256 expiry,
+    bytes calldata encryptedCallData,
+    bytes calldata encodedBid,
+    bytes calldata bidSignature
+  ) external payable override nonReentrant returns (TransactionData memory) {
+    // Sanity check: user is sensible
+    require(invariantData.user != address(0), ""prepare: USER_EMPTY"");
+
+    // Sanity check: router is sensible
+    require(invariantData.router != address(0), ""prepare: ROUTER_EMPTY"");
+
+    // Sanity check: valid fallback
+    require(invariantData.receivingAddress != address(0), ""prepare: RECEIVING_ADDRESS_EMPTY"");
+
+    // Make sure the chains are different
+    require(invariantData.sendingChainId != invariantData.receivingChainId, ""prepare: SAME_CHAINIDS"");
+
+    // Make sure the chains are relevant
+    require(invariantData.sendingChainId == chainId || invariantData.receivingChainId == chainId, ""prepare: INVALID_CHAINIDS"");
+
+    // Make sure the expiry is greater than min
+    require((expiry - block.timestamp) >= MIN_TIMEOUT, ""prepare: TIMEOUT_TOO_LOW"");
+
+    // Make sure the hash is not a duplicate
+    bytes32 digest = keccak256(abi.encode(invariantData));
+    require(variantTransactionData[digest] == bytes32(0), ""prepare: DIGEST_EXISTS"");
+
+    // NOTE: the `encodedBid` and `bidSignature` are simply passed through
+    //       to the contract emitted event to ensure the availability of
+    //       this information. Their validity is asserted offchain, and
+    //       is out of scope of this contract. They are used as inputs so
+    //       in the event of a router or user crash, they may recover the
+    //       correct bid information without requiring an offchain store.
+
+    // Store the transaction variants
+    variantTransactionData[digest] = keccak256(abi.encode(VariantTransactionData({
+      amount: amount,
+      expiry: expiry,
+      preparedBlockNumber: block.number
+    })));
+
+    // Store active blocks
+    activeTransactionBlocks[invariantData.user].push(block.number);
+
+    // First determine if this is sender side or receiver side
+    if (invariantData.sendingChainId == chainId) {
+      // Sanity check: amount is sensible
+      // Only check on sending chain to enforce router fees. Transactions could
+      // be 0-valued on receiving chain if it is just a value-less call to some
+      // `IFulfillHelper`
+      require(amount > 0, ""prepare: AMOUNT_IS_ZERO"");
+
+      // This is sender side prepare. The user is beginning the process of 
+      // submitting an onchain tx after accepting some bid. They should
+      // lock their funds in the contract for the router to claim after
+      // they have revealed their signature on the receiving chain via
+      // submitting a corresponding `fulfill` tx
+
+      // Validate correct amounts on msg and transfer from user to
+      // contract
+      if (LibAsset.isEther(invariantData.sendingAssetId)) {
+        require(msg.value == amount, ""prepare: VALUE_MISMATCH"");
+      } else {
+        require(msg.value == 0, ""prepare: ETH_WITH_ERC_TRANSFER"");
+        require(
+          LibERC20.transferFrom(invariantData.sendingAssetId, msg.sender, address(this), amount),
+          ""prepare: ERC20_TRANSFER_FAILED""
+        );
+      }
+    } else {
+      // This is receiver side prepare. The router has proposed a bid on the
+      // transfer which the user has accepted. They can now lock up their
+      // own liquidity on th receiving chain, which the user can unlock by
+      // calling `fulfill`. When creating the `amount` and `expiry` on the
+      // receiving chain, the router should have decremented both. The
+      // expiry should be decremented to ensure the router has time to
+      // complete the sender-side transaction after the user completes the
+      // receiver-side transactoin. The amount should be decremented to act as
+      // a fee to incentivize the router to complete the transaction properly.
+
+      // Check that the caller is the router
+      require(msg.sender == invariantData.router, ""prepare: ROUTER_MISMATCH"");
+
+      // Check that the router isnt accidentally locking funds in the contract
+      require(msg.value == 0, ""prepare: ETH_WITH_ROUTER_PREPARE"");
+
+      // Check that router has liquidity
+      require(
+        routerBalances[invariantData.router][invariantData.receivingAssetId] >= amount,
+        ""prepare: INSUFFICIENT_LIQUIDITY""
+      );
+
+      // Decrement the router liquidity
+      routerBalances[invariantData.router][invariantData.receivingAssetId] -= amount;
+    }
+
+    // Emit event
+    TransactionData memory txData = TransactionData({
+      user: invariantData.user,
+      router: invariantData.router,
+      sendingAssetId: invariantData.sendingAssetId,
+      receivingAssetId: invariantData.receivingAssetId,
+      sendingChainFallback: invariantData.sendingChainFallback,
+      callTo: invariantData.callTo,
+      receivingAddress: invariantData.receivingAddress,
+      callDataHash: invariantData.callDataHash,
+      transactionId: invariantData.transactionId,
+      sendingChainId: invariantData.sendingChainId,
+      receivingChainId: invariantData.receivingChainId,
+      amount: amount,
+      expiry: expiry,
+      preparedBlockNumber: block.number
+    });
+    emit TransactionPrepared(txData.user, txData.router, txData.transactionId, txData, msg.sender, encryptedCallData, encodedBid, bidSignature);
+    return txData;
+  }
+
+
+
+  /// @notice This function completes a crosschain transaction. When called on
+  ///         the receiving chain, the user reveals their signature on the
+  ///         invariant parts of the transaction data and is sent the 
+  ///         appropriate amount. The router then uses this signature to
+  ///         unlock the corresponding funds on the receiving chain, which are
+  ///         then added back to their available liquidity. The user includes a
+  ///         relayer fee since it is not assumed they will have gas on the
+  ///         receiving chain. This function *must* be called before the
+  ///         transaction expiry has elapsed.
+  /// @param txData All of the data (invariant and variant) for a crosschain
+  ///               transaction. The variant data provided is checked against
+  ///               what was stored when the `prepare` function was called.
+  /// @param relayerFee The fee that should go to the relayer when they are
+  ///                   calling the function on the receiving chain for the user
+  /// @param signature The users signature on the invariant data + fee that
+  ///                  can be used by the router to unlock the transaction on 
+  ///                  the sending chain
+  function fulfill(
+    TransactionData calldata txData,
+    uint256 relayerFee,
+    bytes calldata signature, // signature on fee + digest
+    bytes calldata callData
+  ) external override nonReentrant returns (TransactionData memory) {
+    // Get the hash of the invariant tx data. This hash is the same
+    // between sending and receiving chains. The variant data is stored
+    // in the contract when `prepare` is called within the mapping.
+    bytes32 digest = hashInvariantTransactionData(txData);
+
+    // Make sure that the variant data matches what was stored
+    require(variantTransactionData[digest] == hashVariantTransactionData(txData), ""fulfill: INVALID_VARIANT_DATA"");
+
+    // Make sure the expiry has not elapsed
+    require(txData.expiry > block.timestamp, ""fulfill: EXPIRED"");
+
+    // Make sure the transaction wasn't already completed
+    require(txData.preparedBlockNumber > 0, ""fulfill: ALREADY_COMPLETED"");
+
+    // Validate the user has signed
+    require(recoverFulfillSignature(txData, relayerFee, signature) == txData.user, ""fulfill: INVALID_SIGNATURE"");
+
+    // Sanity check: fee <= amount. Allow `=` in case of only wanting to execute
+    // 0-value crosschain tx, so only providing the fee amount
+    require(relayerFee <= txData.amount, ""fulfill: INVALID_RELAYER_FEE"");
+
+    // Check provided callData matches stored hash
+    require(keccak256(callData) == txData.callDataHash, ""fulfill: INVALID_CALL_DATA"");
+
+    // To prevent `fulfill` / `cancel` from being called multiple times, the
+    // preparedBlockNumber is set to 0 before being hashed. The value of the
+    // mapping is explicitly *not* zeroed out so users who come online without
+    // a store can tell the difference between a transaction that has not been
+    // prepared, and a transaction that was already completed on the receiver
+    // chain.
+    variantTransactionData[digest] = keccak256(abi.encode(VariantTransactionData({
+      amount: txData.amount,
+      expiry: txData.expiry,
+      preparedBlockNumber: 0
+    })));
+
+    // Remove the transaction prepared block from the active blocks
+    removeUserActiveBlocks(txData.user, txData.preparedBlockNumber);
+
+    if (txData.sendingChainId == chainId) {
+      // The router is completing the transaction, they should get the
+      // amount that the user deposited credited to their liquidity
+      // reserves.
+
+      // Make sure that the user is not accidentally fulfilling the transaction
+      // on the sending chain
+      require(msg.sender == txData.router, ""fulfill: ROUTER_MISMATCH"");
+
+      // Complete tx to router for original sending amount
+      routerBalances[txData.router][txData.sendingAssetId] += txData.amount;
+    } else {
+      // The user is completing the transaction, they should get the
+      // amount that the router deposited less fees for relayer.
+
+      // Get the amount to send
+      uint256 toSend = txData.amount - relayerFee;
+
+      // Send the relayer the fee
+      if (relayerFee > 0) {
+        require(
+          LibAsset.transferAsset(txData.receivingAssetId, payable(msg.sender), relayerFee),
+          ""fulfill: FEE_TRANSFER_FAILED""
+        );
+      }
+
+      // Handle receiver chain external calls if needed
+      if (txData.callTo == address(0)) {
+        // No external calls, send directly to receiving address
+        require(
+          LibAsset.transferAsset(txData.receivingAssetId, payable(txData.receivingAddress), toSend),
+          ""fulfill: TRANSFER_FAILED""
+        );
+      } else {
+        // Handle external calls with a fallback to the receiving
+        // address in case the call fails so the funds dont remain
+        // locked.
+
+        // First, approve the funds to the helper if needed
+        if (!LibAsset.isEther(txData.receivingAssetId) && toSend > 0) {
+          require(LibERC20.approve(txData.receivingAssetId, txData.callTo, toSend), ""fulfill: APPROVAL_FAILED"");
+        }
+
+        // Next, call `addFunds` on the helper. Helpers should internally
+        // track funds to make sure no one user is able to take all funds
+        // for tx
+        if (toSend > 0) {
+          try
+            IFulfillHelper(txData.callTo).addFunds{ value: LibAsset.isEther(txData.receivingAssetId) ? toSend : 0}(
+              txData.user,
+              txData.transactionId,
+              txData.receivingAssetId,
+              toSend
+            )
+          {} catch {
+            // Regardless of error within the callData execution, send funds
+            // to the predetermined fallback address
+            require(
+              LibAsset.transferAsset(txData.receivingAssetId, payable(txData.receivingAddress), toSend),
+              ""fulfill: TRANSFER_FAILED""
+            );
+          }
+        }
+
+        // Call `execute` on the helper
+        try
+          IFulfillHelper(txData.callTo).execute(
+            txData.user,
+            txData.transactionId,
+            txData.receivingAssetId,
+            toSend,
+            callData
+          )
+        {} catch {
+          // Regardless of error within the callData execution, send funds
+          // to the predetermined fallback address
+          require(
+            LibAsset.transferAsset(txData.receivingAssetId, payable(txData.receivingAddress), toSend),
+            ""fulfill: TRANSFER_FAILED""
+          );
+        }
+      }
+    }
+
+    // Emit event
+    emit TransactionFulfilled(txData.user, txData.router, txData.transactionId, txData, relayerFee, signature, callData, msg.sender);
+
+    return txData;
+  }
+
+  /// @notice Any crosschain transaction can be cancelled after it has been
+  ///         created to prevent indefinite lock up of funds. After the
+  ///         transaction has expired, anyone can cancel it. Before the
+  ///         expiry, only the recipient of the funds on the given chain is
+  ///         able to cancel. On the sending chain, this means only the router
+  ///         is able to cancel before the expiry, while only the user can
+  ///         prematurely cancel on the receiving chain.
+  /// @param txData All of the data (invariant and variant) for a crosschain
+  ///               transaction. The variant data provided is checked against
+  ///               what was stored when the `prepare` function was called.
+  /// @param relayerFee The fee that should go to the relayer when they are
+  ///                   calling the function for the user
+  /// @param signature The user's signature that allows a transaction to be
+  ///                  cancelled on the receiving chain.
+  function cancel(TransactionData calldata txData, uint256 relayerFee, bytes calldata signature)
+    external
+    override
+    nonReentrant
+    returns (TransactionData memory)
+  {
+    // Make sure params match against stored data
+    // Also checks that there is an active transfer here
+    // Also checks that sender or receiver chainID is this chainId (bc we checked it previously)
+
+    // Get the hash of the invariant tx data. This hash is the same
+    // between sending and receiving chains. The variant data is stored
+    // in the contract when `prepare` is called within the mapping.
+    bytes32 digest = hashInvariantTransactionData(txData);
+
+    // Verify the variant data is correct
+    require(variantTransactionData[digest] == hashVariantTransactionData(txData), ""cancel: INVALID_VARIANT_DATA"");
+
+    // Make sure the transaction wasn't already completed
+    require(txData.preparedBlockNumber > 0, ""cancel: ALREADY_COMPLETED"");
+
+    // Sanity check: fee <= amount. Allow `=` in case of only wanting to execute
+    // 0-value crosschain tx, so only providing the fee amount
+    require(relayerFee <= txData.amount, ""cancel: INVALID_RELAYER_FEE"");
+
+    // To prevent `fulfill` / `cancel` from being called multiple times, the
+    // preparedBlockNumber is set to 0 before being hashed. The value of the
+    // mapping is explicitly *not* zeroed out so users who come online without
+    // a store can tell the difference between a transaction that has not been
+    // prepared, and a transaction that was already completed on the receiver
+    // chain.
+    variantTransactionData[digest] = keccak256(abi.encode(VariantTransactionData({
+      amount: txData.amount,
+      expiry: txData.expiry,
+      preparedBlockNumber: 0
+    })));
+
+    // Remove active blocks
+    removeUserActiveBlocks(txData.user, txData.preparedBlockNumber);
+
+    // Return the appropriate locked funds
+    if (txData.sendingChainId == chainId) {
+      // Sender side, funds must be returned to the user
+      if (txData.expiry >= block.timestamp) {
+        // Timeout has not expired and tx may only be cancelled by router
+        // NOTE: no need to validate the signature here, since you are requiring
+        // the router must be the sender when the cancellation is during the
+        // fulfill-able window
+        require(msg.sender == txData.router, ""cancel: ROUTER_MUST_CANCEL"");
+
+        // Return totality of locked funds to provided fallbacl
+        require(
+          LibAsset.transferAsset(txData.sendingAssetId, payable(txData.sendingChainFallback), txData.amount),
+          ""cancel: TRANSFER_FAILED""
+        );
+      } else {
+        // When the user could be unlocking funds through a relayer, validate
+        // their signature and payout the relayer.
+        if (relayerFee > 0) {
+          require(recoverCancelSignature(txData, relayerFee, signature) == txData.user, ""cancel: INVALID_SIGNATURE"");
+
+          require(
+            LibAsset.transferAsset(txData.receivingAssetId, payable(msg.sender), relayerFee),
+            ""cancel: FEE_TRANSFER_FAILED""
+          );
+        }
+
+        // Get the amount to refund the user
+        uint256 toRefund = txData.amount - relayerFee;
+
+        // Return locked funds to sending chain fallback
+        if (toRefund > 0) {
+          require(
+            LibAsset.transferAsset(txData.sendingAssetId, payable(txData.sendingChainFallback), toRefund),
+            ""cancel: TRANSFER_FAILED""
+          );
+        }
+      }
+
+    } else {
+      // Receiver side, router liquidity is returned
+      if (txData.expiry >= block.timestamp) {
+        // Timeout has not expired and tx may only be cancelled by user
+        // Validate signature
+        require(recoverCancelSignature(txData, relayerFee, signature) == txData.user, ""cancel: INVALID_SIGNATURE"");
+
+        // NOTE: there is no incentive here for relayers to submit this on
+        // behalf of the user (i.e. fee not respected) because the user has not
+        // locked funds on this contract.
+      }
+
+      // Return liquidity to router
+      routerBalances[txData.router][txData.receivingAssetId] += txData.amount;
+    }
+
+    // Emit event
+    emit TransactionCancelled(txData.user, txData.router, txData.transactionId, txData, relayerFee, msg.sender);
+
+    // Return
+    return txData;
+  }
+
+  // helper method to get full array of active blocks
+  function getActiveTransactionBlocks(address user) external override view returns (uint256[] memory) {
+    return activeTransactionBlocks[user];
+  }
+
+  //////////////////////////
+  /// Private functions ///
+  //////////////////////////
+
+  /// @notice Removes a given block from the tracked activeTransactionBlocks
+  ///         array for the user. Called when transactions are completed.
+  /// @param user User who has completed a transaction
+  /// @param preparedBlock The TransactionData.preparedBlockNumber to remove
+  function removeUserActiveBlocks(address user, uint256 preparedBlock) internal {
+    // Remove active blocks
+    uint256 newLength = activeTransactionBlocks[user].length - 1;
+    uint256[] memory updated = new uint256[](newLength);
+    bool removed = false;
+    uint256 updatedIdx = 0;
+    for (uint256 i; i < newLength + 1; i++) {
+      // Handle case where there could be more than one tx added in a block
+      // And only one should be removed
+      if (!removed && activeTransactionBlocks[user][i] == preparedBlock) {
+        removed = true;
+        continue;
+      }
+      updated[updatedIdx] = activeTransactionBlocks[user][i];
+      updatedIdx++;
+    }
+    activeTransactionBlocks[user] = updated;
+  }
+
+  /// @notice Recovers the signer from the signature provided to the `fulfill`
+  ///         function. Returns the address recovered
+  /// @param txData TransactionData of the transaction being fulfilled
+  /// @param relayerFee The fee paid to the relayer for submitting the fulfill
+  ///                   tx on behalf of the user.
+  /// @param signature The signature you are recovering the signer from
+  function recoverFulfillSignature(
+    TransactionData calldata txData,
+    uint256 relayerFee,
+    bytes calldata signature
+  ) internal pure returns (address) {
+    // Create the signed payload
+    SignedFulfillData memory payload = SignedFulfillData({transactionId: txData.transactionId, relayerFee: relayerFee});
+
+    // Recover
+    return ECDSA.recover(ECDSA.toEthSignedMessageHash(keccak256(abi.encode(payload))), signature);
+  }
+
+  /// @notice Recovers the signer from the signature provided to the `cancel`
+  ///         function. Returns the address recovered
+  /// @param txData TransactionData of the transaction being fulfilled
+  /// @param relayerFee The fee paid to the relayer for submitting the cancel
+  ///                   tx on behalf of the user.
+  /// @param signature The signature you are recovering the signer from
+  function recoverCancelSignature(TransactionData calldata txData, uint256 relayerFee, bytes calldata signature)
+    internal
+    pure
+    returns (address)
+  {
+    // Create the signed payload
+    SignedCancelData memory payload = SignedCancelData({transactionId: txData.transactionId, cancel: ""cancel"", relayerFee: relayerFee});
+
+    // Recover
+    return ECDSA.recover(ECDSA.toEthSignedMessageHash(keccak256(abi.encode(payload))), signature);
+  }
+
+  /// @notice Returns the hash of only the invariant portions of a given
+  ///         crosschain transaction
+  /// @param txData TransactionData to hash
+  function hashInvariantTransactionData(TransactionData calldata txData) internal pure returns (bytes32) {
+    InvariantTransactionData memory invariant = InvariantTransactionData({
+      user: txData.user,
+      router: txData.router,
+      sendingAssetId: txData.sendingAssetId,
+      receivingAssetId: txData.receivingAssetId,
+      sendingChainFallback: txData.sendingChainFallback,
+      callTo: txData.callTo,
+      receivingAddress: txData.receivingAddress,
+      sendingChainId: txData.sendingChainId,
+      receivingChainId: txData.receivingChainId,
+      callDataHash: txData.callDataHash,
+      transactionId: txData.transactionId
+    });
+    return keccak256(abi.encode(invariant));
+  }
+
+  /// @notice Returns the hash of only the variant portions of a given
+  ///         crosschain transaction
+  /// @param txData TransactionData to hash
+  function hashVariantTransactionData(TransactionData calldata txData) internal pure returns (bytes32) {
+    return keccak256(abi.encode(VariantTransactionData({
+      amount: txData.amount,
+      expiry: txData.expiry,
+      preparedBlockNumber: txData.preparedBlockNumber
+    })));
+  }
+}
+
+",6657,654,"[H-01] Anyone can arbitrarily add router liquidity
+The `addLiquidity()` function takes a router address parameter, whose liquidity is increased (instead of assuming that router == msg.sender like is done on removeLiquidity()) on this contract/chain, by transferring the fund amount from router address to this contract if assetID != 0 (i.e. ERC20 tokens). However, anyone can call this function on the router’s behalf. For assetID == 0, the Ether transfer via msg.value comes from msg.sender and hence is assumed to be the router itself.
+The impact is that this will allow anyone to call this function and arbitrarily move ERC20 tokens from router address to this contract, assuming router has given max approval to this contract and has assetID amount available for transfer. While the router can always remove the liquidity if it doesn’t want to maintain that level of liquidity, this lack of access control or flexibility for a relayer to add liquidity on router’s behalf, may unnecessarily (and without authorization) increase the router’s exposure to protocol risk to more than it desires. See TransactionManager.sol #L88-L98. See also, use of msg.sender in removeLiquidity (#L88-L98).
+ [H-02] activeTransactionBlocks are vulnerable to DDoS attacks
+There is a potential issue in function `removeUserActiveBlocks` and the for loop inside it. I assume you are aware of block gas limits (they may be less relevant on other chains but still needs to be accounted for), so as there is no limit for activeTransactionBlocks, it may grow so large that the for loop may never finish. You should consider introducing an upper limit for activeTransactionBlocks. Also, a malicious actor may block any account (DDOS) by just calling prepare again and again with 0 amount acting as a router. This will push `activeTransactionBlocks` to the specified user until it is no longer possible to remove them from the array.
+This is also a gas issue, as function removeUserActiveBlocks iterating and assigning large dynamic arrays is very gas-consuming. Consider optimizing the algorithm, e.g. finding the first occurrence, then swap it with the last item, pop the array, and break. Or maybe even using an EnumerableMap, so you can find and remove elements in O(1).
+The best solution depends on what the usual number of activeTransactionBlocks is. If it is expected to be low (e.g. less than 5), then the current approach will work. But with larger arrays, I expect EnumerableMap would be more efficient.
+Because an upper limit will not fully mitigate this issue, as a malicious actor can still DDOS the user by pushing useless txs until this limit is reached and a valid router may not be able to submit new txs. And, because you need to improve both the security and performance of removeUserActiveBlocks; EnumerableMap may be a go-to solution.
+ [H-03] Router liquidity on receiving chain can be double-dipped by the user
+
+Submitted by 0xRajeev, also found by cmichel, gpersoon, pauliax, s1m0 and shw
+During `fulfill()` on the receiving chain, if the user has set up an external contract at `txData.callTo`, the catch blocks for both IFulfillHelper.addFunds() and IFulfillHelper.excute() perform transferAsset to the predetermined fallback address txData.receivingAddress.
+If addFunds() has reverted earlier, toSend amount would already have been transferred to the receivingAddress. If execute() also fails, it is again transferred.
+Scenario: User sets up receiver chain txData.callTo contract such that both addFunds() and execute() calls revert. That will let him get twice the toSend amount credited to the receivingAddress. So effectively, Alice locks 100 tokenAs on chain A, and can get 200 tokenAs (or twice the amount of any token she is supposed to get on chain B from the router), minus relayer fee, on chain B. Router liquidity is double-dipped by Alice and router loses funds. See TransactionManager.sol L395-L409 and L413-L428.
+ [H-04] Expired transfers will lock user funds on the sending chain function `cancel()`
+The cancelling relayer is being paid in `receivingAssetId` on the sendingChain instead of in sendingAssetID. If the user relies on a relayer to cancel transactions, and that receivingAssetId asset does not exist on the sending chain (assuming only sendingAssetID on the sending chain and receivingAssetId on the receiving chain are assured to be valid and present), then the cancel transaction from the relayer will always revert and user’s funds will remain locked on the sending chain.
+The impact is that expired transfers can never be cancelled and user funds will be locked forever if user relies on a relayer.
+Recommend changing receivingAssetId to sendingAssetId in transferAsset() on TransactionManager.sol L514.
+ [H-05] Approval is not reset if the call to IFulfillHelper fails
+The function `fulfill` first approves the `callTo` to transfer an amount of toSend tokens and tries to call IFulfillHelper, but if the call fails, it transfers these assets directly. However, in such case the approval is not reset, so a malicous callTo can pull these tokens later:  [M-01] Signatures use only tx ID instead of entire digest 
+The signature check in `recoverFulfillSignature()` only uses transaction ID (along with the relayer fee) which can be accidentally reused by the user, in which case the older signatures with the older relayer fees can be replayed. The signature should be on the entire digest hashInvariantTransactionData(txData) as indicated in the comment on L306.
+The impact is that, If the user signatures are indeed on the digest as indicated by the comment, the signature/address check in fulfill() will fail. If not, they may be accidentally/intentionally replayed with same transaction ID, which also appears to be an outstanding question as indicated by the comment on L12.
+ [M-02] Malicious router can block cross-chain-transfers
+The agreement between the user and the router seems to already happen off-chain because all the fields are required for the initial In variantTransactionData call already. A router could pretend to take on a user's cross-chain transfer, the user sends their prepare transaction, locking up funds on the sending chain. But then the router simply doesn't respond or responds with a prepare transaction of amount=0.
+The user's funds are then locked for the entire expiry time, whereas the router does not have to lock up anything as the amount is 0, even no gas if they simply don't respond. In this way, a router can bid on everything off-chain without a penalty, and take down everyone that accepts the bid.
+",7,,"pragma solidity 0.8.4;
+
+import ""./interfaces/IFulfillHelper.sol"";
+import ""./interfaces/ITransactionManager.sol"";
+import ""./lib/LibAsset.sol"";
+import ""./lib/LibERC20.sol"";
+import ""@openzeppelin/contracts/security/ReentrancyGuard.sol"";
+import ""@openzeppelin/contracts/utils/cryptography/ECDSA.sol"";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+contract TransactionManager is ReentrancyGuard, ITransactionManager {
+  
+  mapping(address => mapping(address => uint256)) public routerBalances;
+
+  
+  
+  mapping(address => uint256[]) public activeTransactionBlocks;
+
+  
+  
+  mapping(bytes32 => bytes32) public variantTransactionData;
+
+  
+  uint256 public immutable chainId;
+
+  
+  uint256 public constant MIN_TIMEOUT = 24 hours;
+
+  constructor(uint256 _chainId) {
+    chainId = _chainId;
+  }
+
+  
+  
+  
+  
+  
+  
+  function addLiquidity(uint256 amount, address assetId, address router) external payable override nonReentrant {
+    
+    require(amount > 0, ""addLiquidity: AMOUNT_IS_ZERO"");
+
+    
+    if (LibAsset.isEther(assetId)) {
+      require(msg.value == amount, ""addLiquidity: VALUE_MISMATCH"");
+    } else {
+      require(msg.value == 0, ""addLiquidity: ETH_WITH_ERC_TRANSFER"");
+      require(LibERC20.transferFrom(assetId, router, address(this), amount), ""addLiquidity: ERC20_TRANSFER_FAILED"");
+    }
+
+    
+    routerBalances[router][assetId] += amount;
+
+    
+    emit LiquidityAdded(router, assetId, amount, msg.sender);
+  }
+
+  
+  
+  
+  
+  
+  
+  function removeLiquidity(
+    uint256 amount,
+    address assetId,
+    address payable recipient
+  ) external override nonReentrant {
+    
+    require(amount > 0, ""removeLiquidity: AMOUNT_IS_ZERO"");
+
+    
+    require(routerBalances[msg.sender][assetId] >= amount, ""removeLiquidity: INSUFFICIENT_FUNDS"");
+
+    
+    routerBalances[msg.sender][assetId] -= amount;
+
+    
+    require(LibAsset.transferAsset(assetId, recipient, amount), ""removeLiquidity: TRANSFER_FAILED"");
+
+    
+    emit LiquidityRemoved(msg.sender, assetId, amount, recipient);
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  function prepare(
+    InvariantTransactionData calldata invariantData,
+    uint256 amount,
+    uint256 expiry,
+    bytes calldata encryptedCallData,
+    bytes calldata encodedBid,
+    bytes calldata bidSignature
+  ) external payable override nonReentrant returns (TransactionData memory) {
+    
+    require(invariantData.user != address(0), ""prepare: USER_EMPTY"");
+
+    
+    require(invariantData.router != address(0), ""prepare: ROUTER_EMPTY"");
+
+    
+    require(invariantData.receivingAddress != address(0), ""prepare: RECEIVING_ADDRESS_EMPTY"");
+
+    
+    require(invariantData.sendingChainId != invariantData.receivingChainId, ""prepare: SAME_CHAINIDS"");
+
+    
+    require(invariantData.sendingChainId == chainId || invariantData.receivingChainId == chainId, ""prepare: INVALID_CHAINIDS"");
+
+    
+    require((expiry - block.timestamp) >= MIN_TIMEOUT, ""prepare: TIMEOUT_TOO_LOW"");
+
+    
+    bytes32 digest = keccak256(abi.encode(invariantData));
+    require(variantTransactionData[digest] == bytes32(0), ""prepare: DIGEST_EXISTS"");
+
+    
+    
+    
+    
+    
+    
+
+    
+    variantTransactionData[digest] = keccak256(abi.encode(VariantTransactionData({
+      amount: amount,
+      expiry: expiry,
+      preparedBlockNumber: block.number
+    })));
+
+    
+    activeTransactionBlocks[invariantData.user].push(block.number);
+
+    
+    if (invariantData.sendingChainId == chainId) {
+      
+      
+      
+      
+      require(amount > 0, ""prepare: AMOUNT_IS_ZERO"");
+
+      
+      
+      
+      
+      
+
+      
+      
+      if (LibAsset.isEther(invariantData.sendingAssetId)) {
+        require(msg.value == amount, ""prepare: VALUE_MISMATCH"");
+      } else {
+        require(msg.value == 0, ""prepare: ETH_WITH_ERC_TRANSFER"");
+        require(
+          LibERC20.transferFrom(invariantData.sendingAssetId, msg.sender, address(this), amount),
+          ""prepare: ERC20_TRANSFER_FAILED""
+        );
+      }
+    } else {
+      
+      
+      
+      
+      
+      
+      
+      
+      
+
+      
+      require(msg.sender == invariantData.router, ""prepare: ROUTER_MISMATCH"");
+
+      
+      require(msg.value == 0, ""prepare: ETH_WITH_ROUTER_PREPARE"");
+
+      
+      require(
+        routerBalances[invariantData.router][invariantData.receivingAssetId] >= amount,
+        ""prepare: INSUFFICIENT_LIQUIDITY""
+      );
+
+      
+      routerBalances[invariantData.router][invariantData.receivingAssetId] -= amount;
+    }
+
+    
+    TransactionData memory txData = TransactionData({
+      user: invariantData.user,
+      router: invariantData.router,
+      sendingAssetId: invariantData.sendingAssetId,
+      receivingAssetId: invariantData.receivingAssetId,
+      sendingChainFallback: invariantData.sendingChainFallback,
+      callTo: invariantData.callTo,
+      receivingAddress: invariantData.receivingAddress,
+      callDataHash: invariantData.callDataHash,
+      transactionId: invariantData.transactionId,
+      sendingChainId: invariantData.sendingChainId,
+      receivingChainId: invariantData.receivingChainId,
+      amount: amount,
+      expiry: expiry,
+      preparedBlockNumber: block.number
+    });
+    emit TransactionPrepared(txData.user, txData.router, txData.transactionId, txData, msg.sender, encryptedCallData, encodedBid, bidSignature);
+    return txData;
+  }
+
+
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  function fulfill(
+    TransactionData calldata txData,
+    uint256 relayerFee,
+    bytes calldata signature, 
+    bytes calldata callData
+  ) external override nonReentrant returns (TransactionData memory) {
+    
+    
+    
+    bytes32 digest = hashInvariantTransactionData(txData);
+
+    
+    require(variantTransactionData[digest] == hashVariantTransactionData(txData), ""fulfill: INVALID_VARIANT_DATA"");
+
+    
+    require(txData.expiry > block.timestamp, ""fulfill: EXPIRED"");
+
+    
+    require(txData.preparedBlockNumber > 0, ""fulfill: ALREADY_COMPLETED"");
+
+    
+    require(recoverFulfillSignature(txData, relayerFee, signature) == txData.user, ""fulfill: INVALID_SIGNATURE"");
+
+    
+    
+    require(relayerFee <= txData.amount, ""fulfill: INVALID_RELAYER_FEE"");
+
+    
+    require(keccak256(callData) == txData.callDataHash, ""fulfill: INVALID_CALL_DATA"");
+
+    
+    
+    
+    
+    
+    
+    variantTransactionData[digest] = keccak256(abi.encode(VariantTransactionData({
+      amount: txData.amount,
+      expiry: txData.expiry,
+      preparedBlockNumber: 0
+    })));
+
+    
+    removeUserActiveBlocks(txData.user, txData.preparedBlockNumber);
+
+    if (txData.sendingChainId == chainId) {
+      
+      
+      
+
+      
+      
+      require(msg.sender == txData.router, ""fulfill: ROUTER_MISMATCH"");
+
+      
+      routerBalances[txData.router][txData.sendingAssetId] += txData.amount;
+    } else {
+      
+      
+
+      
+      uint256 toSend = txData.amount - relayerFee;
+
+      
+      if (relayerFee > 0) {
+        require(
+          LibAsset.transferAsset(txData.receivingAssetId, payable(msg.sender), relayerFee),
+          ""fulfill: FEE_TRANSFER_FAILED""
+        );
+      }
+
+      
+      if (txData.callTo == address(0)) {
+        
+        require(
+          LibAsset.transferAsset(txData.receivingAssetId, payable(txData.receivingAddress), toSend),
+          ""fulfill: TRANSFER_FAILED""
+        );
+      } else {
+        
+        
+        
+
+        
+        if (!LibAsset.isEther(txData.receivingAssetId) && toSend > 0) {
+          require(LibERC20.approve(txData.receivingAssetId, txData.callTo, toSend), ""fulfill: APPROVAL_FAILED"");
+        }
+
+        
+        
+        
+        if (toSend > 0) {
+          try
+            IFulfillHelper(txData.callTo).addFunds{ value: LibAsset.isEther(txData.receivingAssetId) ? toSend : 0}(
+              txData.user,
+              txData.transactionId,
+              txData.receivingAssetId,
+              toSend
+            )
+          {} catch {
+            
+            
+            require(
+              LibAsset.transferAsset(txData.receivingAssetId, payable(txData.receivingAddress), toSend),
+              ""fulfill: TRANSFER_FAILED""
+            );
+          }
+        }
+
+        
+        try
+          IFulfillHelper(txData.callTo).execute(
+            txData.user,
+            txData.transactionId,
+            txData.receivingAssetId,
+            toSend,
+            callData
+          )
+        {} catch {
+          
+          
+          require(
+            LibAsset.transferAsset(txData.receivingAssetId, payable(txData.receivingAddress), toSend),
+            ""fulfill: TRANSFER_FAILED""
+          );
+        }
+      }
+    }
+
+    
+    emit TransactionFulfilled(txData.user, txData.router, txData.transactionId, txData, relayerFee, signature, callData, msg.sender);
+
+    return txData;
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  function cancel(TransactionData calldata txData, uint256 relayerFee, bytes calldata signature)
+    external
+    override
+    nonReentrant
+    returns (TransactionData memory)
+  {
+    
+    
+    
+
+    
+    
+    
+    bytes32 digest = hashInvariantTransactionData(txData);
+
+    
+    require(variantTransactionData[digest] == hashVariantTransactionData(txData), ""cancel: INVALID_VARIANT_DATA"");
+
+    
+    require(txData.preparedBlockNumber > 0, ""cancel: ALREADY_COMPLETED"");
+
+    
+    
+    require(relayerFee <= txData.amount, ""cancel: INVALID_RELAYER_FEE"");
+
+    
+    
+    
+    
+    
+    
+    variantTransactionData[digest] = keccak256(abi.encode(VariantTransactionData({
+      amount: txData.amount,
+      expiry: txData.expiry,
+      preparedBlockNumber: 0
+    })));
+
+    
+    removeUserActiveBlocks(txData.user, txData.preparedBlockNumber);
+
+    
+    if (txData.sendingChainId == chainId) {
+      
+      if (txData.expiry >= block.timestamp) {
+        
+        
+        
+        
+        require(msg.sender == txData.router, ""cancel: ROUTER_MUST_CANCEL"");
+
+        
+        require(
+          LibAsset.transferAsset(txData.sendingAssetId, payable(txData.sendingChainFallback), txData.amount),
+          ""cancel: TRANSFER_FAILED""
+        );
+      } else {
+        
+        
+        if (relayerFee > 0) {
+          require(recoverCancelSignature(txData, relayerFee, signature) == txData.user, ""cancel: INVALID_SIGNATURE"");
+
+          require(
+            LibAsset.transferAsset(txData.receivingAssetId, payable(msg.sender), relayerFee),
+            ""cancel: FEE_TRANSFER_FAILED""
+          );
+        }
+
+        
+        uint256 toRefund = txData.amount - relayerFee;
+
+        
+        if (toRefund > 0) {
+          require(
+            LibAsset.transferAsset(txData.sendingAssetId, payable(txData.sendingChainFallback), toRefund),
+            ""cancel: TRANSFER_FAILED""
+          );
+        }
+      }
+
+    } else {
+      
+      if (txData.expiry >= block.timestamp) {
+        
+        
+        require(recoverCancelSignature(txData, relayerFee, signature) == txData.user, ""cancel: INVALID_SIGNATURE"");
+
+        
+        
+        
+      }
+
+      
+      routerBalances[txData.router][txData.receivingAssetId] += txData.amount;
+    }
+
+    
+    emit TransactionCancelled(txData.user, txData.router, txData.transactionId, txData, relayerFee, msg.sender);
+
+    
+    return txData;
+  }
+
+  
+  function getActiveTransactionBlocks(address user) external override view returns (uint256[] memory) {
+    return activeTransactionBlocks[user];
+  }
+
+  
+  
+  
+
+  
+  
+  
+  
+  function removeUserActiveBlocks(address user, uint256 preparedBlock) internal {
+    
+    uint256 newLength = activeTransactionBlocks[user].length - 1;
+    uint256[] memory updated = new uint256[](newLength);
+    bool removed = false;
+    uint256 updatedIdx = 0;
+    for (uint256 i; i < newLength + 1; i++) {
+      
+      
+      if (!removed && activeTransactionBlocks[user][i] == preparedBlock) {
+        removed = true;
+        continue;
+      }
+      updated[updatedIdx] = activeTransactionBlocks[user][i];
+      updatedIdx++;
+    }
+    activeTransactionBlocks[user] = updated;
+  }
+
+  
+  
+  
+  
+  
+  
+  function recoverFulfillSignature(
+    TransactionData calldata txData,
+    uint256 relayerFee,
+    bytes calldata signature
+  ) internal pure returns (address) {
+    
+    SignedFulfillData memory payload = SignedFulfillData({transactionId: txData.transactionId, relayerFee: relayerFee});
+
+    
+    return ECDSA.recover(ECDSA.toEthSignedMessageHash(keccak256(abi.encode(payload))), signature);
+  }
+
+  
+  
+  
+  
+  
+  
+  function recoverCancelSignature(TransactionData calldata txData, uint256 relayerFee, bytes calldata signature)
+    internal
+    pure
+    returns (address)
+  {
+    
+    SignedCancelData memory payload = SignedCancelData({transactionId: txData.transactionId, cancel: ""cancel"", relayerFee: relayerFee});
+
+    
+    return ECDSA.recover(ECDSA.toEthSignedMessageHash(keccak256(abi.encode(payload))), signature);
+  }
+
+  
+  
+  
+  function hashInvariantTransactionData(TransactionData calldata txData) internal pure returns (bytes32) {
+    InvariantTransactionData memory invariant = InvariantTransactionData({
+      user: txData.user,
+      router: txData.router,
+      sendingAssetId: txData.sendingAssetId,
+      receivingAssetId: txData.receivingAssetId,
+      sendingChainFallback: txData.sendingChainFallback,
+      callTo: txData.callTo,
+      receivingAddress: txData.receivingAddress,
+      sendingChainId: txData.sendingChainId,
+      receivingChainId: txData.receivingChainId,
+      callDataHash: txData.callDataHash,
+      transactionId: txData.transactionId
+    });
+    return keccak256(abi.encode(invariant));
+  }
+
+  
+  
+  
+  function hashVariantTransactionData(TransactionData calldata txData) internal pure returns (bytes32) {
+    return keccak256(abi.encode(VariantTransactionData({
+      amount: txData.amount,
+      expiry: txData.expiry,
+      preparedBlockNumber: txData.preparedBlockNumber
+    })));
+  }
+}",3101,5,2,"Based on the detailed code review, here's a comprehensive audit task list:
+
+{
+  ""task_list"": [
+    {
+      ""Area"": ""Cross-Chain Security"",
+      ""Tasks"": [
+        ""Verify the integrity of cross-chain transaction validation mechanisms"",
+        ""Audit the signature recovery and verification process for prepare, fulfill, and cancel functions"",
+        ""Analyze potential replay attack vulnerabilities in transaction signatures"",
+        ""Validate chainId check and cross-chain transaction routing logic"",
+        ""Review the handling of transactions across different blockchain environments""
+      ]
+    },
+    {
+      ""Area"": ""Liquidity Management"",
+      ""Tasks"": [
+        ""Thoroughly examine router liquidity balance tracking mechanisms"",
+        ""Verify balance updates in addLiquidity and removeLiquidity functions"",
+        ""Check for potential integer overflow/underflow risks in liquidity calculations"",
+        ""Validate minimum liquidity requirements and transfer mechanisms"",
+        ""Assess router balance management during cross-chain transactions""
+      ]
+    },
+    {
+      ""Area"": ""Security Vulnerabilities"",
+      ""Tasks"": [
+        ""Comprehensive reentrancy protection analysis across all external functions"",
+        ""Verify non-zero value checks in critical transaction methods"",
+        ""Analyze signature verification mechanisms for potential spoofing"",
+        ""Check for proper input validation in all public/external functions"",
+        ""Review error handling and revert conditions for potential bypass scenarios""
+      ]
+    },
+    {
+      ""Area"": ""Transaction Management"",
+      ""Tasks"": [
+        ""Audit the prepare-fulfill-cancel transaction lifecycle"",
+        ""Verify timeout and expiry mechanisms"",
+        ""Analyze the handling of variant and invariant transaction data"",
+        ""Check the removeUserActiveBlocks mechanism for potential manipulation"",
+        ""Review fallback mechanisms for failed contract interactions during fulfillment""
+      ]
+    },
+    {
+      ""Area"": ""External Interactions"",
+      ""Tasks"": [
+        ""Verify safe external contract interactions with IFulfillHelper"",
+        ""Analyze the try-catch mechanism for external contract calls"",
+        ""Check approval and transfer mechanisms for ERC20 tokens"",
+        ""Validate the handling of ETH and ERC20 asset transfers"",
+        ""Review the safety of dynamic contract calls in fulfill function""
+      ]
+    },
+    {
+      ""Area"": ""Cryptographic Security"",
+      ""Tasks"": [
+        ""Audit ECDSA signature recovery methods"",
+        ""Verify the integrity of signature generation and verification"",
+        ""Check the hashing mechanisms for transaction data"",
+        ""Analyze the salt and unique identifier generation for transactions"",
+        ""Review the security of signed payload structures""
+      ]
+    },
+    {
+      ""Area"": ""Gas Optimization and Efficiency"",
+      ""Tasks"": [
+        ""Analyze gas consumption in complex transaction methods"",
+        ""Review array manipulation in removeUserActiveBlocks"",
+        ""Check for potential gas griefing through large input data"",
+        ""Validate the efficiency of mapping and array operations"",
+        ""Assess the computational complexity of signature and hash verification""
+      ]
+    },
+    {
+      ""Area"": ""Error Handling and Edge Cases"",
+      ""Tasks"": [
+        ""Identify potential edge cases in cross-chain transaction scenarios"",
+        ""Verify comprehensive error message coverage"",
+        ""Check handling of zero-value or dust transactions"",
+        ""Analyze recovery mechanisms for failed transactions"",
+        ""Review the robustness of transaction state management""
+      ]
+    }
+  ]
+}
+
+This task list provides a comprehensive and structured approach to auditing the TransactionManager contract. It covers critical areas of security, functionality, and performance, ensuring a thorough examination of the smart contract's design and implementation.
+
+The tasks are:
+- Specific and actionable
+- Directly addressing potential vulnerabilities
+- Covering multiple dimensions of smart contract security
+- Prioritizing cross-chain, cryptographic, and transaction management aspects
+
+Recommendations for the audit process:
+1. Follow the task list systematically
+2. Document findings for each task
+3. Provide specific recommendations for improvements
+4. Prioritize critical security vulnerabilities
+5. Consider potential attack vectors and edge cases","I've performed a detailed audit of the provided smart contract. Here's my analysis:
+
+{
+  ""ReviewingTheCode"": ""The code implements a cross-chain transaction management system that handles ERC20 tokens and ETH transfers across different blockchains. It allows routers to provide liquidity, users to prepare transactions, and includes mechanisms for fulfilling or canceling these transactions."",
+  ""IdentifyingKeyComponents"": {
+    ""ContractName"": ""TransactionManager"",
+    ""Purpose"": ""Manages cross-chain transactions, including preparing transactions on a source chain, providing router liquidity, and fulfilling or canceling transactions on the destination chain."",
+    ""InheritanceAndImports"": {
+      ""InheritsFrom"": [""ReentrancyGuard"", ""ITransactionManager""],
+      ""Imports"": [
+        ""./interfaces/IFulfillHelper.sol"",
+        ""./interfaces/ITransactionManager.sol"",
+        ""./lib/LibAsset.sol"",
+        ""./lib/LibERC20.sol"",
+        ""@openzeppelin/contracts/security/ReentrancyGuard.sol"",
+        ""@openzeppelin/contracts/utils/cryptography/ECDSA.sol""
+      ]
+    },
+    ""StateVariables"": [
+      {
+        ""Name"": ""routerBalances"",
+        ""Type"": ""mapping(address => mapping(address => uint256))"",
+        ""Purpose"": ""Tracks router liquidity balances by router address and asset""
+      },
+      {
+        ""Name"": ""activeTransactionBlocks"",
+        ""Type"": ""mapping(address => uint256[])"",
+        ""Purpose"": ""Tracks active transaction block numbers for each user""
+      },
+      {
+        ""Name"": ""variantTransactionData"",
+        ""Type"": ""mapping(bytes32 => bytes32)"",
+        ""Purpose"": ""Stores transaction variant data keyed by invariant data hash""
+      },
+      {
+        ""Name"": ""chainId"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Stores the current chain ID for cross-chain validation""
+      },
+      {
+        ""Name"": ""MIN_TIMEOUT"",
+        ""Type"": ""uint256"",
+        ""Purpose"": ""Minimum timespan for transaction expiry (24 hours)""
+      }
+    ],
+    ""FunctionsAndModifiers"": [
+      {
+        ""Name"": ""constructor"",
+        ""Visibility"": ""public"",
+        ""Purpose"": ""Initializes the contract with the chain ID"",
+        ""Parameters"": [""_chainId: uint256""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""addLiquidity"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows routers to add liquidity for a specific asset"",
+        ""Parameters"": [""amount: uint256"", ""assetId: address"", ""router: address""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""removeLiquidity"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Allows routers to remove their liquidity"",
+        ""Parameters"": [""amount: uint256"", ""assetId: address"", ""recipient: address payable""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""prepare"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Prepares a cross-chain transaction by locking funds on the sending chain or committing router liquidity on the receiving chain"",
+        ""Parameters"": [
+          ""invariantData: InvariantTransactionData"",
+          ""amount: uint256"",
+          ""expiry: uint256"",
+          ""encryptedCallData: bytes"",
+          ""encodedBid: bytes"",
+          ""bidSignature: bytes""
+        ],
+        ""Returns"": [""TransactionData memory""]
+      },
+      {
+        ""Name"": ""fulfill"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Fulfills a prepared transaction, transferring funds to the recipient on the receiving chain"",
+        ""Parameters"": [
+          ""txData: TransactionData"",
+          ""relayerFee: uint256"",
+          ""signature: bytes"",
+          ""callData: bytes""
+        ],
+        ""Returns"": [""TransactionData memory""]
+      },
+      {
+        ""Name"": ""cancel"",
+        ""Visibility"": ""external"",
+        ""Purpose"": ""Cancels a prepared transaction, refunding funds if expired"",
+        ""Parameters"": [
+          ""txData: TransactionData"",
+          ""relayerFee: uint256"",
+          ""signature: bytes""
+        ],
+        ""Returns"": [""TransactionData memory""]
+      },
+      {
+        ""Name"": ""getActiveTransactionBlocks"",
+        ""Visibility"": ""external view"",
+        ""Purpose"": ""Retrieves the active transaction blocks for a user"",
+        ""Parameters"": [""user: address""],
+        ""Returns"": [""uint256[] memory""]
+      },
+      {
+        ""Name"": ""removeUserActiveBlocks"",
+        ""Visibility"": ""internal"",
+        ""Purpose"": ""Removes a specific block from a user's active blocks array"",
+        ""Parameters"": [""user: address"", ""preparedBlock: uint256""],
+        ""Returns"": []
+      },
+      {
+        ""Name"": ""recoverFulfillSignature"",
+        ""Visibility"": ""internal pure"",
+        ""Purpose"": ""Recovers the signer address from a fulfill transaction signature"",
+        ""Parameters"": [
+          ""txData: TransactionData"",
+          ""relayerFee: uint256"",
+          ""signature: bytes""
+        ],
+        ""Returns"": [""address""]
+      },
+      {
+        ""Name"": ""recoverCancelSignature"",
+        ""Visibility"": ""internal pure"",
+        ""Purpose"": ""Recovers the signer address from a cancel transaction signature"",
+        ""Parameters"": [
+          ""txData: TransactionData"",
+          ""relayerFee: uint256"",
+          ""signature: bytes""
+        ],
+        ""Returns"": [""address""]
+      },
+      {
+        ""Name"": ""hashInvariantTransactionData"",
+        ""Visibility"": ""internal pure"",
+        ""Purpose"": ""Hashes the invariant parts of transaction data"",
+        ""Parameters"": [""txData: TransactionData""],
+        ""Returns"": [""bytes32""]
+      },
+      {
+        ""Name"": ""hashVariantTransactionData"",
+        ""Visibility"": ""internal pure"",
+        ""Purpose"": ""Hashes the variant parts of transaction data"",
+        ""Parameters"": [""txData: TransactionData""],
+        ""Returns"": [""bytes32""]
+      }
+    ]
+  },
+  ""ExternalInteractions"": [
+    ""IFulfillHelper.addFunds() - Called when fulfilling a transaction with a callTo address"",
+    ""IFulfillHelper.execute() - Called when fulfilling a transaction with a callTo address"",
+    ""LibAsset.isEther() - Utility to check if an asset is ETH"",
+    ""LibAsset.transferAsset() - Utility to transfer ETH or ERC20 tokens"",
+    ""LibERC20.transferFrom() - Used for ERC20 token transfers"",
+    ""LibERC20.approve() - Used for ERC20 approvals before calling external contracts"",
+    ""ECDSA.recover() - Used for signature verification""
+  ],
+  ""SpecialMechanisms"": [
+    ""Cross-chain transaction management using a prepare-fulfill pattern"",
+    ""Non-reentrant protection for all external methods via ReentrancyGuard"",
+    ""Signature verification for fulfillment and cancellation"",
+    ""Fallback mechanism for failed contract calls during transaction fulfillment"",
+    ""Transaction data split into invariant (hashed as index) and variant (stored as value) components"",
+    ""Router liquidity pool system for cross-chain asset availability"",
+    ""Try-catch pattern for safely handling external contract calls""
+  ],
+  ""Questions"": [
+    ""Is there a mechanism to handle chain reorganizations that might affect the prepared transactions?"",
+    ""How are transaction IDs generated to ensure uniqueness across chains?"",
+    ""What's the full logic behind encryptedCallData, encodedBid, and bidSignature in the prepare function?"",
+    ""Is there a timeout mechanism for transactions that are never fulfilled or canceled?"",
+    ""How is the relayer fee distributed when a transaction is fulfilled or canceled?"",
+    ""Are there any limits on the size of the activeTransactionBlocks array for a user?""
+  ]
+}
+
+The TransactionManager contract implements a complex cross-chain transaction system with several security mechanisms. It manages liquidity provided by routers and handles the preparation, fulfillment, and cancellation of cross-chain transactions.
+
+The contract uses a combination of cryptographic verification (ECDSA signatures), non-reentrant guards, and careful balance tracking to ensure secure operations. It splits transaction data into invariant (unchanging) and variant (changeable) parts for efficient storage and validation.
+
+The system appears well-designed with appropriate fallback mechanisms when contract calls fail during fulfillment. However, there are some potential concerns about array growth limitations and handling of chain reorganizations that might warrant further investigation.","I've analyzed the provided smart contract security findings for the TransactionManager contract. After reviewing all the issues across different analyses, I've consolidated similar issues and organized them by severity.
+
+{
+  ""Findings"": [
+    {
+      ""Issue"": ""Front-running vulnerability in the prepare function"",
+      ""Severity"": ""High"",
+      ""Description"": ""The prepare function lacks protection against front-running attacks. Transaction details including amount and expiry are exposed in the mempool before confirmation. An attacker could observe pending transactions and submit their own with higher gas fees to manipulate market conditions before the original transaction is processed."",
+      ""Impact"": ""Attackers could manipulate market conditions or execute their own transactions based on knowledge of pending cross-chain transactions, potentially causing financial losses to users who experience worse execution prices."",
+      ""Location"": ""prepare function (lines 95-230)""
+    },
+    {
+      ""Issue"": ""Signature replay vulnerability"",
+      ""Severity"": ""High"",
+      ""Description"": ""The signature verification in recoverFulfillSignature and recoverCancelSignature doesn't include the chainId or a nonce mechanism, making cross-chain replay attacks possible. The signatures only include the transactionId and relayerFee without any unique identifier that would prevent the same signature from being reused in different contexts."",
+      ""Impact"": ""Signatures could be captured and replayed on different chains or in different contexts, potentially allowing unauthorized fulfillment or cancellation of transactions, leading to fund manipulation or loss."",
+      ""Location"": ""recoverFulfillSignature function (lines 471-496), recoverCancelSignature function""
+    },
+    {
+      ""Issue"": ""Reentrancy risk in external calls"",
+      ""Severity"": ""High"",
+      ""Description"": ""In the fulfill function, there's a potential reentrancy attack vector when making external calls to IFulfillHelper. While the contract uses ReentrancyGuard, the contract first approves tokens and then executes an external call with user-supplied callData to the callTo address without sufficient validation. If callTo is malicious, it could reenter the contract before function completion."",
+      ""Impact"": ""A malicious callTo contract could reenter the TransactionManager and exploit the state between operations, potentially draining funds or manipulating transaction states."",
+      ""Location"": ""fulfill function (lines 237-336), specifically the external calls to IFulfillHelper""
+    },
+    {
+      ""Issue"": ""Missing slippage protection in cross-chain transactions"",
+      ""Severity"": ""High"",
+      ""Description"": ""The prepare function doesn't implement slippage protection for cross-chain transactions. When users initiate a transaction on one chain with a specific amount, there's no mechanism to ensure they receive a fair value on the receiving chain, especially considering potential price fluctuations during the transaction's pending time."",
+      ""Impact"": ""Users could receive significantly less value than expected due to price movements between transaction preparation and fulfillment, leading to financial losses."",
+      ""Location"": ""prepare function (lines 164-265)""
+    },
+    {
+      ""Issue"": ""Insufficient validation in prepare function"",
+      ""Severity"": ""High"",
+      ""Description"": ""The prepare function has commented-out validation code related to bid signature validation. There appears to be incomplete or disabled validation for encodedBid and bidSignature parameters, with no active code that validates these inputs, which could allow unauthorized transactions."",
+      ""Impact"": ""Attackers could potentially prepare transactions without proper authorization by the router, leading to financial losses or system manipulation."",
+      ""Location"": ""prepare function (lines 123-175)""
+    },
+    {
+      ""Issue"": ""Unvalidated token approval in fulfill function"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The contract approves the entire toSend amount to the callTo address without validating that it's trusted. While the function attempts to handle failed calls through try-catch blocks, a malicious callTo contract could simply accept the approval without triggering exceptions and later drain the funds."",
+      ""Impact"": ""If the callTo address is malicious or compromised, it could use the approval to drain tokens from the contract, potentially leading to loss of funds."",
+      ""Location"": ""fulfill function (line 303)""
+    },
+    {
+      ""Issue"": ""Unchecked return values on external calls"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""In the fulfill function, the contract makes external calls to IFulfillHelper but doesn't properly check the return values. While there are try-catch blocks, the contract doesn't verify if the operations were actually successful and doesn't log or handle specific errors, making it difficult to debug issues."",
+      ""Impact"": ""Silent failures could lead to unexpected behavior or contract state inconsistencies. If the external call fails silently (not throwing an exception), the transaction might be considered fulfilled even though the underlying operation failed, potentially causing funds to be lost or locked."",
+      ""Location"": ""fulfill function (lines 290-312), external call to IFulfillHelper.execute""
+    },
+    {
+      ""Issue"": ""Inadequate validation of relayerFee"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""While there is a check that relayerFee <= txData.amount, there's no minimum bound check. Additionally, when canceling a transaction on the receiving chain with an active timeout, the function requires a valid signature for a non-zero relayerFee but doesn't actually transfer the fee to the relayer."",
+      ""Impact"": ""This could lead to economic incentive misalignment, where relayers might ignore transactions with extremely low fees, causing transactions to remain in a prepared state indefinitely. Relayers expecting payment for facilitating cancellations won't receive their fee despite having a valid signature."",
+      ""Location"": ""fulfill function (line 270), cancel function (line 364)""
+    },
+    {
+      ""Issue"": ""Array manipulation issues in removeUserActiveBlocks"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The removeUserActiveBlocks function has multiple issues: 1) It assumes the block will always be found in the array, 2) It doesn't check if the activeTransactionBlocks array is empty before creating a new array of length (length-1), which could cause an underflow, 3) It creates a new array in memory and copies values rather than manipulating storage directly, which is gas inefficient."",
+      ""Impact"": ""If the prepared block isn't found or if the array is empty, the function could incorrectly handle array manipulation, potentially causing contract failures, unexpected behavior, or data corruption. The inefficient implementation also leads to higher gas costs, especially for users with many active transactions."",
+      ""Location"": ""removeUserActiveBlocks function (lines 390-414)""
+    },
+    {
+      ""Issue"": ""Lack of pausable mechanism"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The contract lacks a pause mechanism that would allow administrators to halt operations in case of detected vulnerabilities or attacks. This is particularly important for cross-chain applications where exploits might be more complex to detect and mitigate."",
+      ""Impact"": ""In case of a discovered vulnerability, there's no way to quickly stop the contract operations, potentially leading to significant financial losses before a fix can be deployed."",
+      ""Location"": ""Entire contract""
+    },
+    {
+      ""Issue"": ""No protection against compromised router"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The contract design assumes routers are trusted entities with no fallback mechanism if a router becomes compromised. There's no ability for users to cancel transactions or recover funds if a router misbehaves in certain scenarios."",
+      ""Impact"": ""Users could lose funds permanently if a router is compromised or acts maliciously, particularly for users with many transactions, potentially making the platform expensive to use."",
+      ""Location"": ""Throughout the contract, particularly in the relationship between prepare, fulfill, and cancel functions""
+    },
+    {
+      ""Issue"": ""Insufficient handling of failed token transfers in error paths"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""In several places, the contract attempts to send tokens to a fallback address after failed operations, but doesn't have a comprehensive fallback plan if those transfers also fail. This is particularly concerning in the error handling paths of the fulfill function."",
+      ""Impact"": ""If transfers to the fallback address fail, tokens could be trapped in the contract with no way to retrieve them."",
+      ""Location"": ""fulfill function (lines 310-315, 325-331)""
+    },
+    {
+      ""Issue"": ""Block number/timestamp manipulation risks"",
+      ""Severity"": ""Medium"",
+      ""Description"": ""The contract uses block.number for tracking active transactions and block.timestamp for transaction expiry validation. Block numbers can be manipulated by miners to some extent, and their progression isn't consistent across different chains. Block.timestamp can also be slightly manipulated by miners (typically by a few seconds)."",
+      ""Impact"": ""Could lead to inconsistent behavior or attacks targeting specific block number/timestamp conditions, especially in cross-chain contexts. Miners could potentially manipulate the timestamp to execute or prevent transaction cancellations near the expiry boundary."",
+      ""Location"": ""prepare function (block.number usage), fulfill and cancel functions (block.timestamp usage)""
+    },
+    {
+      ""Issue"": ""Missing validation for addresses"",
+      ""Severity"": ""Low"",
+      ""Description"": ""Various functions in the contract have incomplete address validation. For example, the removeLiquidity function doesn't check if the recipient address is the zero address, and there's no consistent validation for the callTo address in prepare. The constructor doesn't validate that the chainId parameter is non-zero."",
+      ""Impact"": ""If addresses are mistakenly set to zero when meant to be valid, it could change transaction behavior unexpectedly or lead to permanent loss of funds. If the contract is deployed with chainId=0, it could lead to unexpected behavior and potential security issues."",
+      ""Location"": ""removeLiquidity function, prepare function (address checks), constructor""
+    },
+    {
+      ""Issue"": ""No special treatment for fee-on-transfer tokens"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The contract doesn't handle fee-on-transfer tokens specially. When such tokens are used, the actual amount received by the contract may be less than the specified amount, causing accounting discrepancies."",
+      ""Impact"": ""For fee-on-transfer tokens, the contract's balance tracking would be incorrect, potentially leading to locked funds or failed transactions."",
+      ""Location"": ""addLiquidity function (line 73), prepare function (line 167-171)""
+    },
+    {
+      ""Issue"": ""Lack of event emissions for state changes"",
+      ""Severity"": ""Low"",
+      ""Description"": ""The contract doesn't emit events for all critical state changes, particularly when router balances are modified inside the fulfill function or when adding to activeTransactionBlocks. Some important state changes aren't accompanied by specific events to track these changes."",
+      ""Impact"": ""Reduced transparency and auditability of the contract's operations, making it harder to track and verify changes to router balances and complicating off-chain monitoring of active transactions."",
+      ""Location"": ""fulfill function (line 283), prepare function where activeTransactionBlocks is updated""
+    },
+    {
+      ""Issue"": ""Unlimited storage growth in activeTransactionBlocks"",
+      ""Severity"": ""Low"",
+      ""Description"": ""Each time a transaction is prepared, a new block number is added to the activeTransactionBlocks array for the user. If a user prepares many transactions but doesn't fulfill or cancel them before they expire, this array could grow indefinitely."",
+      ""Impact"": ""Could lead to increased gas costs for users over time and potential DoS conditions if arrays grow very large."",
+      ""Location"": ""prepare function (line 205)""
+    }
+  ],
+  ""IssueNumber"": 50,
+  ""OutputList"": 16
+}",444.4686141014099,81482.0,32.0,"### **Summary of Matches and Gaps**
+
+---
+
+### **[H-01] Anyone can arbitrarily add router liquidity**
+
+**Report Description**:  
+The `addLiquidity()` function allows anyone to call it on behalf of a router, enabling unauthorized movement of ERC20 tokens from the router's address to the contract. This lack of access control increases the router's exposure to protocol risk without its consent. For `assetID == 0`, the Ether transfer comes from `msg.sender`, but for ERC20 tokens, the router must have approved the contract for the transfer. This could lead to unauthorized liquidity increases and increased risk for the router.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this issue. The lack of access control in `addLiquidity()` is a critical vulnerability that is entirely missed in the response list.
+
+---
+
+### **[H-02] `activeTransactionBlocks` are vulnerable to DDoS attacks**
+
+**Report Description**:  
+The `removeUserActiveBlocks` function iterates over the `activeTransactionBlocks` array, which can grow indefinitely. A malicious actor can repeatedly call `prepare` with a zero amount to push blocks into the array, causing the loop to exceed gas limits and effectively DDoS the user. Additionally, the function is gas-inefficient for large arrays. The issue could be mitigated by using an `EnumerableMap` or limiting the array size.
+
+**Match in Response List**:  
+Matches with the issue titled **""Array manipulation issues in removeUserActiveBlocks""**.
+
+**Validation**:  
+**Partially Correct**. The response identifies the gas inefficiency and potential array manipulation issues but does not fully address the DDoS risk or suggest specific solutions like `EnumerableMap` or array size limits.
+
+---
+
+### **[H-03] Router liquidity on receiving chain can be double-dipped by the user**
+
+**Report Description**:  
+During `fulfill()`, if the user sets up an external contract at `txData.callTo` that causes both `addFunds()` and `execute()` to revert, the `toSend` amount is transferred twice to the `receivingAddress`. This allows the user to double-dip the router's liquidity, effectively receiving twice the intended amount and causing the router to lose funds.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this issue. The double-dipping vulnerability is a critical risk to router liquidity that is entirely missed.
+
+---
+
+### **[H-04] Expired transfers will lock user funds on the sending chain**
+
+**Report Description**:  
+The `cancel()` function pays the relayer in `receivingAssetId` on the sending chain instead of `sendingAssetId`. If `receivingAssetId` does not exist on the sending chain, the transaction will revert, and user funds will remain locked indefinitely. This issue prevents the cancellation of expired transfers if the user relies on a relayer.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**. The response list does not address this issue. The incorrect asset ID in `cancel()` is a critical vulnerability that could lead to permanent fund locking.
+
+---
+
+### **[H-05] Approval is not reset if the call to `IFulfillHelper` fails**
+
+**Report Description**:  
+The `fulfill` function approves the `callTo` address to transfer `toSend` tokens but does not reset the approval if the call to `IFulfillHelper` fails. This allows a malicious `callTo` to later pull the approved tokens, leading to potential fund loss.
+
+**Match in Response List**:  
+Matches with the issue titled **""Unvalidated token approval in fulfill function""**.
+
+**Validation**:  
+**Correct**. The response accurately identifies the issue with unvalidated token approvals and the risk of a malicious `callTo` address draining funds.
+
+---
+
+### **[M-01] Signatures use only tx ID instead of entire digest**
+
+**Report Description**:  
+The signature check in `recoverFulfillSignature()` uses only the transaction ID and relayer fee, making it vulnerable to replay attacks. The signature should be on the entire digest `hashInvariantTransactionData(txData)` to prevent accidental or intentional reuse of signatures.
+
+**Match in Response List**:  
+Matches with the issue titled **""Signature replay vulnerability""**.
+
+**Validation**:  
+**Correct**. The response accurately identifies the replay vulnerability and the need for a more comprehensive signature mechanism.
+
+---
+
+### **[M-02] Malicious router can block cross-chain transfers**
+
+**Report Description**:  
+A malicious router can bid on a user's cross-chain transfer off-chain, lock the user's funds by submitting a `prepare` transaction, and then fail to fulfill the transfer by submitting a `prepare` transaction with `amount=0`. This blocks the user's funds for the entire expiry period without the router locking any funds.
+
+**Match in Response List**:  
+Matches with the issue titled **""No protection against compromised router""**.
+
+**Validation**:  
+**Partially Correct**. The response identifies the risk of a compromised router but does not specifically address the scenario where a router blocks transfers by submitting `amount=0` transactions.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:
+
+- **[H-05] Approval is not reset if the call to `IFulfillHelper` fails**
+- **[M-01] Signatures use only tx ID instead of entire digest**
+
+**Partially Correct Matches**:
+
+- **[H-02] `activeTransactionBlocks` are vulnerable to DDoS attacks**
+- **[M-02] Malicious router can block cross-chain transfers**
+
+**Missed Issues from Issue Report**:
+
+- **[H-01] Anyone can arbitrarily add router liquidity**
+- **[H-03] Router liquidity on receiving chain can be double-dipped by the user**
+- **[H-04] Expired transfers will lock user funds on the sending chain**
+
+--- 
+
+The response list covers some issues but misses critical vulnerabilities related to access control, double-dipping, and fund locking. Additionally, some responses only partially address the identified issues, leaving gaps in the proposed solutions.","```
+1. Unvalidated token approval in fulfill function
+2. Signature replay vulnerability
+```","To calculate the **Average Precision (AP)** for the given query, follow these steps:
+
+1. **Identify the ranks of the true positives in the ranked list of predictions**:
+   - ""Unvalidated token approval in fulfill function"" appears at rank 6.
+   - ""Signature replay vulnerability"" appears at rank 2.
+
+2. **Calculate the precision at each rank where a true positive appears**:
+   - For rank 2: \( P@2 = \frac{1}{2} = 0.5 \)
+   - For rank 6: \( P@6 = \frac{2}{6} \approx 0.333 \)
+
+3. **Average the precision values**:
+   - \( AP = \frac{0.5 + 0.333}{2} = \frac{0.833}{2} \approx 0.4165 \)
+
+**Average Precision (AP)**: 0.4165"
