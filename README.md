@@ -20,7 +20,7 @@ Key innovations include:
 Experimental results show that SmartAuditFlow achieves **100% accuracy** on common vulnerability benchmarks and identifies **13 additional CVEs** missed by other methods, demonstrating superior adaptability and utility.
 
 <div align="center">
-  <img src="./media/plan_and_execute.png" alt="LLM-SmartAudit System" height="350">
+  <img src="./media/planAndExecute.png" alt="LLM-SmartAudit System" height="350">
 </div>
 
 
