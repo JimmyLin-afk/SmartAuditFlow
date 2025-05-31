@@ -17,12 +17,20 @@ Key innovations include:
 * **Structured reasoning** and **prompt optimization** to improve LLM performance.
 * **Integration with static analyzers** and **Retrieval-Augmented Generation (RAG)** for contextual enrichment.
 
-Experimental results show that SmartAuditFlow achieves **100% accuracy** on common vulnerability benchmarks and identifies **13 additional CVEs** missed by other methods, demonstrating superior adaptability and utility.
+This framework is inspired by the [Plan-and-Solve](https://aclanthology.org/2023.acl-long.147.pdf) paper as well as the [Baby-AGI](https://github.com/yoheinakajima/babyagi) project.
+
+The core idea is to first come up with a multi-step plan, and then go through that plan one item at a time. After accomplishing a particular task, you can then revisit the plan and modify as appropriate.
+
+The general computational graph looks like the following:
 
 <div align="center">
   <img src="./media/planAndExecute.png" alt="LLM-SmartAudit System" height="350">
 </div>
 
+This compares to a typical [ReAct](https://arxiv.org/abs/2210.03629) style agent where you think one step at a time. The advantages of this "plan-and-execute" style agent are:
+
+Explicit long term planning (which even really strong LLMs can struggle with)
+Ability to use smaller/weaker models for the execution step, only using larger/better models for the planning step
 
 ## 📑 Quick Links
 | Resource | Description | Link |
