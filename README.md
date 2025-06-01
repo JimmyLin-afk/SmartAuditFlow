@@ -24,7 +24,7 @@ The core idea is to first come up with a multi-step plan, and then go through th
 The general computational graph looks like the following:
 
 <div align="center">
-  <img src="./media/planAndExecute.png" alt="LLM-SmartAudit System" height="350">
+  <img src="./media/plan_and_execute.png" alt="LLM-SmartAudit System" height="350">
 </div>
 
 This compares to a typical [ReAct](https://arxiv.org/abs/2210.03629) style agent where you think one step at a time. The advantages of this "plan-and-execute" style agent are:
