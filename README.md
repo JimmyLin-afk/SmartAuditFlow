@@ -60,6 +60,18 @@ The source code and instructions are available at:
 3. **Run the demo**
    Follow the instructions in the [documentation](./docs/) to perform your first smart contract audit.
 
+===========================================
+## Tool Presentation
+
+<div align="center">
+  <img src="./media/show1.png" alt="SmartAuditFlow System" height="350">
+</div>
+
+<div align="center">
+  <img src="./media/show2.jpg" alt="Auditing Findings" height="440">
+</div>
+
+
 ## Citation
 
 If you use SmartAuditFlow in your research, please cite:
