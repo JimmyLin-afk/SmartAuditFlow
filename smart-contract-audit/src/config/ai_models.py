@@ -1,6 +1,3 @@
-"""
-AI Models configuration for the Smart Contract Audit application
-"""
 import os
 from dotenv import load_dotenv
 

@@ -6,26 +6,31 @@
 
 **SmartAuditFlow** is a dynamic and adaptive framework for automated smart contract auditing, leveraging Large Language Models (LLMs) and workflow-driven strategies to deliver reliable, precise, and scalable security analysis.
 
-## Overview
+## 🌟 Overview
 
-**SmartAuditFlow** addresses these limitations by orchestrating LLMs within a structured, multi-stage workflow, enabling dynamic audit plan generation, iterative reasoning, and integration of external tools for enhanced vulnerability detection.
-
-Key innovations include:
+SmartAuditFlow addresses key limitations in smart contract auditing by orchestrating LLMs within a structured, multi-stage workflow, enabling:
 
 * **Dynamic audit plan customization** for each contract.
 * **Iterative execution and refinement** of audit strategies based on intermediate findings.
 * **Structured reasoning** and **prompt optimization** to improve LLM performance.
 * **Integration with static analyzers** and **Retrieval-Augmented Generation (RAG)** for contextual enrichment.
 
+### 🔍 Core Concept
+
 This framework is inspired by the [Plan-and-Solve](https://aclanthology.org/2023.acl-long.147.pdf) paper as well as the [Baby-AGI](https://github.com/yoheinakajima/babyagi) project.
 
-The core idea is to first come up with a multi-step plan, and then go through that plan one item at a time. After accomplishing a particular task, you can then revisit the plan and modify as appropriate.
-
-The general computational graph looks like the following:
+The framework follows a "plan-and-execute" approach:
+1. Create a multi-step audit plan
+2. Execute tasks sequentially
+3. Refine plan based on intermediate findings
 
 <div align="center">
-  <img src="./media/plan_and_execute.png" alt="LLM-SmartAudit System" height="350">
+  <img src="./media/plan_and_execute.png" alt="LLM-SmartAudit System" width="400">
+  <br>
+  <em>SmartAuditFlow computational graph</em>
 </div>
+
+### 🚀 Advantages Over Traditional Methods
 
 This compares to a typical [ReAct](https://arxiv.org/abs/2210.03629) style agent where you think one step at a time. The advantages of this "plan-and-execute" style agent are:
 
@@ -33,46 +38,46 @@ Explicit long term planning (which even really strong LLMs can struggle with)
 Ability to use smaller/weaker models for the execution step, only using larger/better models for the planning step
 
 ## 📑 Quick Links
-| Resource | Description | Link |
-|----------|-------------|------|
-| 📊 Dataset | Explore our benchmark dataset | [View Dataset](https://github.com/JimmyLin-afk/SmartAuditFlow/tree/main/evaluation/contracts) |
-| 📈 Evaluation Results | See our tool's performance metrics | [View Results](https://github.com/JimmyLin-afk/SmartAuditFlow/tree/main/evaluation/results) |
-| 🛠️ Prompt Optimization | execute code for optimial prompt generate | [View Code](https://github.com/JimmyLin-afk/SmartAuditFlow/tree/main/promptOptimization) |
-| 📚 Documentation | Comprehensive guide | [Read Docs](https://github.com/JimmyLin-afk/SmartAuditFlow/wiki) |
-| 🐛 Issue Tracker | Report bugs or request features | [Issues](https://github.com/JimmyLin-afk/SmartAuditFlow/issues) |
+| Section | Description | Link |
+|---------|-------------|------|
+| 🛠️ Audit Tool | Main auditing application | [View Code](/smart-contract-audit) |
+| 📊 Dataset | Benchmark contracts for evaluation | [View Dataset](/evaluation/contracts) |
+| 📈 Results | Performance metrics and analysis | [View Results](/evaluation/results) |
+| ✨ Prompt Optimization | Optimal prompt generation code | [View Code](/promptOptimization) |
+| 📚 Documentation | Comprehensive user guide | [Read Docs](/wiki) |
+| 🐛 Issue Tracker | Report bugs or request features | [View Issues](https://github.com/JimmyLin-afk/SmartAuditFlow/issues) |
 
-===========================================
-## Getting Started
+## 🚀 Getting Started
 
-The source code and instructions are available at:
-[https://github.com/JimmyLin-afk/SmartAuditFlow](https://github.com/JimmyLin-afk/SmartAuditFlow)
+```bash
+# Clone the repository
+git clone https://github.com/JimmyLin-afk/SmartAuditFlow.git
+cd SmartAuditFlow
 
-1. **Clone the repository**
+# Install dependencies
+pip install -r requirements.txt
 
-   ```bash
-   git clone https://github.com/JimmyLin-afk/SmartAuditFlow.git
-   cd SmartAuditFlow
-   ```
+# Run the demo (see documentation for details)
+```
 
-2. **Install dependencies**
-   (See [requirements.txt](./requirements.txt) or the project documentation.)
+## 🖥️ Tool Demonstration
 
-3. **Run the demo**
-   Follow the instructions in the [documentation](./docs/) to perform your first smart contract audit.
-
-===========================================
-## Tool Presentation
-
+#### 1. **Input Code Snippet**
 <div align="center">
-  <img src="./media/show1.png" alt="SmartAuditFlow System" height="350">
+  <img src="./media/show1.png" alt="Code input interface" height="350">
 </div>
 
+#### 2. **Audit Process**
 <div align="center">
-  <img src="./media/show2.jpg" alt="Auditing Findings" height="440">
+  <img src="./media/show2.png" alt="Auditing Process" height="390">
 </div>
 
+#### 3. **Audit Findings**
+<div align="center">
+  <img src="./media/show3.png" alt="Auditing Findings" height="335">
+</div>
 
-## Citation
+## 📚 Citation
 
 If you use SmartAuditFlow in your research, please cite:
 
