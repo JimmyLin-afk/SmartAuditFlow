@@ -1,7 +1,3 @@
-"""
-Simplified configuration settings for the Smart Contract Audit application
-No database dependencies - uses in-memory storage
-"""
 import os
 from dotenv import load_dotenv
 
