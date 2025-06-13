@@ -7,8 +7,10 @@ This guide covers deploying the Smart Contract Audit Tool to various environment
 ### Quick Start
 ```bash
 cd smart-contract-audit
-source venv/bin/activate
+python3 -m venv venv
+`source venv/bin/activate` (Linux/Mac) or `venv\Scripts\activate` (Windows)
 cp .env.template .env
+pip install -r requirements.txt
 # Edit .env with your API keys
 python src/main.py
 ```

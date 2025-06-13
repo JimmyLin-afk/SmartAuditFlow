@@ -1,78 +1,134 @@
 import random
-from Levenshtein import distance as levenshtein_distance # pip install python-Levenshtein
+from sentence_transformers import SentenceTransformer, util
+
+# Load a pre-trained Sentence-BERT model
+# This will download the model the first time it's run.
+# Consider moving this to a more central place or initializing once if performance is critical.
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def calculate_prompt_similarity(prompt1: str, prompt2: str) -> float:
     """
-    Calculates similarity between two prompts. Returns a score between 0 and 1.
-    (1 for identical, 0 for completely different).
-
-    Args:
-        prompt1 (str): The first prompt.
-        prompt2 (str): The second prompt.
-
-    Returns:
-        float: The similarity score.
+    Calculates similarity between two prompts using Sentence-BERT embeddings and cosine similarity.
+    Returns a score between 0 and 1.
     """
-    # Placeholder: Using normalized Levenshtein distance as an example.
-    # Consider semantic similarity for more advanced use cases.
     if not prompt1 and not prompt2:
         return 1.0
-    if not prompt1 or not prompt2: # One is empty, the other is not
+    if not prompt1 or not prompt2:
         return 0.0
-    max_len = max(len(prompt1), len(prompt2))
-    if max_len == 0: # Should be caught by the first condition
-        return 1.0
-    return 1.0 - (levenshtein_distance(prompt1, prompt2) / max_len)
+
+    # Encode the prompts to get their embeddings
+    embedding1 = model.encode(prompt1, convert_to_tensor=True)
+    embedding2 = model.encode(prompt2, convert_to_tensor=True)
+
+    # Calculate cosine similarity
+    cosine_similarity = util.cos_sim(embedding1, embedding2).item()
+
+    # Cosine similarity ranges from -1 to 1. Normalize to 0 to 1.
+    return (cosine_similarity + 1) / 2
 
 def mutate_prompt_guided(parent_prompt: str, temperature: float, current_batch: list) -> str:
     """
-    Mutates a parent prompt.
-    'temperature' can control the extent/randomness of mutation.
-    'current_batch' (list of (context, answer) tuples) can be used for guided mutation.
-
-    Args:
-        parent_prompt (str): The prompt to mutate.
-        temperature (float): Controls the mutation strength/randomness.
-        current_batch (list): Mini-batch of data for context-aware mutation.
-
-    Returns:
-        str: The mutated prompt.
+    Mutates a parent prompt using paraphrasing, keyword substitution, and structural edits.
+    `temperature` controls the extent/randomness of mutation.
+    `current_batch` (list of (context, answer) tuples) can be used for guided mutation.
     """
-    # Placeholder: This is a very basic mutation strategy.
-    # You'll likely want to implement more sophisticated prompt mutation techniques.
     words = parent_prompt.split()
     if not words:
-        return "A new simple example prompt." # Default for empty parent
+        return "Analyze the smart contract thoroughly."
 
-    num_mutations = max(1, int(len(words) * temperature * 0.5)) # Higher temp = more potential changes
+    # Determine number of mutations based on temperature and prompt length
+    num_mutations = max(1, int(len(words) * temperature * 0.3)) # Reduced impact of temperature
 
     for _ in range(num_mutations):
-        if not words: break # Stop if words list becomes empty
-        mutation_type = random.choice(["replace_word", "insert_word", "delete_word", "swap_words"])
+        if not words: break
+        mutation_type = random.choice([
+            "replace_keyword", 
+            "insert_phrase", 
+            "delete_word", 
+            "reorder_words",
+            "paraphrase_segment"
+        ])
 
-        if mutation_type == "replace_word" and words:
-            idx = random.randint(0, len(words) - 1)
-            words[idx] = random.choice(["optimal", "concise", "detailed", "effective", "new", "sample", "response", "instruction"])
-        elif mutation_type == "insert_word":
-            idx = random.randint(0, len(words)) # Can insert at the end
-            words.insert(idx, random.choice(["please", "ensure", "generate", "provide", "create", "summarize", "explain"]))
-        elif mutation_type == "delete_word" and len(words) > 1: # Avoid deleting the last word
+        if mutation_type == "replace_keyword" and words:
+            # More relevant keywords for smart contract analysis
+            keywords_to_replace = {
+                "analyze": ["examine", "inspect", "review", "evaluate"],
+                "focus": ["concentrate on", "highlight", "emphasize"],
+                "list": ["enumerate", "detail", "provide", "identify"],
+                "precise": ["accurate", "exact", "specific"],
+                "comprehensive": ["thorough", "complete", "exhaustive"],
+                "detail": ["describe", "explain", "outline"],
+                "purpose": ["functionality", "role", "objective"],
+                "conditions": ["requirements", "criteria", "checks"],
+                "emitted": ["triggered", "logged", "dispatched"]
+            }
+            
+            # Find a word to replace
+            eligible_words = [w for w in words if w.lower() in keywords_to_replace]
+            if eligible_words:
+                word_to_replace = random.choice(eligible_words)
+                new_word = random.choice(keywords_to_replace[word_to_replace.lower()])
+                idx = words.index(word_to_replace)
+                words[idx] = new_word # Keep original casing for now, or apply new_word.capitalize() etc.
+
+        elif mutation_type == "insert_phrase":
+            phrases_to_insert = [
+                "Ensure clarity.", 
+                "Provide a summary.", 
+                "Include all relevant details.",
+                "Pay attention to visibility.",
+                "Consider all parameters."
+            ]
+            idx = random.randint(0, len(words))
+            words.insert(idx, random.choice(phrases_to_insert))
+
+        elif mutation_type == "delete_word" and len(words) > 3: # Avoid making prompts too short
             idx = random.randint(0, len(words) - 1)
             words.pop(idx)
-        elif mutation_type == "swap_words" and len(words) > 1:
-            idx1, idx2 = random.sample(range(len(words)), 2)
-            words[idx1], words[idx2] = words[idx2], words[idx1]
 
-    # Example of "guided" mutation (very naive): add a word from a context in the batch
-    if current_batch and random.random() < 0.3: # 30% chance to add a word from context
+        elif mutation_type == "reorder_words" and len(words) > 2:
+            # Reorder a small segment of words
+            start_idx = random.randint(0, len(words) - 2)
+            end_idx = random.randint(start_idx + 1, len(words) - 1)
+            segment = words[start_idx:end_idx+1]
+            random.shuffle(segment)
+            words[start_idx:end_idx+1] = segment
+
+        elif mutation_type == "paraphrase_segment" and len(words) > 5:
+            # This is a very basic form of paraphrasing by replacing a common phrase
+            # In a real scenario, this would involve a more sophisticated NLP technique
+            replacements = {
+                "Focus on its function definitions": "Highlight functions",
+                "List all functions": "Enumerate functions",
+                "Be precise": "Ensure accuracy"
+            }
+            original_prompt_str = " ".join(words)
+            for old_phrase, new_phrase in replacements.items():
+                if old_phrase in original_prompt_str:
+                    original_prompt_str = original_prompt_str.replace(old_phrase, new_phrase, 1)
+                    words = original_prompt_str.split()
+                    break
+
+    # Guided mutation: add a word from a context in the batch if relevant
+    if current_batch and random.random() < 0.2: # 20% chance
         sample_context_item = random.choice(current_batch)
         sample_context_text = sample_context_item[0] # Assuming (context, answer) structure
-        context_words = sample_context_text.split()
-        if context_words:
-            chosen_word = random.choice(context_words)
-            # Add word if it's not too long and not already present (simple checks)
-            if len(chosen_word) < 15 and chosen_word not in words:
-                 words.append(chosen_word.strip(".,?!"))
+        
+        # Extract potential keywords from the smart contract context
+        # This is a very basic extraction, could be improved with AST parsing etc.
+        contract_keywords = []
+        if "function" in sample_context_text.lower(): contract_keywords.append("function")
+        if "event" in sample_context_text.lower(): contract_keywords.append("event")
+        if "modifier" in sample_context_text.lower(): contract_keywords.append("modifier")
+        if "mapping" in sample_context_text.lower(): contract_keywords.append("mapping")
+        if "address" in sample_context_text.lower(): contract_keywords.append("address")
+        if "uint" in sample_context_text.lower(): contract_keywords.append("uint")
+
+        if contract_keywords:
+            chosen_word = random.choice(contract_keywords)
+            if chosen_word not in [w.lower() for w in words]: # Avoid adding duplicates
+                 words.append(chosen_word)
+
+    return " ".join(words) if words else "Analyze the smart contract."
 
 
-    return " ".join(words) if words else "Mutated into an empty prompt."
