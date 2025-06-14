@@ -49,7 +49,7 @@ This compares to a typical [ReAct](https://arxiv.org/abs/2210.03629) style agent
 Explicit long term planning (which even really strong LLMs can struggle with)
 Ability to use smaller/weaker models for the execution step, only using larger/better models for the planning step
 
-## 📑 Source Structure
+## 📑 Source Link
 | Section | Description | Link |
 |---------|-------------|------|
 | 🛠️ Audit Tool | Main auditing application | [View Code](/smart-contract-audit) |
