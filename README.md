@@ -6,7 +6,19 @@
 
 **SmartAuditFlow** is a dynamic and adaptive framework for automated smart contract auditing, leveraging Large Language Models (LLMs) and workflow-driven strategies to deliver reliable, precise, and scalable security analysis.
 
-## 🌟 Overview
+<details open>
+<summary><b>📕 Table of Contents</b></summary>
+
+- 💡 [What is SmartAuditFlow?](#-what-is-smartauditflow)
+- 🎮 [Core Concept](#-core-concept)
+- 📌 [Source Structure](#-source-structure)
+- 🎬 [Get Started](#-get-started)
+- 🔧 [Tool Demonstration](#-tool-demonstration)
+- 📚 [Citation](#-citation)
+
+</details>
+
+## 🌟 What is SmartAuditFlow?
 
 SmartAuditFlow addresses key limitations in smart contract auditing by orchestrating LLMs within a structured, multi-stage workflow, enabling:
 
@@ -37,7 +49,7 @@ This compares to a typical [ReAct](https://arxiv.org/abs/2210.03629) style agent
 Explicit long term planning (which even really strong LLMs can struggle with)
 Ability to use smaller/weaker models for the execution step, only using larger/better models for the planning step
 
-## 📑 Quick Links
+## 📑 Source Structure
 | Section | Description | Link |
 |---------|-------------|------|
 | 🛠️ Audit Tool | Main auditing application | [View Code](/smart-contract-audit) |
