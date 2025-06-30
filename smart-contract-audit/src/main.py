@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 from src.api.audit_api import audit_api
-from src.api.workflow_api import workflow_api
+# from src.api.workflow_api import workflow_api # This blueprint appears to be unused/legacy
 from src.routes.user import user_bp
 from src.api.models_api import models_bp
 
@@ -29,9 +29,9 @@ def create_app():
     CORS(app, origins="*")
     
     # Register blueprints
-    app.register_blueprint(user_bp, url_prefix='/api/user')
+    # app.register_blueprint(user_bp, url_prefix='/api/user') # Disabled: DB not configured
     app.register_blueprint(audit_api, url_prefix='/api/audit')
-    app.register_blueprint(workflow_api, url_prefix='/api/workflow')
+    # app.register_blueprint(workflow_api, url_prefix='/api/workflow') # Disabled: Appears to be unused
     app.register_blueprint(models_bp, url_prefix='/api/models')
     
     @app.route('/', defaults={'path': ''})
@@ -62,4 +62,3 @@ app = create_app()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
-

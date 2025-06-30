@@ -47,18 +47,22 @@ class WorkflowEngine:
             '1728120734743'   # Format Converter
         ]
     
-    def execute_workflow_sync(self, code_snippet: str, static_tool: str = "") -> Dict[str, Any]:
+    def execute_workflow_sync(self, code_snippet: str, static_tool: str = "", progress_callback: Optional[callable] = None) -> Dict[str, Any]:
         """
         Execute the complete workflow synchronously with selected model
         
         Args:
             code_snippet: Smart contract code to audit
             static_tool: Static analysis results
+            progress_callback: A function to call with progress updates.
             
         Returns:
             Final audit results
         """
         try:
+            # Record start time
+            workflow_start_time = time.time()
+
             # Update session status
             storage.update_session_status(self.session_id, 'running')
             
@@ -85,7 +89,18 @@ class WorkflowEngine:
             
             # Execute nodes in order
             for i, node_id in enumerate(self.execution_order):
+                # Check if the session has been stopped by the user
+                session_status = storage.get_session(self.session_id).get('status')
+                if session_status == 'stopped':
+                    logger.info(f"Workflow for session {self.session_id} stopped by user.")
+                    return {'status': 'stopped', 'message': 'Workflow stopped by user.'}
+
                 node = self.nodes[node_id]
+                node_name = node.node_type.replace('-', ' ').title()
+
+                if progress_callback:
+                    progress_callback(step=i + 1, name=node_name, percentage=(i + 1) / len(self.execution_order) * 95)
+
                 logger.info(f"Executing node {i+1}/{len(self.execution_order)}: {node_id} ({node.node_type}) with model {self.model_choice}")
                 print(f"📋 Step {i+1}/{len(self.execution_order)}: {node.node_type}")
                 
@@ -139,17 +154,21 @@ class WorkflowEngine:
                     
                     raise Exception(f"Workflow failed at step {i+1} ({node.node_type}): {error_msg}")
             
+            # Calculate total workflow time
+            workflow_execution_time = time.time() - workflow_start_time
+
             # Get final results from the last node
             final_results = context.get('1728120734743', {})
             
-            # Add model information to results
+            # Add model and execution info to results
             final_results['model_used'] = self.model_choice
             final_results['available_models'] = available_models
-            final_results['execution_summary'] = {
-                'total_steps': len(self.execution_order),
-                'completed_steps': len(self.execution_order),
-                'session_id': self.session_id
-            }
+            
+            # Add execution time to the summary
+            execution_summary = final_results.get('ExecutionSummary', {})
+            execution_summary['total_execution_time'] = workflow_execution_time
+            execution_summary['session_id'] = self.session_id
+            final_results['ExecutionSummary'] = execution_summary
             
             # Save audit results
             storage.save_result(
@@ -157,9 +176,13 @@ class WorkflowEngine:
                 findings=final_results.get('Findings', []),
                 full_report=final_results.get('FullReport', ''),
                 model_used=self.model_choice,
-                execution_summary=final_results.get('ExecutionSummary', {})
+                execution_summary=final_results.get('ExecutionSummary', {}),
+                execution_time=workflow_execution_time
             )
             
+            if progress_callback:
+                progress_callback(step=len(self.execution_order), name="Completed", percentage=100, status='completed')
+
             # Update session status
             storage.update_session_status(self.session_id, 'completed')
             
@@ -201,4 +224,3 @@ class WorkflowEngine:
     def get_logs(self) -> List[Dict[str, Any]]:
         """Get workflow execution logs"""
         return storage.get_executions_for_session(self.session_id)
-
