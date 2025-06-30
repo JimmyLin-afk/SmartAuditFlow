@@ -29,7 +29,8 @@ class InMemoryStorage:
             'status': 'created',
             'created_at': datetime.now().isoformat(),
             'updated_at': datetime.now().isoformat(),
-            'completed_at': None
+            'completed_at': None,
+            'execution_time': None
         }
         
         self.sessions[session_id] = session
@@ -48,6 +49,9 @@ class InMemoryStorage:
             
             if status == 'completed':
                 self.sessions[session_id]['completed_at'] = datetime.now().isoformat()
+            
+            if status == 'stopped' and self.sessions[session_id].get('execution_time') is None:
+                self.sessions[session_id]['execution_time'] = (datetime.now() - datetime.fromisoformat(self.sessions[session_id]['created_at'])).total_seconds()
             
             print(f"📊 Session {session_id} status updated to: {status}")
     
@@ -102,7 +106,7 @@ class InMemoryStorage:
         return executions
     
     def save_result(self, session_id: str, findings: List[Dict], full_report: str = None, 
-                   model_used: str = None, execution_summary: Dict = None):
+                   model_used: str = None, execution_summary: Dict = None, execution_time: float = None):
         """Save final audit results with new findings format"""
         
         # Validate findings format
@@ -116,14 +120,18 @@ class InMemoryStorage:
             'model_used': model_used or 'unknown',
             'execution_summary': execution_summary or {},
             'created_at': datetime.now().isoformat(),
-            'severity_breakdown': self._calculate_severity_breakdown(validated_findings)
+            'severity_breakdown': self._calculate_severity_breakdown(validated_findings),
+            'execution_time': execution_time
         }
         
         self.results[session_id] = result
         print(f"💾 Saved results for session {session_id} with {len(validated_findings)} findings")
         
-        # Update session status
-        self.update_session_status(session_id, 'completed')
+        # Update session status and execution time
+        if session_id in self.sessions:
+            self.update_session_status(session_id, 'completed')
+            if execution_time is not None:
+                self.sessions[session_id]['execution_time'] = execution_time
         
         return result
     
@@ -230,4 +238,3 @@ class InMemoryStorage:
 # Global storage instance
 storage = InMemoryStorage()
 print("🗄️ In-memory storage initialized successfully")
-

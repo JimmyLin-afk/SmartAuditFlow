@@ -1,19 +1,8 @@
 from flask import Blueprint, jsonify
-from src.workflow.models import ModelManager
+from src.workflow.models import get_model_manager
 
 # Create blueprint for model endpoints
 models_bp = Blueprint('models', __name__)
-
-# Global model manager
-global_model_manager = None
-
-def get_model_manager():
-    """Get or create global model manager"""
-    global global_model_manager
-    if global_model_manager is None:
-        global_model_manager = ModelManager()
-        print("🤖 Model manager initialized for API")
-    return global_model_manager
 
 @models_bp.route('/status', methods=['GET'])
 def get_model_status():
@@ -215,4 +204,3 @@ def get_model_info():
             'status': 'error',
             'error': str(e)
         }), 500
-

@@ -36,7 +36,7 @@ def start_audit():
         
         code_snippet = data.get('code_snippet', '').strip()
         static_tool = data.get('static_tool', '').strip()
-        model_choice = data.get('model_choice', 'auto')
+        model_choice = data.get('model', 'auto') # FIX: Match frontend key 'model'
         
         if not code_snippet:
             return jsonify({'error': 'code_snippet is required'}), 400
@@ -57,58 +57,29 @@ def start_audit():
                 
                 print(f"🏗️ Creating workflow engine...")
                 engine = WorkflowEngine(session_id, model_choice)
-                
-                # --- THIS IS THE CRITICAL FIX ---
-                # We simulate the workflow step-by-step to report progress.
-                workflow_steps = [
-                    (1, 'Initial Analysis', 20),
-                    (2, 'Audit Plan', 40),
-                    (3, 'Parameter Extractor', 60),
-                    (4, 'Iteration', 80),
-                    (5, 'Format Converter', 95) 
-                ]
-                
-                # Loop through each simulated step
-                for step, name, percentage in workflow_steps:
-                    print(f"Executing step {step}: {name} for session {session_id}")
-                    
-                    # Get the session object to update it directly in memory
+
+                def progress_updater(step: int, name: str, percentage: int, status: str = 'running'):
+                    """Callback to update session progress in storage."""
+                    print(f"Progress update for {session_id}: Step {step} - {name} ({percentage}%)")
                     session = storage.get_session(session_id)
                     if session:
                         session['current_step'] = step
                         session['current_step_name'] = name
                         session['progress_percentage'] = percentage
+                        session['status'] = status
                         session['updated_at'] = datetime.now().isoformat()
-                    
-                    # Simulate the time it takes to run this step
-                    time.sleep(2.5) # Increased sleep time slightly to ensure frontend polling catches every step
 
-                # After simulating progress, run the actual audit to get the result
                 print(f"🚀 Starting final workflow execution...")
-                result = engine.execute_workflow_sync(code_snippet, static_tool)
+                # The engine now handles saving the result, including execution time.
+                engine.execute_workflow_sync(
+                    code_snippet, 
+                    static_tool, 
+                    progress_callback=progress_updater
+                )
                 
                 print(f"✅ Workflow completed for session {session_id}")
-                
-                # Extract and save the final results
-                findings = result.get('Findings', [])
-                full_report = result.get('FullReport', '')
-                model_used = result.get('ModelUsed', model_choice)
-                execution_summary = result.get('ExecutionSummary', {})
-                
-                print(f"🔍 Found {len(findings)} findings")
-                storage.save_result(session_id, findings, full_report, model_used, execution_summary)
-                
-                # Final progress update to mark the session as 'completed'
-                session = storage.get_session(session_id)
-                if session:
-                    session['current_step'] = 5
-                    session['current_step_name'] = 'Completed'
-                    session['progress_percentage'] = 100
-                    session['status'] = 'completed'
-                    session['updated_at'] = datetime.now().isoformat()
-
-                print(f"💾 Results saved for session {session_id}")
-                
+                # No need to save results here, the engine does it.
+                # This was the source of the bug, as this call overwrote the correct results.
             except Exception as e:
                 error_msg = f"Workflow execution failed: {str(e)}"
                 print(f"❌ {error_msg}")
@@ -178,9 +149,19 @@ def get_audit_status(session_id):
 
         # Calculate elapsed time
         created_at = datetime.fromisoformat(session['created_at'])
-        elapsed_seconds = (datetime.now() - created_at).total_seconds()
-        elapsed_time = f"{int(elapsed_seconds // 60)}:{int(elapsed_seconds % 60):02d}"
+        final_execution_time = session.get('execution_time')
 
+        if final_execution_time is not None:
+            # Format final time if available
+            minutes = int(final_execution_time // 60)
+            seconds = int(final_execution_time % 60)
+            elapsed_time = f"{minutes}:{seconds:02d}"
+        else:
+            # Calculate running elapsed time
+            elapsed_seconds = (datetime.now() - created_at).total_seconds()
+            minutes = int(elapsed_seconds // 60)
+            seconds = int(elapsed_seconds % 60)
+            elapsed_time = f"{minutes}:{seconds:02d}"
         # Assemble the final JSON response
         response = {
             'session_id': session_id,
@@ -238,6 +219,7 @@ def get_audit_results(session_id):
             'full_report': result.get('full_report', ''),
             'model_used': result.get('model_used', 'unknown'),
             'execution_summary': result.get('execution_summary', {}),
+            'execution_time': result.get('execution_time'),
             'severity_breakdown': result.get('severity_breakdown', {}),
             'created_at': result.get('created_at', ''),
             'format_validation': {
