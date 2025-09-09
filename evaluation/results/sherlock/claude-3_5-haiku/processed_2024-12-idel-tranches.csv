@@ -1,0 +1,4249 @@
+contract_name,code_snippet,ground_truth,Vul. High,Vul. Medium,tokens,loc,code_snippet_rm,processtokens,high_severity_count,medium_severity_count,vulnumber,Findings,Comparison
+IdleCreditVault.sol,"// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+
+import ""../../interfaces/IIdleCDOStrategy.sol"";
+import ""../../interfaces/IERC20Detailed.sol"";
+import ""../../interfaces/clearpool/IPoolFactory.sol"";
+import ""../../interfaces/clearpool/IPoolMaster.sol"";
+
+import '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol"";
+
+interface IdleCDOEpochVariant {
+  function isEpochRunning() external view returns (bool);
+}
+
+error NotAllowed();
+
+contract IdleCreditVault is
+  Initializable,
+  OwnableUpgradeable,
+  ERC20Upgradeable,
+  ReentrancyGuardUpgradeable,
+  IIdleCDOStrategy
+{
+  using SafeERC20Upgradeable for IERC20Detailed;
+
+  /// @notice underlying token address (pool currency for Clearpool)
+  address public override token;
+  /// @notice decimals of the underlying asset
+  uint256 public override tokenDecimals;
+  /// @notice one underlying token
+  uint256 public override oneToken;
+  /// @notice underlying ERC20 token contract (pool currency for Clearpool)
+  IERC20Detailed public underlyingToken;
+  /// @notice address of the IdleCDO
+  address public idleCDO;
+  /// @notice one year, used to calculate the APR
+  uint256 public constant YEAR = 365 days;
+  /// @notice latest saved apr
+  uint256 public lastApr;
+  /// @notice address of the borrower
+  address public borrower;
+  /// @notice address of the manager
+  address public manager;
+  /// @notice user withdraw requests
+  mapping (address => uint256) public withdrawsRequests;
+  /// @notice user instant withdraw requests
+  mapping (address => uint256) public instantWithdrawsRequests;
+  /// @notice total withdraw requests
+  uint256 public pendingWithdraws;
+  /// @notice pending instant withdraw requests
+  uint256 public pendingInstantWithdraws;
+  /// @notice counter for epoch deposits
+  uint256 public totEpochDeposits;
+  /// @notice flag to allow transfers
+  bool public canTransfer;
+
+  /// @custom:oz-upgrades-unsafe-allow constructor
+  constructor() {
+    token = address(1);
+  }
+
+  /// @notice can be only called once
+  /// @param _underlyingToken address of the underlying token (pool currency)
+  function initialize(
+    address _underlyingToken,
+    address _owner,
+    address _manager,
+    address _borrower,
+    string memory borrowerName,
+    uint256 _apr
+  ) public virtual initializer {
+    OwnableUpgradeable.__Ownable_init();
+    ReentrancyGuardUpgradeable.__ReentrancyGuard_init();
+    require(token == address(0), ""Token is already initialized"");
+
+    //----- // -------//
+    token = _underlyingToken;
+    underlyingToken = IERC20Detailed(token);
+    tokenDecimals = underlyingToken.decimals();
+    oneToken = 10**(tokenDecimals);
+    borrower = _borrower;
+    manager = _manager;
+    lastApr = _apr;
+
+    ERC20Upgradeable.__ERC20_init(
+      string(abi.encodePacked(""Idle Credit Vault "", borrowerName)),
+      string(abi.encodePacked(""idle_"", borrowerName))
+    );
+    //------//-------//
+
+    transferOwnership(_owner);
+  }
+
+  /// @notice strategy token decimals
+  /// @dev equal to underlying token decimals
+  /// @return number of decimals
+  function decimals() public view override returns (uint8) {
+    return uint8(tokenDecimals);
+  }
+
+  /// @notice strategy token address
+  function strategyToken() external view override returns (address) {
+    return address(this);
+  }
+
+  /// @notice return strategy token price which is always 1
+  /// @return price in underlyings
+  function price() public view virtual override returns (uint256) {
+    return oneToken;
+  }
+
+  /// @notice current fixed apr for the epoch
+  function getApr() external view returns (uint256) {
+    return lastApr;
+  }
+
+  /// @notice set the fixed apr
+  /// @dev only manager can set the apr
+  function setApr(uint256 _apr) external {
+    if (msg.sender != idleCDO && msg.sender != manager) {
+      revert NotAllowed();
+    }
+    lastApr = _apr;
+  }
+
+  /// @notice request withdraw of underlying token from the vault
+  /// @dev we don't burn strategy tokens here, but we increase the withdraw requests
+  /// @param _amount number of tokens to withdraw
+  /// @param _user address of the user
+  /// @param _netInterest net interest gained in the next epoch
+  function requestWithdraw(uint256 _amount, address _user, uint256 _netInterest) external {
+    _onlyIdleCDO();
+    // burn strategy tokens from cdo (we don't burn interest here, only the principal)
+    _burn(msg.sender, _amount - _netInterest);
+    // mint equal amount of strategy tokens to the user as receipt (interest included), useful in case of default
+    _mint(_user, _amount);
+
+    // increase the withdraw requests for the user
+    withdrawsRequests[_user] += _amount;
+    // increase the total withdraw requests
+    pendingWithdraws += _amount;
+  }
+
+  /// @notice claim the withdraw request
+  /// @dev we burn the strategy tokens and transfer the underlying tokens
+  /// @param _user address of the user
+  /// @return amount number of tokens claimed
+  function claimWithdrawRequest(address _user) external returns (uint256 amount) {
+    _onlyIdleCDO();
+    // get amount of underlyings
+    amount = withdrawsRequests[_user];
+    // burn strategy tokens 1:1 with the amount of underlyings
+    _burn(_user, amount);
+    withdrawsRequests[_user] = 0;
+    underlyingToken.safeTransfer(_user, amount);
+  }
+
+  /// @notice request instant withdraw of underlying token from the vault
+  /// @dev we burn strategy tokens here, and we increase the instant withdraw requests
+  /// @param _amount number of tokens to withdraw
+  /// @param _user address of the user
+  function requestInstantWithdraw(uint256 _amount, address _user) external {
+    _onlyIdleCDO();
+    // burn strategy tokens from cdo
+    _burn(msg.sender, _amount);
+  
+    // mint equal amount of strategy tokens to the user as receipt, useful in case of default
+    _mint(_user, _amount);
+
+    // increase the instant withdraw requests for the user
+    instantWithdrawsRequests[_user] += _amount;
+    // increase the total instant withdraw requests
+    pendingInstantWithdraws += _amount;
+  }
+
+  /// @notice claim the instant withdraw request
+  /// @dev we transfer the underlying tokens
+  /// @param _user address of the user
+  function claimInstantWithdrawRequest(address _user) external {
+    _onlyIdleCDO();
+    uint256 amount = instantWithdrawsRequests[_user];
+    // burn strategy tokens from user
+    _burn(_user, amount);
+
+    instantWithdrawsRequests[_user] = 0;
+    underlyingToken.safeTransfer(_user, amount);
+  }
+
+  /// @notice collect the instant withdraw funds
+  /// @dev only IdleCDO can call this function
+  /// @param _amount number of tokens to collect
+  function collectInstantWithdrawFunds(uint256 _amount) external {
+    _onlyIdleCDO();
+    pendingInstantWithdraws -= _amount;
+    underlyingToken.safeTransferFrom(idleCDO, address(this), _amount);
+  }
+
+  /// @notice collect the withdraw funds
+  /// @dev only IdleCDO can call this function
+  /// @param _amount number of tokens to collect
+  function collectWithdrawFunds(uint256 _amount) external {
+    _onlyIdleCDO();
+    pendingWithdraws -= _amount;
+    underlyingToken.safeTransferFrom(idleCDO, address(this), _amount);
+  }
+
+  /// @notice Send funds to the IdleCDO
+  /// @param _amount number of underlyings to transfer
+  function sendInterestAndDeposits(uint256 _amount) external {
+    _onlyIdleCDO();
+    IERC20Detailed(token).safeTransfer(idleCDO, _amount);
+  }
+
+  /// @notice Get funds from IdleCDO and mint strategy tokens. Funds are not sent to the borrower here
+  /// @param _amount number of underlyings to transfer
+  function deposit(uint256 _amount)
+    external
+    virtual
+    override
+    returns (uint256) {
+    _onlyIdleCDO();
+    underlyingToken.safeTransferFrom(msg.sender, address(this), _amount);
+    _mint(msg.sender, _amount);
+
+    if (IdleCDOEpochVariant(idleCDO).isEpochRunning()) {
+      // deposit done on stopEpoch (before setting the var to false) so we reset the counter
+      totEpochDeposits = 0;
+    } else {
+      // deposit done between epochs so we increase the counter
+      totEpochDeposits += _amount;
+    }
+
+    return _amount;
+  }
+  
+  /// @inheritdoc ERC20Upgradeable
+  /// @dev we don't allow transfers of strategy tokens normally, transfers are allowed only after a default
+  function _transfer(address sender, address recipient, uint256 amount) internal virtual override {
+    if (msg.sender != idleCDO && !canTransfer) {
+      revert NotAllowed();
+    }
+    super._transfer(sender, recipient, amount);
+  }
+
+  /// @notice allow transfers of strategy tokens
+  function allowTransfers() external {
+    _onlyIdleCDO();
+    canTransfer = true;
+  }
+
+  /// @notice allow to update whitelisted address
+  function setWhitelistedCDO(address _cdo) external onlyOwner {
+    require(_cdo != address(0), ""IS_0"");
+    idleCDO = _cdo;
+  }
+
+  /// @notice Emergency method to rescue funds
+  /// @param _token address of the token to transfer
+  /// @param value amount of `_token` to transfer
+  /// @param _to receiver address
+  function transferToken(address _token, uint256 value, address _to) external onlyOwner {
+    IERC20Detailed(_token).safeTransfer(_to, value);
+  }
+
+  /// @notice Modifier to make sure that caller os only the idleCDO contract
+  function _onlyIdleCDO() internal view {
+    if (msg.sender != idleCDO) {
+      revert NotAllowed();
+    }
+  }
+
+  /// @notice Not used as redeems happens only via requestWithdraw and requestInstantWithdraw
+  function redeem(uint256 _amount)
+    external
+    override
+    returns (uint256) {}
+
+  /// @notice Not used as redeems happens only via requestWithdraw and requestInstantWithdraw
+  function redeemUnderlying(uint256)
+    external
+    returns (uint256) {}
+
+  /// @notice not used in this strategy
+  function pullStkAAVE() 
+    external 
+    pure 
+    override 
+    returns (uint256) {}
+
+  /// @notice not used for this strategy
+  function getRewardTokens()
+    external
+    view
+    override
+    returns (address[] memory) {}
+
+  /// @notice not used for this strategy
+  function redeemRewards(bytes calldata)
+    external
+    override
+    returns (uint256[] memory rewards) {}
+}
+
+","[H-1] Initial Deposits Can Be Stolen Before First Epoch Begins A flaw in the `claimWithdrawRequest` function allows withdrawal requests to be claimed immediately before the first epoch begins. An attacker can repeatedly deposit and withdraw to claim unearned, projected interest, draining the principal deposited by other users.",1,0,2489,308,"pragma solidity 0.8.10;
+
+import ""../../interfaces/IIdleCDOStrategy.sol"";
+import ""../../interfaces/IERC20Detailed.sol"";
+import ""../../interfaces/clearpool/IPoolFactory.sol"";
+import ""../../interfaces/clearpool/IPoolMaster.sol"";
+
+import '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
+import ""@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol"";
+
+interface IdleCDOEpochVariant {
+  function isEpochRunning() external view returns (bool);
+}
+
+error NotAllowed();
+
+contract IdleCreditVault is
+  Initializable,
+  OwnableUpgradeable,
+  ERC20Upgradeable,
+  ReentrancyGuardUpgradeable,
+  IIdleCDOStrategy
+{
+  using SafeERC20Upgradeable for IERC20Detailed;
+
+  
+  address public override token;
+  
+  uint256 public override tokenDecimals;
+  
+  uint256 public override oneToken;
+  
+  IERC20Detailed public underlyingToken;
+  
+  address public idleCDO;
+  
+  uint256 public constant YEAR = 365 days;
+  
+  uint256 public lastApr;
+  
+  address public borrower;
+  
+  address public manager;
+  
+  mapping (address => uint256) public withdrawsRequests;
+  
+  mapping (address => uint256) public instantWithdrawsRequests;
+  
+  uint256 public pendingWithdraws;
+  
+  uint256 public pendingInstantWithdraws;
+  
+  uint256 public totEpochDeposits;
+  
+  bool public canTransfer;
+
+  
+  constructor() {
+    token = address(1);
+  }
+
+  
+  
+  function initialize(
+    address _underlyingToken,
+    address _owner,
+    address _manager,
+    address _borrower,
+    string memory borrowerName,
+    uint256 _apr
+  ) public virtual initializer {
+    OwnableUpgradeable.__Ownable_init();
+    ReentrancyGuardUpgradeable.__ReentrancyGuard_init();
+    require(token == address(0), ""Token is already initialized"");
+
+    
+    token = _underlyingToken;
+    underlyingToken = IERC20Detailed(token);
+    tokenDecimals = underlyingToken.decimals();
+    oneToken = 10**(tokenDecimals);
+    borrower = _borrower;
+    manager = _manager;
+    lastApr = _apr;
+
+    ERC20Upgradeable.__ERC20_init(
+      string(abi.encodePacked(""Idle Credit Vault "", borrowerName)),
+      string(abi.encodePacked(""idle_"", borrowerName))
+    );
+    
+
+    transferOwnership(_owner);
+  }
+
+  
+  
+  
+  function decimals() public view override returns (uint8) {
+    return uint8(tokenDecimals);
+  }
+
+  
+  function strategyToken() external view override returns (address) {
+    return address(this);
+  }
+
+  
+  
+  function price() public view virtual override returns (uint256) {
+    return oneToken;
+  }
+
+  
+  function getApr() external view returns (uint256) {
+    return lastApr;
+  }
+
+  
+  
+  function setApr(uint256 _apr) external {
+    if (msg.sender != idleCDO && msg.sender != manager) {
+      revert NotAllowed();
+    }
+    lastApr = _apr;
+  }
+
+  
+  
+  
+  
+  
+  function requestWithdraw(uint256 _amount, address _user, uint256 _netInterest) external {
+    _onlyIdleCDO();
+    
+    _burn(msg.sender, _amount - _netInterest);
+    
+    _mint(_user, _amount);
+
+    
+    withdrawsRequests[_user] += _amount;
+    
+    pendingWithdraws += _amount;
+  }
+
+  
+  
+  
+  
+  function claimWithdrawRequest(address _user) external returns (uint256 amount) {
+    _onlyIdleCDO();
+    
+    amount = withdrawsRequests[_user];
+    
+    _burn(_user, amount);
+    withdrawsRequests[_user] = 0;
+    underlyingToken.safeTransfer(_user, amount);
+  }
+
+  
+  
+  
+  
+  function requestInstantWithdraw(uint256 _amount, address _user) external {
+    _onlyIdleCDO();
+    
+    _burn(msg.sender, _amount);
+  
+    
+    _mint(_user, _amount);
+
+    
+    instantWithdrawsRequests[_user] += _amount;
+    
+    pendingInstantWithdraws += _amount;
+  }
+
+  
+  
+  
+  function claimInstantWithdrawRequest(address _user) external {
+    _onlyIdleCDO();
+    uint256 amount = instantWithdrawsRequests[_user];
+    
+    _burn(_user, amount);
+
+    instantWithdrawsRequests[_user] = 0;
+    underlyingToken.safeTransfer(_user, amount);
+  }
+
+  
+  
+  
+  function collectInstantWithdrawFunds(uint256 _amount) external {
+    _onlyIdleCDO();
+    pendingInstantWithdraws -= _amount;
+    underlyingToken.safeTransferFrom(idleCDO, address(this), _amount);
+  }
+
+  
+  
+  
+  function collectWithdrawFunds(uint256 _amount) external {
+    _onlyIdleCDO();
+    pendingWithdraws -= _amount;
+    underlyingToken.safeTransferFrom(idleCDO, address(this), _amount);
+  }
+
+  
+  
+  function sendInterestAndDeposits(uint256 _amount) external {
+    _onlyIdleCDO();
+    IERC20Detailed(token).safeTransfer(idleCDO, _amount);
+  }
+
+  
+  
+  function deposit(uint256 _amount)
+    external
+    virtual
+    override
+    returns (uint256) {
+    _onlyIdleCDO();
+    underlyingToken.safeTransferFrom(msg.sender, address(this), _amount);
+    _mint(msg.sender, _amount);
+
+    if (IdleCDOEpochVariant(idleCDO).isEpochRunning()) {
+      
+      totEpochDeposits = 0;
+    } else {
+      
+      totEpochDeposits += _amount;
+    }
+
+    return _amount;
+  }
+  
+  
+  
+  function _transfer(address sender, address recipient, uint256 amount) internal virtual override {
+    if (msg.sender != idleCDO && !canTransfer) {
+      revert NotAllowed();
+    }
+    super._transfer(sender, recipient, amount);
+  }
+
+  
+  function allowTransfers() external {
+    _onlyIdleCDO();
+    canTransfer = true;
+  }
+
+  
+  function setWhitelistedCDO(address _cdo) external onlyOwner {
+    require(_cdo != address(0), ""IS_0"");
+    idleCDO = _cdo;
+  }
+
+  
+  
+  
+  
+  function transferToken(address _token, uint256 value, address _to) external onlyOwner {
+    IERC20Detailed(_token).safeTransfer(_to, value);
+  }
+
+  
+  function _onlyIdleCDO() internal view {
+    if (msg.sender != idleCDO) {
+      revert NotAllowed();
+    }
+  }
+
+  
+  function redeem(uint256 _amount)
+    external
+    override
+    returns (uint256) {}
+
+  
+  function redeemUnderlying(uint256)
+    external
+    returns (uint256) {}
+
+  
+  function pullStkAAVE() 
+    external 
+    pure 
+    override 
+    returns (uint256) {}
+
+  
+  function getRewardTokens()
+    external
+    view
+    override
+    returns (address[] memory) {}
+
+  
+  function redeemRewards(bytes calldata)
+    external
+    override
+    returns (uint256[] memory rewards) {}
+}",1556,1,0,1,"Here are the key vulnerabilities in this Solidity smart contract:
+
+1. Initialization Bypass:
+- The constructor sets `token = address(1)`, which could potentially allow multiple initializations
+- Weak initialization check with `require(token == address(0))` can be circumvented
+
+2. Access Control Weaknesses:
+- `setApr()` allows manager and idleCDO to modify APR without comprehensive validation
+- Limited access controls on critical functions like `transferToken()`
+
+3. Potential Reentrancy Risks:
+- Despite using ReentrancyGuard, some external transfer methods lack comprehensive reentrancy protection
+- `claimWithdrawRequest()` and `claimInstantWithdrawRequest()` have transfer-after-state-change patterns
+
+4. Insufficient Input Validation:
+- No validation on withdrawal amounts
+- No checks for zero-value transfers
+- Lack of comprehensive boundary checks on deposit/withdrawal functions
+
+5. Token Transfer Centralization:
+- Heavy dependence on `idleCDO` address for most critical operations
+- Single point of failure if `idleCDO` is compromised
+
+6. Incomplete Implementation:
+- Several placeholder functions with empty implementations (`redeem()`, `redeemUnderlying()`)
+- Potential unintended behaviors due to incomplete logic
+
+7. Potential Integer Underflow/Arithmetic Issues:
+- Subtraction operations without explicit SafeMath checks (though Solidity 0.8.10 has built-in checks)
+
+Recommendation: Conduct a comprehensive review, add robust access controls, implement thorough input validation, and complete all function implementations.","---
+
+### **[H-1] Initial Deposits Can Be Stolen Before First Epoch Begins**
+
+**Report Description**:  
+The `claimWithdrawRequest` function contains a vulnerability that allows withdrawal requests to be claimed immediately before the first epoch begins. This flaw enables an attacker to repeatedly deposit and withdraw funds, claiming unearned, projected interest. As a result, the attacker can drain the principal deposited by other users, leading to significant financial losses for legitimate participants.
+
+---
+
+**Match in Response List**:  
+Matches partially with **""Potential Reentrancy Risks""** and **""Insufficient Input Validation""**.
+
+---
+
+**Validation**:  
+**Partially Correct**.  
+
+- **""Potential Reentrancy Risks""**:  
+  The response identifies that `claimWithdrawRequest()` has a transfer-after-state-change pattern, which is a common reentrancy risk. While this is relevant, the issue described in the report is not primarily about reentrancy but rather about the lack of proper validation or safeguards to prevent abuse of the `claimWithdrawRequest` function before the first epoch begins. The response does not explicitly address the specific vulnerability of repeated deposits and withdrawals to claim unearned interest.
+
+- **""Insufficient Input Validation""**:  
+  The response mentions a lack of validation on withdrawal amounts and boundary checks, which is tangentially related to the issue. However, it does not directly address the specific flaw of allowing claims before the first epoch begins or the need for additional checks to prevent abuse of the function.
+
+- **Missed Aspects**:  
+  The response does not explicitly address the core issue of the vulnerability: the ability to exploit the system by claiming unearned interest before the first epoch begins. It also does not propose a solution, such as implementing a mechanism to ensure that claims can only be made after the first epoch starts or adding validation to prevent repeated abuse.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[H-1] Initial Deposits Can Be Stolen Before First Epoch Begins**: Matches partially with **""Potential Reentrancy Risks""** and **""Insufficient Input Validation""**.
+
+**Missed Issues from Issue Report**:  
+- The specific vulnerability of exploiting the `claimWithdrawRequest` function to claim unearned interest before the first epoch begins is not fully addressed in the response list. The response list does not propose a solution to prevent this abuse.
+
+---
+
+### **Recommendations for Improvement**:
+1. **Explicitly Address the Core Issue**:  
+   The response list should include a specific acknowledgment of the vulnerability in `claimWithdrawRequest` that allows claims before the first epoch begins. It should also propose a solution, such as:
+   - Adding a check to ensure that claims can only be made after the first epoch starts.
+   - Implementing a mechanism to track and validate legitimate claims to prevent repeated abuse.
+
+2. **Strengthen Input Validation**:  
+   While the response mentions insufficient input validation, it should explicitly recommend adding checks to prevent repeated deposits and withdrawals for unearned interest claims.
+
+3. **Reentrancy Protection**:  
+   Although the response mentions reentrancy risks, it should emphasize the importance of ensuring that all state changes are finalized before external calls, especially in functions like `claimWithdrawRequest`.
+
+By addressing these gaps, the response list can more comprehensively cover the issue and align with Solidity best practices for secure contract development."
+IdleCDO.sol,"// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+
+import ""@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol"";
+import '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
+import ""@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+
+import ""./interfaces/IIdleCDOStrategy.sol"";
+import ""./interfaces/IERC20Detailed.sol"";
+
+import ""./GuardedLaunchUpgradable.sol"";
+import ""./IdleCDOTranche.sol"";
+import ""./IdleCDOStorage.sol"";
+
+/// @title A perpetual tranche implementation
+/// @author Idle Labs Inc.
+/// @notice More info and high level overview in the README
+/// @dev The contract is upgradable, to add storage slots, create IdleCDOStorageVX and inherit from IdleCDOStorage, then update the definitaion below
+contract IdleCDO is PausableUpgradeable, GuardedLaunchUpgradable, IdleCDOStorage {
+  using SafeERC20Upgradeable for IERC20Detailed;
+
+  // ERROR MESSAGES:
+  // 0 = is 0
+  // 1 = already initialized
+  // 2 = Contract limit reached
+  // 3 = Tranche withdraw not allowed (Paused or in shutdown)
+  // 4 = Default, wait shutdown
+  // 5 = Amount too low
+  // 6 = Not authorized
+  // 7 = Amount too high
+  // 8 = Same block
+  // 9 = Invalid
+
+  // Used to prevent initialization of the implementation contract
+  /// @custom:oz-upgrades-unsafe-allow constructor
+  constructor() {
+    token = address(1);
+  }
+
+  // ###################
+  // Initializer
+  // ###################
+
+  /// @notice can only be called once
+  /// @dev Initialize the upgradable contract
+  /// @param _limit contract value limit, can be 0
+  /// @param _guardedToken underlying token
+  /// @param _governanceFund address where funds will be sent in case of emergency
+  /// @param _owner guardian address (can pause, unpause and call emergencyShutdown)
+  /// @param _rebalancer rebalancer address
+  /// @param _strategy strategy address
+  /// @param _trancheAPRSplitRatio trancheAPRSplitRatio value
+  /// @param // deprecated
+  /// @param // deprecated _incentiveTokens array of addresses for incentive tokens
+  function initialize(
+    uint256 _limit, address _guardedToken, address _governanceFund, address _owner, // GuardedLaunch args
+    address _rebalancer,
+    address _strategy,
+    uint256 _trancheAPRSplitRatio, // for AA tranches, so eg 10000 means 10% interest to AA and 90% BB
+    uint256, // Deprecated
+    address[] memory // Deprecated
+  ) external initializer {
+    require(token == address(0), '1');
+    require(_rebalancer != address(0), '0');
+    require(_strategy != address(0), '0');
+    require(_guardedToken != address(0), '0');
+    require( _trancheAPRSplitRatio <= FULL_ALLOC, '7');
+    // Initialize contracts
+    PausableUpgradeable.__Pausable_init();
+    // check for _governanceFund and _owner != address(0) are inside GuardedLaunchUpgradable
+    GuardedLaunchUpgradable.__GuardedLaunch_init(_limit, _governanceFund, _owner);
+    // Deploy Tranches tokens
+    address _strategyToken = IIdleCDOStrategy(_strategy).strategyToken();
+    // get strategy token symbol (eg. idleDAI)
+    string memory _symbol = IERC20Detailed(_strategyToken).symbol();
+    // create tranche tokens (concat strategy token symbol in the name and symbol of the tranche tokens)
+    AATranche = address(new IdleCDOTranche(_concat(string(""IdleCDO AA Tranche - ""), _symbol), _concat(string(""AA_""), _symbol)));
+    BBTranche = address(new IdleCDOTranche(_concat(string(""IdleCDO BB Tranche - ""), _symbol), _concat(string(""BB_""), _symbol)));
+    // Set CDO params
+    token = _guardedToken;
+    strategy = _strategy;
+    strategyToken = _strategyToken;
+    rebalancer = _rebalancer;
+    trancheAPRSplitRatio = _trancheAPRSplitRatio;
+    uint256 _oneToken = 10**(IERC20Detailed(_guardedToken).decimals());
+    oneToken = _oneToken;
+    uniswapRouterV2 = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+    weth = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    // incentiveTokens = _incentiveTokens; [DEPRECATED]
+    priceAA = _oneToken;
+    priceBB = _oneToken;
+    unlentPerc = 2000; // 2%
+    // # blocks, after an harvest, during which harvested rewards gets progressively unlocked
+    releaseBlocksPeriod = 6400; // about 1 day
+    // Set flags
+    allowAAWithdraw = true;
+    allowBBWithdraw = true;
+    revertIfTooLow = true;
+    // skipDefaultCheck = false is the default value
+    // Set allowance for strategy
+    _allowUnlimitedSpend(_guardedToken, _strategy);
+    _allowUnlimitedSpend(_strategyToken, _strategy);
+    // Save current strategy price
+    lastStrategyPrice = _strategyPrice();
+    // Fee params
+    fee = 15000; // 15% performance fee
+    feeReceiver = address(0xFb3bD022D5DAcF95eE28a6B07825D4Ff9C5b3814); // treasury multisig
+    guardian = _owner;
+    // feeSplit = 0; // default all to feeReceiver
+    isAYSActive = true; // adaptive yield split
+    minAprSplitAYS = AA_RATIO_LIM_DOWN; // AA tranche will get min 50% of the yield
+
+    maxDecreaseDefault = 5000; // 5% decrease for triggering a default
+    _additionalInit();
+  }
+
+  /// @notice used by child contracts (cdo variants) if anything needs to be done on/after init
+  function _additionalInit() internal virtual {}
+
+  // ###############
+  // Public methods
+  // ###############
+
+  /// @notice pausable
+  /// @dev msg.sender should approve this contract first to spend `_amount` of `token`
+  /// @param _amount amount of `token` to deposit
+  /// @return AA tranche tokens minted
+  function depositAA(uint256 _amount) external returns (uint256) {
+    return _deposit(_amount, AATranche, address(0));
+  }
+
+  /// @notice pausable in _deposit
+  /// @dev msg.sender should approve this contract first to spend `_amount` of `token`
+  /// @param _amount amount of `token` to deposit
+  /// @return BB tranche tokens minted
+  function depositBB(uint256 _amount) external returns (uint256) {
+    return _deposit(_amount, BBTranche, address(0));
+  }
+
+  /// @notice pausable
+  /// @dev msg.sender should approve this contract first to spend `_amount` of `token`
+  /// @param _amount amount of `token` to deposit
+  /// @param _referral address of the referral
+  /// @return AA tranche tokens minted
+  function depositAARef(uint256 _amount, address _referral) external returns (uint256) {
+    return _deposit(_amount, AATranche, _referral);
+  }
+
+  /// @notice pausable in _deposit
+  /// @dev msg.sender should approve this contract first to spend `_amount` of `token`
+  /// @param _amount amount of `token` to deposit
+  /// @param _referral address of the referral
+  /// @return BB tranche tokens minted
+  function depositBBRef(uint256 _amount, address _referral) external returns (uint256) {
+    return _deposit(_amount, BBTranche, _referral);
+  }
+
+  /// @notice pausable in _deposit
+  /// @param _amount amount of AA tranche tokens to burn
+  /// @return underlying tokens redeemed
+  function withdrawAA(uint256 _amount) external virtual returns (uint256) {
+    require(!paused() || allowAAWithdraw, '3');
+    return _withdraw(_amount, AATranche);
+  }
+
+  /// @notice pausable
+  /// @param _amount amount of BB tranche tokens to burn
+  /// @return underlying tokens redeemed
+  function withdrawBB(uint256 _amount) external virtual returns (uint256) {
+    require(!paused() || allowBBWithdraw, '3');
+    return _withdraw(_amount, BBTranche);
+  }
+
+  // ###############
+  // Views
+  // ###############
+
+  /// @param _tranche tranche address
+  /// @return tranche price, in underlyings, at the last interaction (not considering interest earned 
+  /// since last interaction)
+  function tranchePrice(address _tranche) external view returns (uint256) {
+    return _tranchePrice(_tranche);
+  }
+
+  /// @notice calculates the current net TVL (in `token` terms)
+  /// @dev unclaimed rewards (gov tokens) and `unclaimedFees` are not counted. 
+  /// Harvested rewards are counted only if enough blocks have passed (`_lockedRewards`)
+  function getContractValue() public override view returns (uint256) {
+    address _strategyToken = strategyToken;
+    uint256 strategyTokenDecimals = IERC20Detailed(_strategyToken).decimals();
+    // TVL is the sum of unlent balance in the contract + the balance in lending - harvested but locked rewards - unclaimedFees
+    // Balance in lending is the value of the interest bearing assets (strategyTokens) in this contract
+    // TVL = (strategyTokens * strategy token price) + unlent balance - lockedRewards - unclaimedFees
+    return (_contractTokenBalance(_strategyToken) * _strategyPrice() / (10**(strategyTokenDecimals))) +
+            _contractTokenBalance(token) -
+            _lockedRewards() -
+            unclaimedFees;
+  }
+
+  /// @param _tranche tranche address
+  /// @return actual apr given current ratio between AA and BB tranches
+  function getApr(address _tranche) external view returns (uint256) {
+    return _getApr(_tranche, _getAARatio(false));
+  }
+
+  /// @notice calculates the current AA tranches ratio
+  /// @dev _virtualBalance is used to have a more accurate/recent value for the AA ratio
+  /// because it calculates the balance after splitting the accrued interest since the
+  /// last depositXX/withdrawXX/harvest
+  /// @return AA tranches ratio (in underlying value) considering all interest
+  function getCurrentAARatio() external view returns (uint256) {
+    return _getAARatio(false);
+  }
+
+  /// @notice calculates the current tranches price considering the interest/loss that is yet to be splitted
+  /// ie the interest/loss generated since the last update of priceAA and priceBB (done on depositXX/withdrawXX/harvest)
+  /// @param _tranche address of the requested tranche
+  /// @return _virtualPrice tranche price considering all interest/losses
+  function virtualPrice(address _tranche) public virtual view returns (uint256 _virtualPrice) {
+    // get both NAVs, because we need the total NAV anyway
+    uint256 _lastNAVAA = lastNAVAA;
+    uint256 _lastNAVBB = lastNAVBB;
+
+    (_virtualPrice, ) = _virtualPriceAux(
+      _tranche,
+      getContractValue(), // nav
+      _lastNAVAA + _lastNAVBB, // lastNAV
+      _tranche == AATranche ? _lastNAVAA : _lastNAVBB, // lastTrancheNAV
+      trancheAPRSplitRatio
+    );
+  }
+
+  /// @notice [DEPRECATED]
+  /// @return array with addresses of incentiveTokens (can be empty)
+  function getIncentiveTokens() external view virtual returns (address[] memory) {
+    return incentiveTokens;
+  }
+
+  // ###############
+  // Internal
+  // ###############
+
+  /// @notice method used to check if depositor has enough stkIDLE per unit of underlying to access the vault.
+  /// This can be used to give priority access to new vaults to stkIDLE holders. 
+  /// @dev This check is only intended for ""regular"" users as it does not strictly enforce the _stkIDLEPerUnderlying 
+  /// ratio (eg: deposit+transfer). This will be mitigated by the fee rebate mechanism (airdrop) as otherwise those
+  /// rebates will be lost.
+  /// @param _amount amount of underlying to deposit
+  function _checkStkIDLEBal(address _tranche, uint256 _amount) internal view virtual {
+    uint256 _stkIDLEPerUnderlying = stkIDLEPerUnderlying;
+    // check if stkIDLE requirement is active for _tranche
+    if (_stkIDLEPerUnderlying == 0 || 
+      (_tranche == BBTranche && BBStaking == address(0)) || 
+      (_tranche == AATranche && AAStaking == address(0))) {
+      return;
+    }
+
+    uint256 trancheBal = IERC20Detailed(_tranche).balanceOf(msg.sender);
+    // We check if sender deposited in the same tranche previously and add the bal to _amount
+    uint256 bal = _amount + (trancheBal > 0 ? (trancheBal * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN) : 0);
+    require(
+      IERC20(STK_IDLE).balanceOf(msg.sender) >= 
+      bal * _stkIDLEPerUnderlying / oneToken, 
+      '7'
+    );
+  }
+
+  /// @notice method used to deposit `token` and mint tranche tokens
+  /// Ideally users should deposit right after an `harvest` call to maximize profit
+  /// @dev this contract must be approved to spend at least _amount of `token` before calling this method
+  /// automatically reverts on lending provider default (_strategyPrice decreased)
+  /// @param _amount amount of underlyings (`token`) to deposit
+  /// @param _tranche tranche address
+  /// @param _referral referral address
+  /// @return _minted number of tranche tokens minted
+  function _deposit(uint256 _amount, address _tranche, address _referral) internal virtual whenNotPaused returns (uint256 _minted) {
+    if (_amount == 0) {
+      return _minted;
+    }
+    // check that we are not depositing more than the contract available limit
+    _guarded(_amount);
+    // set _lastCallerBlock hash
+    _updateCallerBlock();
+    // check if _strategyPrice decreased
+    _checkDefault();
+    // interest accrued since last depositXX/withdrawXX/harvest is splitted between AA and BB
+    // according to trancheAPRSplitRatio. NAVs of AA and BB are updated and tranche
+    // prices adjusted accordingly
+    _updateAccounting();
+    // check if depositor has enough stkIDLE for the amount to be deposited
+    _checkStkIDLEBal(_tranche, _amount);
+    // get underlyings from sender
+    address _token = token;
+    uint256 _preBal = _contractTokenBalance(_token);
+    IERC20Detailed(_token).safeTransferFrom(msg.sender, address(this), _amount);
+    // mint tranche tokens according to the current tranche price
+    _minted = _mintShares(_contractTokenBalance(_token) - _preBal, msg.sender, _tranche);
+    // update trancheAPRSplitRatio
+    _updateSplitRatio(_getAARatio(true));
+
+    if (directDeposit) {
+      IIdleCDOStrategy(strategy).deposit(_amount);
+    }
+
+    if (_referral != address(0)) {
+      emit Referral(_amount, _referral);
+    }
+  }
+
+  /// @notice this method is called on depositXX/withdrawXX/harvest and
+  /// updates the accounting of the contract and effectively splits the yield/loss between the
+  /// AA and BB tranches
+  /// @dev this method:
+  /// - update tranche prices (priceAA and priceBB)
+  /// - update net asset value for both tranches (lastNAVAA and lastNAVBB)
+  /// - update fee accounting (unclaimedFees)
+  function _updateAccounting() internal virtual {
+    uint256 _lastNAVAA = lastNAVAA;
+    uint256 _lastNAVBB = lastNAVBB;
+    uint256 _lastNAV = _lastNAVAA + _lastNAVBB;
+    uint256 nav = getContractValue();
+    uint256 _aprSplitRatio = trancheAPRSplitRatio;
+    // If gain is > 0, then collect some fees in `unclaimedFees`
+    if (nav > _lastNAV) {
+      unclaimedFees += (nav - _lastNAV) * fee / FULL_ALLOC;
+    }
+    (uint256 _priceAA, int256 _totalAAGain) = _virtualPriceAux(AATranche, nav, _lastNAV, _lastNAVAA, _aprSplitRatio);
+    (uint256 _priceBB, int256 _totalBBGain) = _virtualPriceAux(BBTranche, nav, _lastNAV, _lastNAVBB, _aprSplitRatio);
+    lastNAVAA = uint256(int256(_lastNAVAA) + _totalAAGain);
+
+    // if we have a loss and it's gte last junior NAV we trigger a default
+    if (_totalBBGain < 0 && -_totalBBGain >= int256(_lastNAVBB)) {
+      // revert with 'default' error (4) if skipDefaultCheck is false, as seniors will have a loss too not covered. 
+      // `updateAccounting` should be manually called to distribute loss
+      require(skipDefaultCheck, ""4"");
+      // This path will be called when a default happens and guardian calls
+      // `updateAccounting` after setting skipDefaultCheck or when skipDefaultCheck is already set to true
+      lastNAVBB = 0;
+      // if skipDefaultCheck is set to true prior a default (eg because AA is used as collateral and needs to be liquid), 
+      // emergencyShutdown won't prevent the current deposit/redeem (the one that called this _updateAccounting) and is 
+      // still correct because:
+      // - depositBB will revert as priceBB is 0
+      // - depositAA won't revert (unless the loss is 100% of TVL) and user will get 
+      //   correct number of share at a priceAA already post junior default
+      // - withdrawBB will redeem 0 and burn BB tokens because priceBB is 0
+      // - withdrawAA will redeem the correct amount of underlyings post junior default
+      // We pass true as we still want AA to be redeemable in any case even after a junior default
+      _emergencyShutdown(true);
+    } else {
+      // we add the gain to last saved NAV
+      lastNAVBB = uint256(int256(_lastNAVBB) + _totalBBGain);
+    }
+    priceAA = _priceAA;
+    priceBB = _priceBB;
+  }
+
+  /// @notice calculates the NAV for a tranche considering the interest that is yet to be splitted
+  /// @param _tranche address of the requested tranche
+  /// @return net asset value, in underlying tokens, for _tranche considering all nav
+  function _virtualBalance(address _tranche) internal view returns (uint256) {
+    // balance is: tranche supply * virtual tranche price
+    return IdleCDOTranche(_tranche).totalSupply() * virtualPrice(_tranche) / ONE_TRANCHE_TOKEN;
+  }
+
+  /// @notice calculates the NAV for a tranche without considering the interest that is yet to be splitted
+  /// @param _tranche address of the requested tranche
+  /// @return net asset value, in underlying tokens, for _tranche
+  function _instantBalance(address _tranche) internal view returns (uint256) {
+    return IdleCDOTranche(_tranche).totalSupply() * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+  }
+
+  /// @notice calculates the current tranches price considering the interest/loss that is yet to be splitted and the
+  /// total gain/loss for a specific tranche
+  /// @dev Main scenarios covered:
+  /// - if there is a loss on the lending protocol (ie strategy price decrease) up to maxDecreaseDefault (_checkDefault method), the loss is
+  ///     - totally absorbed by junior holders if they have enough TVL and deposits/redeems work as normal
+  ///     - otherwise a 'default' error (4) is raised and deposits/redeems are blocked
+  /// - if there is a loss on the lending protocol (ie strategy price decrease) more than maxDecreaseDefault all deposits and redeems
+  ///   are blocked and a 'default' error (4) is raised
+  /// - if there is a loss somewhere not in the lending protocol (ie in our contracts) and the TVL decreases then the same process as above
+  ///   applies, the only difference is that maxDecreaseDefault is not considered
+  /// In any case, once a loss happens, it only gets accounted when new deposits/redeems are made, but those are blocked.
+  /// For this reason a protected updateAccounting method has been added which should be used to distributed the loss after a default event
+  /// @param _tranche address of the requested tranche
+  /// @param _nav current NAV
+  /// @param _lastNAV last saved NAV
+  /// @param _lastTrancheNAV last saved tranche NAV
+  /// @param _trancheAPRSplitRatio APR split ratio for AA tranche
+  /// @return _virtualPrice tranche price considering all interest
+  /// @return _totalTrancheGain (int256) tranche gain/loss since last update
+  function _virtualPriceAux(
+    address _tranche,
+    uint256 _nav,
+    uint256 _lastNAV,
+    uint256 _lastTrancheNAV,
+    uint256 _trancheAPRSplitRatio
+  ) internal virtual view returns (uint256 _virtualPrice, int256 _totalTrancheGain) {
+    // Check if there are tranche holders
+    uint256 trancheSupply = IdleCDOTranche(_tranche).totalSupply();
+    if (_lastNAV == 0 || trancheSupply == 0) {
+      return (oneToken, 0);
+    }
+
+    // In order to correctly split the interest generated between AA and BB tranche holders
+    // (according to the trancheAPRSplitRatio) we need to know how much interest/loss we gained
+    // since the last price update (during a depositXX/withdrawXX/harvest)
+    // To do that we need to get the current value of the assets in this contract
+    // and the last saved one (always during a depositXX/withdrawXX/harvest)
+    // Calculate the total gain/loss
+    int256 totalGain = int256(_nav) - int256(_lastNAV);
+    // If there is no gain/loss return the current price
+    if (totalGain == 0) {
+      return (_tranchePrice(_tranche), 0);
+    }
+
+    // Remove performance fee for gains
+    if (totalGain > 0) {
+      totalGain -= totalGain * int256(fee) / int256(FULL_ALLOC);
+    }
+
+    address _AATranche = AATranche;
+    address _BBTranche = BBTranche;
+    bool _isAATranche = _tranche == _AATranche;
+    // Get the supply of the other tranche and
+    // if it's 0 then give all gain to the current `_tranche` holders
+    if (IdleCDOTranche(_isAATranche ? _BBTranche : _AATranche).totalSupply() == 0) {
+      _totalTrancheGain = totalGain;
+    } else {
+      // if we gained something or the loss is between 0 and lossToleranceBps then we socialize the gain/loss
+      if (totalGain > 0) {
+        // Split the net gain, according to _trancheAPRSplitRatio, with precision loss favoring the AA tranche.
+        int256 totalBBGain = totalGain * int256(FULL_ALLOC - _trancheAPRSplitRatio) / int256(FULL_ALLOC);
+        // The new NAV for the tranche is old NAV + total gain for the tranche
+        _totalTrancheGain = _isAATranche ? (totalGain - totalBBGain) : totalBBGain;
+      } else if (uint256(-totalGain) <= (lossToleranceBps * _lastNAV) / FULL_ALLOC) {
+        // Split the loss, according to TVL ratio instead of _trancheAPRSplitRatio (loss socialized between all tranches)
+        uint256 _lastNAVBB = lastNAVBB;
+        int256 totalBBLoss = totalGain * int256(_lastNAVBB) / int256(lastNAVAA + _lastNAVBB);
+        // The new NAV for the tranche is old NAV - loss for the tranche
+        _totalTrancheGain = _isAATranche ? (totalGain - totalBBLoss) : totalBBLoss;
+      } else { // totalGain is negative here
+        // Redirect the whole loss (which should be < maxDecreaseDefault) to junior holders
+        int256 _juniorTVL = int256(_isAATranche ? _lastNAV - _lastTrancheNAV : _lastTrancheNAV);
+        int256 _newJuniorTVL = _juniorTVL + totalGain; 
+        // if junior holders have enough TVL to cover
+        if (_newJuniorTVL > 0) {
+          // then juniors get all loss (totalGain) and senior gets 0 loss
+          _totalTrancheGain = _isAATranche ? int256(0) : totalGain;
+        } else {
+          // otherwise all loss minus junior tvl to senior
+          if (!_isAATranche) {
+            // juniors have no more claims, price is set to 0, gain is set to -juniorTVL
+            return (0, -_juniorTVL);
+          }
+          // seniors get the loss - old junior TVL
+          _totalTrancheGain = _newJuniorTVL;
+        }
+      }
+    }
+    // Split the new NAV (_lastTrancheNAV + _totalTrancheGain) per tranche token
+    _virtualPrice = uint256(int256(_lastTrancheNAV) + _totalTrancheGain) * ONE_TRANCHE_TOKEN / trancheSupply;
+  }
+
+  /// @notice mint tranche tokens and updates tranche last NAV
+  /// @param _amount, in underlyings, to convert in tranche tokens
+  /// @param _to receiver address of the newly minted tranche tokens
+  /// @param _tranche tranche address
+  /// @return _minted number of tranche tokens minted
+  function _mintShares(uint256 _amount, address _to, address _tranche) internal virtual returns (uint256 _minted) {
+    // calculate # of tranche token to mint based on current tranche price: _amount / tranchePrice
+    _minted = _amount * ONE_TRANCHE_TOKEN / _tranchePrice(_tranche);
+    IdleCDOTranche(_tranche).mint(_to, _minted);
+    // update NAV with the _amount of underlyings added
+    if (_tranche == AATranche) {
+      lastNAVAA += _amount;
+    } else {
+      lastNAVBB += _amount;
+    }
+  }
+
+  /// @notice convert fees (`unclaimedFees`) in AA tranche tokens
+  /// @dev this will be called only during harvests
+  function _depositFees() internal virtual {
+    uint256 _amount = unclaimedFees;
+    if (_amount != 0) {
+      // mint tranches tokens (always AA) to this contract
+      _mintShares(_amount, feeReceiver, AATranche);
+      // reset unclaimedFees counter
+      unclaimedFees = 0;
+      // update trancheAPRSplitRatio using instant balance
+      _updateSplitRatio(_getAARatio(true));
+    }
+  }
+
+  /// @notice It allows users to burn their tranche token and redeem their principal + interest back
+  /// @dev automatically reverts on lending provider default (_strategyPrice decreased).
+  /// @param _amount in tranche tokens
+  /// @param _tranche tranche address
+  /// @return toRedeem number of underlyings redeemed
+  function _withdraw(uint256 _amount, address _tranche) virtual internal nonReentrant returns (uint256 toRedeem) {
+    // check if a deposit is made in the same block from the same user
+    _checkSameTx();
+    // check if _strategyPrice decreased
+    _checkDefault();
+    // accrue interest to tranches and updates tranche prices
+    _updateAccounting();
+    // redeem all user balance if 0 is passed as _amount
+    if (_amount == 0) {
+      _amount = IERC20Detailed(_tranche).balanceOf(msg.sender);
+    }
+    require(_amount != 0, '0');
+    address _token = token;
+    // get current available unlent balance
+    uint256 balanceUnderlying = _contractTokenBalance(_token);
+    // Calculate the amount to redeem
+    toRedeem = _amount * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+    uint256 _want = toRedeem;
+    if (toRedeem > balanceUnderlying) {
+      // if the unlent balance is not enough we try to redeem what's missing directly from the strategy
+      // and then add it to the current unlent balance
+      // NOTE: A difference of up to 100 wei due to rounding is tolerated
+      toRedeem = _liquidate(toRedeem - balanceUnderlying, revertIfTooLow) + balanceUnderlying;
+    }
+    // burn tranche token
+    IdleCDOTranche(_tranche).burn(msg.sender, _amount);
+
+    // update NAV with the _amount of underlyings removed
+    if (_tranche == AATranche) {
+      lastNAVAA -= _want;
+    } else {
+      lastNAVBB -= _want;
+    }
+
+    // update trancheAPRSplitRatio
+    _updateSplitRatio(_getAARatio(true));
+  
+    // send underlying to msg.sender. Keep this at the end of the function to avoid 
+    // potential read only reentrancy on cdo variants that have hooks (eg with nfts)
+    IERC20Detailed(_token).safeTransfer(msg.sender, toRedeem);
+  }
+
+  /// @notice updates trancheAPRSplitRatio based on the current tranches TVL ratio between AA and BB
+  /// @dev the idea here is to limit the min and max APR that the senior tranche can get
+  function _updateSplitRatio(uint256 tvlAARatio) internal virtual {
+    uint256 _minSplit = minAprSplitAYS;
+    _minSplit = _minSplit == 0 ? AA_RATIO_LIM_DOWN : _minSplit;
+
+    if (isAYSActive) {
+      uint256 aux;
+      if (tvlAARatio >= AA_RATIO_LIM_UP) {
+        aux = tvlAARatio == FULL_ALLOC ? FULL_ALLOC : AA_RATIO_LIM_UP;
+      } else if (tvlAARatio > _minSplit) {
+        aux = tvlAARatio;
+      } else {
+        aux = _minSplit;
+      }
+      trancheAPRSplitRatio = aux * tvlAARatio / FULL_ALLOC;
+    }
+  }
+
+  /// @notice calculates the current AA tranches ratio
+  /// @dev it does count accrued interest not yet split since last
+  /// depositXX/withdrawXX/harvest only if _instant flag is true
+  /// @param _instant if true, it returns the current ratio without accrued interest
+  /// @return AA tranches ratio (in underlying value) considering all interest
+  function _getAARatio(bool _instant) internal view returns (uint256) {
+    function(address) internal view returns (uint256) _getNAV =
+      _instant ? _instantBalance : _virtualBalance;
+    uint256 AABal = _getNAV(AATranche);
+    uint256 contractVal = AABal + _getNAV(BBTranche);
+    if (contractVal == 0) {
+      return 0;
+    }
+    // Current AA tranche split ratio = AABal * FULL_ALLOC / (AABal + BBBal)
+    return AABal * FULL_ALLOC / contractVal;
+  }
+
+  /// @dev check if _strategyPrice is decreased more than X% with X configurable since last update 
+  /// and updates last saved strategy price
+  function _checkDefault() virtual internal {
+    uint256 currPrice = _strategyPrice();
+    if (!skipDefaultCheck) {
+      // calculate if % of decrease of strategyPrice is within maxDecreaseDefault
+      require(lastStrategyPrice * (FULL_ALLOC - maxDecreaseDefault) / FULL_ALLOC <= currPrice, ""4"");
+    }
+    lastStrategyPrice = currPrice;
+  }
+
+  /// @return strategy price, in underlyings
+  function _strategyPrice() internal view returns (uint256) {
+    return IIdleCDOStrategy(strategy).price();
+  }
+
+  /// @dev this should liquidate at least _amount of `token` from the lending provider or revertIfNeeded
+  /// @param _amount in underlying tokens
+  /// @param _revertIfNeeded flag whether to revert or not if the redeemed amount is not enough
+  /// @return _redeemedTokens number of underlyings redeemed
+  function _liquidate(uint256 _amount, bool _revertIfNeeded) internal virtual returns (uint256 _redeemedTokens) {
+    _redeemedTokens = IIdleCDOStrategy(strategy).redeemUnderlying(_amount);
+    if (_revertIfNeeded) {
+      uint256 _tolerance = liquidationTolerance;
+      if (_tolerance == 0) {
+        _tolerance = 100;
+      }
+      // keep `_tolerance` wei as margin for rounding errors
+      require(_redeemedTokens + _tolerance >= _amount, '5');
+    }
+
+    if (_redeemedTokens > _amount) {
+      _redeemedTokens = _amount;
+    }
+  }
+
+  /// @notice method used to sell `_rewardToken` for `_token` on uniswap
+  /// @param _rewardToken address of the token to sell
+  /// @param _path to buy
+  /// @param _amount of `_rewardToken` to sell
+  /// @param _minAmount min amount of `_token` to buy
+  /// @return _amount of _rewardToken sold
+  /// @return _amount received for the sell
+  function _sellReward(address _rewardToken, bytes memory _path, uint256 _amount, uint256 _minAmount)
+    internal virtual
+    returns (uint256, uint256) {
+    // If 0 is passed as sell amount, we get the whole contract balance
+    if (_amount == 0) {
+      _amount = _contractTokenBalance(_rewardToken);
+    }
+    if (_amount == 0) {
+      return (0, 0);
+    }
+  
+    if (_path.length != 0) {
+      // Uni v3 swap
+      ISwapRouter _swapRouter = ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
+      IERC20Detailed(_rewardToken).safeIncreaseAllowance(address(_swapRouter), _amount);
+      // multi hop swap params
+      ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+        path: _path,
+        recipient: address(this),
+        deadline: block.timestamp + 100,
+        amountIn: _amount,
+        amountOutMinimum: _minAmount
+      });
+      // do the swap and return the amount swapped and the amount received
+      return (_amount, _swapRouter.exactInput(params));
+    } else {
+      // Uni v2 swap
+      IUniswapV2Router02 _uniRouter = uniswapRouterV2;
+      // approve the uniswap router to spend our reward
+      IERC20Detailed(_rewardToken).safeIncreaseAllowance(address(_uniRouter), _amount);
+      // do the trade with all `_rewardToken` in this contract
+      address[] memory _pathUniv2 = new address[](3);
+      _pathUniv2[0] = _rewardToken;
+      _pathUniv2[1] = weth;
+      _pathUniv2[2] = token;
+      uint256[] memory _amounts = _uniRouter.swapExactTokensForTokens(
+        _amount,
+        _minAmount,
+        _pathUniv2,
+        address(this),
+        block.timestamp + 100
+      );
+      // return the amount swapped and the amount received
+      return (_amounts[0], _amounts[_amounts.length - 1]);
+    }
+  }
+
+  /// @notice method used to sell all sellable rewards for `_token` on uniswap
+  /// @param _strategy IIdleCDOStrategy stategy instance
+  /// @param _sellAmounts array with amounts of rewards to sell
+  /// @param _minAmount array with amounts of _token buy for each reward sold. (should have the same length as _sellAmounts)
+  /// @param _skipReward array of flags for skipping the market sell of specific rewards (should have the same length as _sellAmounts)
+  /// @return _soldAmounts array with amounts of rewards actually sold
+  /// @return _swappedAmounts array with amounts of _token actually bought
+  /// @return _totSold total rewards sold in `_token`
+  function _sellAllRewards(IIdleCDOStrategy _strategy, uint256[] memory _sellAmounts, uint256[] memory _minAmount, bool[] memory _skipReward, bytes memory _extraData)
+    internal virtual
+    returns (uint256[] memory _soldAmounts, uint256[] memory _swappedAmounts, uint256 _totSold) {
+    // Fetch state variables once to save gas
+    // get all rewards addresses
+    address[] memory _rewards = _strategy.getRewardTokens();
+    address _rewardToken;
+    bytes[] memory _paths = new bytes[](_rewards.length);
+    if (_extraData.length > 0) {
+      _paths = abi.decode(_extraData, (bytes[]));
+    }
+    uint256 rewardsLen = _rewards.length;
+    // Initialize the return array, containing the amounts received after swapping reward tokens
+    _soldAmounts = new uint256[](rewardsLen);
+    _swappedAmounts = new uint256[](rewardsLen);
+    // loop through all reward tokens
+    for (uint256 i; i < rewardsLen; ++i) {
+      _rewardToken = _rewards[i];
+      // check if it should be sold or not
+      if (_skipReward[i]) { continue; }
+      // do not sell stkAAVE but only AAVE if present
+      if (_rewardToken == stkAave) {
+        _rewardToken = AAVE;
+      }
+      // Market sell _rewardToken in this contract for _token
+      (_soldAmounts[i], _swappedAmounts[i]) = _sellReward(_rewardToken, _paths[i], _sellAmounts[i], _minAmount[i]);
+      _totSold += _swappedAmounts[i];
+    }
+  }
+
+  /// @param _tranche tranche address
+  /// @return last saved tranche price, in underlyings
+  function _tranchePrice(address _tranche) internal view returns (uint256) {
+    if (IdleCDOTranche(_tranche).totalSupply() == 0) {
+      return oneToken;
+    }
+    return _tranche == AATranche ? priceAA : priceBB;
+  }
+
+  /// @notice returns the current apr for a tranche based on trancheAPRSplitRatio and the provided AA ratio
+  /// @dev the apr for a tranche can be higher than the strategy apr
+  /// @param _tranche tranche token address
+  /// @param _AATrancheSplitRatio AA split ratio used for calculations
+  /// @return apr for the specific tranche
+  function _getApr(address _tranche, uint256 _AATrancheSplitRatio) internal view returns (uint256) {
+    uint256 stratApr = IIdleCDOStrategy(strategy).getApr();
+    uint256 _trancheAPRSplitRatio = trancheAPRSplitRatio;
+    bool isAATranche = _tranche == AATranche;
+    if (_AATrancheSplitRatio == 0) {
+      // if there are no AA tranches, apr for AA is 0 (all apr to BB and it will be equal to stratApr)
+      return isAATranche ? 0 : stratApr;
+    }
+    return isAATranche ?
+      // AA apr is: stratApr * AAaprSplitRatio / AASplitRatio
+      stratApr * _trancheAPRSplitRatio / _AATrancheSplitRatio :
+      // BB apr is: stratApr * BBaprSplitRatio / BBSplitRatio -> where
+      // BBaprSplitRatio is: (FULL_ALLOC - _trancheAPRSplitRatio) and
+      // BBSplitRatio is: (FULL_ALLOC - _AATrancheSplitRatio)
+      stratApr * (FULL_ALLOC - _trancheAPRSplitRatio) / (FULL_ALLOC - _AATrancheSplitRatio);
+  }
+
+  /// @return _locked amount of harvested rewards that are still not available to be redeemed
+  function _lockedRewards() internal view virtual returns (uint256 _locked) {
+    uint256 _releaseBlocksPeriod = releaseBlocksPeriod;
+    uint256 _blocksSinceLastHarvest = block.number - latestHarvestBlock;
+    uint256 _harvestedRewards = harvestedRewards;
+
+    // NOTE: _harvestedRewards is never set to 0, but rather to 1 to save some gas
+    if (_harvestedRewards > 1 && _blocksSinceLastHarvest < _releaseBlocksPeriod) {
+      // progressively release harvested rewards
+      _locked = _harvestedRewards * (_releaseBlocksPeriod - _blocksSinceLastHarvest) / _releaseBlocksPeriod;
+    }
+  }
+
+  // ###################
+  // Protected
+  // ###################
+
+  /// @notice This method is used to lend user funds in the lending provider through an IIdleCDOStrategy
+  /// The method:
+  /// - redeems rewards (if any) from the lending provider
+  /// - converts the rewards in underlyings through uniswap v2 or v3
+  /// - calls _updateAccounting to update the accounting of the system with the new underlyings received
+  /// - it then convert fees in tranche tokens
+  /// - finally it deposits the (initial unlent balance + the underlyings get from uniswap - fees) in the
+  ///   lending provider through the IIdleCDOStrategy `deposit` call
+  /// The method will be called by an external, whitelisted, keeper bot which will call the method sistematically (eg once a day)
+  /// @dev can be called only by the rebalancer or the owner
+  /// @param _skipFlags array of flags, [0] = skip reward redemption, [1] = skip incentives update, [2] = skip fee deposit, [3] = skip all
+  /// @param _skipReward array of flags for skipping the market sell of specific rewards. Length should be equal to the `IIdleCDOStrategy(strategy).getRewardTokens()` array
+  /// @param _minAmount array of min amounts for uniswap trades. Lenght should be equal to the _skipReward array
+  /// @param _sellAmounts array of amounts (of reward tokens) to sell on uniswap. Lenght should be equal to the _minAmount array
+  /// if a sellAmount is 0 the whole contract balance for that token is swapped
+  /// @param _extraData bytes to be passed to the redeemRewards call
+  /// @return _res array of arrays with the following elements:
+  ///   [0] _soldAmounts array with amounts of rewards actually sold
+  ///   [1] _swappedAmounts array with amounts of _token actually bought
+  ///   [2] _redeemedRewards array with amounts of rewards redeemed
+  function harvest(
+    // _skipFlags[0] _skipRedeem,
+    // _skipFlags[1] _skipIncentivesUpdate, [DEPRECATED]
+    // _skipFlags[2] _skipFeeDeposit,
+    // _skipFlags[3] _skipRedeem && _skipIncentivesUpdate && _skipFeeDeposit,
+    bool[] calldata _skipFlags,
+    bool[] calldata _skipReward,
+    uint256[] calldata _minAmount,
+    uint256[] calldata _sellAmounts,
+    bytes[] calldata _extraData
+  ) public
+    virtual
+    returns (uint256[][] memory _res) {
+    _checkOnlyOwnerOrRebalancer();
+    // initalize the returned array (elements will be [_soldAmounts, _swappedAmounts, _redeemedRewards])
+    _res = new uint256[][](3);
+    // Fetch state variable once to save gas
+    IIdleCDOStrategy _strategy = IIdleCDOStrategy(strategy);
+    // Check whether to redeem rewards from strategy or not
+    if (!_skipFlags[3]) {
+      uint256 _totSold;
+
+      if (!_skipFlags[0]) {
+        // Redeem all rewards associated with the strategy
+        _res[2] = _strategy.redeemRewards(_extraData[0]);
+        // Sell rewards
+        (_res[0], _res[1], _totSold) = _sellAllRewards(_strategy, _sellAmounts, _minAmount, _skipReward, _extraData[1]);
+      }
+      // update last saved harvest block number
+      latestHarvestBlock = block.number;
+      // update harvested rewards value (avoid setting it to 0 to save some gas)
+      harvestedRewards = _totSold == 0 ? 1 : _totSold;
+
+      // split converted rewards if any and update tranche prices
+      // NOTE: harvested rewards won't be counted directly but released over time
+      _updateAccounting();
+
+      if (!_skipFlags[2]) {
+        // Get fees in the form of totalSupply diluition
+        _depositFees();
+      }
+    }
+
+    // Deposit the remaining balance in the lending provider and 
+    // keep some unlent balance for cheap redeems and as reserve of last resort
+    uint256 underlyingBal = _contractTokenBalance(token);
+    uint256 idealUnlent = getContractValue() * unlentPerc / FULL_ALLOC;
+    if (underlyingBal > idealUnlent) {
+      // Put unlent balance at work in the lending provider
+      _strategy.deposit(underlyingBal - idealUnlent);
+    }
+  }
+
+  /// @notice method used to redeem underlyings from the lending provider
+  /// @dev can be called only by the rebalancer or the owner
+  /// @param _amount in underlyings to liquidate from lending provider
+  /// @param _revertIfNeeded flag to revert if amount liquidated is too low
+  /// @return liquidated amount in underlyings
+  function liquidate(uint256 _amount, bool _revertIfNeeded) external virtual returns (uint256) {
+    _checkOnlyOwnerOrRebalancer();
+    return _liquidate(_amount, _revertIfNeeded);
+  }
+
+  // ###################
+  // onlyOwner
+  // ###################
+
+  /// @dev automatically reverts if strategyPrice decreased more than `_maxDecreaseDefault`
+  /// @param _maxDecreaseDefault max value, in % where `100000` = 100%, of accettable price decrease for the strategy
+  function setMaxDecreaseDefault(uint256 _maxDecreaseDefault) external {
+    _checkOnlyOwner();
+    require(_maxDecreaseDefault < FULL_ALLOC, '7');
+    maxDecreaseDefault = _maxDecreaseDefault;
+  }
+
+  /// @param _active flag to allow Adaptive Yield Split
+  function setIsAYSActive(bool _active) external {
+    _checkOnlyOwner();
+    isAYSActive = _active;
+  }
+
+  /// @param _allowed flag to allow AA withdraws
+  function setAllowAAWithdraw(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    allowAAWithdraw = _allowed;
+  }
+
+  /// @param _allowed flag to allow BB withdraws
+  function setAllowBBWithdraw(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    allowBBWithdraw = _allowed;
+  }
+
+  /// @param _allowed flag to enable the 'default' check (whether _strategyPrice decreased or not)
+  function setSkipDefaultCheck(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    skipDefaultCheck = _allowed;
+  }
+
+  /// @param _allowed flag to enable the check if redeemed amount during liquidations is enough
+  function setRevertIfTooLow(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    revertIfTooLow = _allowed;
+  }
+
+  /// @param _rebalancer new rebalancer address
+  function setRebalancer(address _rebalancer) external {
+    _checkOnlyOwner();
+    require((rebalancer = _rebalancer) != address(0), '0');
+  }
+
+  /// @param _feeReceiver new fee receiver address
+  function setFeeReceiver(address _feeReceiver) external {
+    _checkOnlyOwner();
+    require((feeReceiver = _feeReceiver) != address(0), '0');
+  }
+
+  /// @param _guardian new guardian (pauser) address
+  function setGuardian(address _guardian) external {
+    _checkOnlyOwner();
+    require((guardian = _guardian) != address(0), '0');
+  }
+
+  /// @param _diff max liquidation diff tolerance in underlyings
+  function setLiquidationTolerance(uint256 _diff) external virtual {
+    _checkOnlyOwner();
+    liquidationTolerance = _diff;
+  }
+
+  /// @param _val stkIDLE per underlying required for deposits
+  function setStkIDLEPerUnderlying(uint256 _val) external virtual {
+    _checkOnlyOwner();
+    stkIDLEPerUnderlying = _val;
+  }
+
+  /// @param _aprSplit min apr split for AA, considering FULL_ALLOC = 100%
+  function setMinAprSplitAYS(uint256 _aprSplit) external {
+    _checkOnlyOwner();
+    require((minAprSplitAYS = _aprSplit) <= FULL_ALLOC, '7');
+    minAprSplitAYS = _aprSplit;
+  }
+
+  /// @param _fee new fee
+  function setFee(uint256 _fee) external {
+    _checkOnlyOwner();
+    require((fee = _fee) <= MAX_FEE, '7');
+  }
+
+  /// @param _unlentPerc new unlent percentage
+  function setUnlentPerc(uint256 _unlentPerc) external {
+    _checkOnlyOwner();
+    require((unlentPerc = _unlentPerc) <= FULL_ALLOC, '7');
+  }
+
+  /// @notice set new release block period. WARN: this should be called only when there 
+  /// are no active rewards being unlocked
+  /// @param _releaseBlocksPeriod new # of blocks after an harvest during which
+  /// harvested rewards gets progressively redistriburted to users
+  function setReleaseBlocksPeriod(uint256 _releaseBlocksPeriod) external virtual {
+    _checkOnlyOwner();
+    releaseBlocksPeriod = _releaseBlocksPeriod;
+  }
+
+  /// @param _trancheAPRSplitRatio new apr split ratio
+  function setTrancheAPRSplitRatio(uint256 _trancheAPRSplitRatio) external {
+    _checkOnlyOwner();
+    require((trancheAPRSplitRatio = _trancheAPRSplitRatio) <= FULL_ALLOC, '7');
+  }
+
+  /// @param _diffBps tolerance in % (FULL_ALLOC = 100%) for socializing small losses 
+  function setLossToleranceBps(uint256 _diffBps) external {
+    _checkOnlyOwner();
+    lossToleranceBps = _diffBps;
+  }
+
+  /// @dev toggle stkIDLE requirement for tranche
+  /// @param _tranche address
+  function toggleStkIDLEForTranche(address _tranche) external virtual {
+    _checkOnlyOwner();
+    address aa = AATranche;
+    require(_tranche == BBTranche || _tranche == aa, '9');
+    if (_tranche == aa) {
+      AAStaking = AAStaking == address(0) ? address(1) : address(0);
+      return;
+    }
+
+    BBStaking = BBStaking == address(0) ? address(1) : address(0);
+  }
+
+  /// @notice this method updates the accounting of the contract and effectively splits the yield/loss between the
+  /// AA and BB tranches. This can be called at any time as is called automatically on each deposit/redeem. It's here
+  /// just to be called when a default happened, as deposits/redeems are paused, but we need to update
+  /// the loss for junior holders
+  function updateAccounting() external {
+    _checkOnlyOwnerOrGuardian();
+    skipDefaultCheck = true;
+    _updateAccounting();
+    // _updateAccounting can set `skipDefaultCheck` to true in case of default
+    // but this can be manually be reset to true if needed
+    skipDefaultCheck = false;
+  }
+
+  /// @notice pause deposits and redeems for all classes of tranches
+  /// @dev can be called by both the owner and the guardian
+  function emergencyShutdown() external {
+    _checkOnlyOwnerOrGuardian();
+    _emergencyShutdown(false);
+  }
+
+  function _emergencyShutdown(bool isAAWithdrawAllowed) internal virtual {
+    // prevent deposits
+    _pause();
+    // prevent withdraws
+    allowAAWithdraw = isAAWithdrawAllowed;
+    allowBBWithdraw = false;
+    // Allow deposits/withdraws (once selectively re-enabled, eg for AA holders)
+    // without checking for lending protocol default
+    skipDefaultCheck = true;
+    revertIfTooLow = true;
+  }
+
+  /// @notice allow deposits and redeems for all classes of tranches
+  /// @dev can be called by the owner only
+  function restoreOperations() external virtual {
+    _checkOnlyOwner();
+    // restore deposits
+    _unpause();
+    // restore withdraws
+    allowAAWithdraw = true;
+    allowBBWithdraw = true;
+    // Allow deposits/withdraws but checks for lending protocol default
+    skipDefaultCheck = false;
+    revertIfTooLow = true;
+  }
+
+  /// @notice Pauses deposits
+  /// @dev can be called by both the owner and the guardian
+  function pause() external  {
+    _checkOnlyOwnerOrGuardian();
+    _pause();
+  }
+
+  /// @notice Unpauses deposits
+  /// @dev can be called by both the owner and the guardian
+  function unpause() external {
+    _checkOnlyOwnerOrGuardian();
+    _unpause();
+  }
+
+  // ###################
+  // Helpers
+  // ###################
+
+  /// @dev Check that the msg.sender is the either the owner or the guardian
+  function _checkOnlyOwnerOrGuardian() internal view {
+    require(msg.sender == guardian || msg.sender == owner(), ""6"");
+  }
+
+  /// @dev Check that the msg.sender is the either the owner or the rebalancer
+  function _checkOnlyOwnerOrRebalancer() internal view {
+    require(msg.sender == rebalancer || msg.sender == owner(), ""6"");
+  }
+
+  /// @notice returns the current balance of this contract for a specific token
+  /// @param _token token address
+  /// @return balance of `_token` for this contract
+  function _contractTokenBalance(address _token) internal view returns (uint256) {
+    return IERC20Detailed(_token).balanceOf(address(this));
+  }
+
+  /// @dev Set allowance for _token to unlimited for _spender
+  /// @param _token token address
+  /// @param _spender spender address
+  function _allowUnlimitedSpend(address _token, address _spender) internal {
+    IERC20Detailed(_token).safeIncreaseAllowance(_spender, type(uint256).max);
+  }
+
+  /// @dev Set last caller and block.number hash. This should be called at the beginning of the first function to protect
+  function _updateCallerBlock() internal {
+    _lastCallerBlock = keccak256(abi.encodePacked(tx.origin, block.number));
+  }
+
+  /// @dev Check that the second function is not called in the same tx from the same tx.origin
+  function _checkSameTx() internal view {
+    require(keccak256(abi.encodePacked(tx.origin, block.number)) != _lastCallerBlock, ""8"");
+  }
+
+  /// @notice concat 2 strings in a single one
+  /// @param a first string
+  /// @param b second string
+  /// @return new string with a and b concatenated
+  function _concat(string memory a, string memory b) internal pure returns (string memory) {
+    return string(abi.encodePacked(a, b));
+  }
+}
+","[H-2] IdleCDO is Vulnerable to Share Price Inflation Attacks The deposit mechanism is susceptible to a classic inflation attack, particularly when the vault is empty. An attacker can deposit a minimal amount (e.g., 1 wei) to mint the first share. They can then front-run a legitimate depositor's transaction by directly transferring a large amount of the underlying asset to the contract. This inflates the total assets without minting new shares, drastically increasing the price per share. When the victim's deposit is processed, the amount of shares they receive rounds down to zero, causing them to lose their entire deposit to the attacker.",1,0,12613,1070,"pragma solidity 0.8.10;
+
+import ""@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol"";
+import '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol';
+import ""@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol"";
+import ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+
+import ""./interfaces/IIdleCDOStrategy.sol"";
+import ""./interfaces/IERC20Detailed.sol"";
+
+import ""./GuardedLaunchUpgradable.sol"";
+import ""./IdleCDOTranche.sol"";
+import ""./IdleCDOStorage.sol"";
+
+
+
+
+
+contract IdleCDO is PausableUpgradeable, GuardedLaunchUpgradable, IdleCDOStorage {
+  using SafeERC20Upgradeable for IERC20Detailed;
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  
+  
+  constructor() {
+    token = address(1);
+  }
+
+  
+  
+  
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  function initialize(
+    uint256 _limit, address _guardedToken, address _governanceFund, address _owner, 
+    address _rebalancer,
+    address _strategy,
+    uint256 _trancheAPRSplitRatio, 
+    uint256, 
+    address[] memory 
+  ) external initializer {
+    require(token == address(0), '1');
+    require(_rebalancer != address(0), '0');
+    require(_strategy != address(0), '0');
+    require(_guardedToken != address(0), '0');
+    require( _trancheAPRSplitRatio <= FULL_ALLOC, '7');
+    
+    PausableUpgradeable.__Pausable_init();
+    
+    GuardedLaunchUpgradable.__GuardedLaunch_init(_limit, _governanceFund, _owner);
+    
+    address _strategyToken = IIdleCDOStrategy(_strategy).strategyToken();
+    
+    string memory _symbol = IERC20Detailed(_strategyToken).symbol();
+    
+    AATranche = address(new IdleCDOTranche(_concat(string(""IdleCDO AA Tranche - ""), _symbol), _concat(string(""AA_""), _symbol)));
+    BBTranche = address(new IdleCDOTranche(_concat(string(""IdleCDO BB Tranche - ""), _symbol), _concat(string(""BB_""), _symbol)));
+    
+    token = _guardedToken;
+    strategy = _strategy;
+    strategyToken = _strategyToken;
+    rebalancer = _rebalancer;
+    trancheAPRSplitRatio = _trancheAPRSplitRatio;
+    uint256 _oneToken = 10**(IERC20Detailed(_guardedToken).decimals());
+    oneToken = _oneToken;
+    uniswapRouterV2 = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+    weth = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    
+    priceAA = _oneToken;
+    priceBB = _oneToken;
+    unlentPerc = 2000; 
+    
+    releaseBlocksPeriod = 6400; 
+    
+    allowAAWithdraw = true;
+    allowBBWithdraw = true;
+    revertIfTooLow = true;
+    
+    
+    _allowUnlimitedSpend(_guardedToken, _strategy);
+    _allowUnlimitedSpend(_strategyToken, _strategy);
+    
+    lastStrategyPrice = _strategyPrice();
+    
+    fee = 15000; 
+    feeReceiver = address(0xFb3bD022D5DAcF95eE28a6B07825D4Ff9C5b3814); 
+    guardian = _owner;
+    
+    isAYSActive = true; 
+    minAprSplitAYS = AA_RATIO_LIM_DOWN; 
+
+    maxDecreaseDefault = 5000; 
+    _additionalInit();
+  }
+
+  
+  function _additionalInit() internal virtual {}
+
+  
+  
+  
+
+  
+  
+  
+  
+  function depositAA(uint256 _amount) external returns (uint256) {
+    return _deposit(_amount, AATranche, address(0));
+  }
+
+  
+  
+  
+  
+  function depositBB(uint256 _amount) external returns (uint256) {
+    return _deposit(_amount, BBTranche, address(0));
+  }
+
+  
+  
+  
+  
+  
+  function depositAARef(uint256 _amount, address _referral) external returns (uint256) {
+    return _deposit(_amount, AATranche, _referral);
+  }
+
+  
+  
+  
+  
+  
+  function depositBBRef(uint256 _amount, address _referral) external returns (uint256) {
+    return _deposit(_amount, BBTranche, _referral);
+  }
+
+  
+  
+  
+  function withdrawAA(uint256 _amount) external virtual returns (uint256) {
+    require(!paused() || allowAAWithdraw, '3');
+    return _withdraw(_amount, AATranche);
+  }
+
+  
+  
+  
+  function withdrawBB(uint256 _amount) external virtual returns (uint256) {
+    require(!paused() || allowBBWithdraw, '3');
+    return _withdraw(_amount, BBTranche);
+  }
+
+  
+  
+  
+
+  
+  
+  
+  function tranchePrice(address _tranche) external view returns (uint256) {
+    return _tranchePrice(_tranche);
+  }
+
+  
+  
+  
+  function getContractValue() public override view returns (uint256) {
+    address _strategyToken = strategyToken;
+    uint256 strategyTokenDecimals = IERC20Detailed(_strategyToken).decimals();
+    
+    
+    
+    return (_contractTokenBalance(_strategyToken) * _strategyPrice() / (10**(strategyTokenDecimals))) +
+            _contractTokenBalance(token) -
+            _lockedRewards() -
+            unclaimedFees;
+  }
+
+  
+  
+  function getApr(address _tranche) external view returns (uint256) {
+    return _getApr(_tranche, _getAARatio(false));
+  }
+
+  
+  
+  
+  
+  
+  function getCurrentAARatio() external view returns (uint256) {
+    return _getAARatio(false);
+  }
+
+  
+  
+  
+  
+  function virtualPrice(address _tranche) public virtual view returns (uint256 _virtualPrice) {
+    
+    uint256 _lastNAVAA = lastNAVAA;
+    uint256 _lastNAVBB = lastNAVBB;
+
+    (_virtualPrice, ) = _virtualPriceAux(
+      _tranche,
+      getContractValue(), 
+      _lastNAVAA + _lastNAVBB, 
+      _tranche == AATranche ? _lastNAVAA : _lastNAVBB, 
+      trancheAPRSplitRatio
+    );
+  }
+
+  
+  
+  function getIncentiveTokens() external view virtual returns (address[] memory) {
+    return incentiveTokens;
+  }
+
+  
+  
+  
+
+  
+  
+  
+  
+  
+  
+  function _checkStkIDLEBal(address _tranche, uint256 _amount) internal view virtual {
+    uint256 _stkIDLEPerUnderlying = stkIDLEPerUnderlying;
+    
+    if (_stkIDLEPerUnderlying == 0 || 
+      (_tranche == BBTranche && BBStaking == address(0)) || 
+      (_tranche == AATranche && AAStaking == address(0))) {
+      return;
+    }
+
+    uint256 trancheBal = IERC20Detailed(_tranche).balanceOf(msg.sender);
+    
+    uint256 bal = _amount + (trancheBal > 0 ? (trancheBal * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN) : 0);
+    require(
+      IERC20(STK_IDLE).balanceOf(msg.sender) >= 
+      bal * _stkIDLEPerUnderlying / oneToken, 
+      '7'
+    );
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  
+  function _deposit(uint256 _amount, address _tranche, address _referral) internal virtual whenNotPaused returns (uint256 _minted) {
+    if (_amount == 0) {
+      return _minted;
+    }
+    
+    _guarded(_amount);
+    
+    _updateCallerBlock();
+    
+    _checkDefault();
+    
+    
+    
+    _updateAccounting();
+    
+    _checkStkIDLEBal(_tranche, _amount);
+    
+    address _token = token;
+    uint256 _preBal = _contractTokenBalance(_token);
+    IERC20Detailed(_token).safeTransferFrom(msg.sender, address(this), _amount);
+    
+    _minted = _mintShares(_contractTokenBalance(_token) - _preBal, msg.sender, _tranche);
+    
+    _updateSplitRatio(_getAARatio(true));
+
+    if (directDeposit) {
+      IIdleCDOStrategy(strategy).deposit(_amount);
+    }
+
+    if (_referral != address(0)) {
+      emit Referral(_amount, _referral);
+    }
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  function _updateAccounting() internal virtual {
+    uint256 _lastNAVAA = lastNAVAA;
+    uint256 _lastNAVBB = lastNAVBB;
+    uint256 _lastNAV = _lastNAVAA + _lastNAVBB;
+    uint256 nav = getContractValue();
+    uint256 _aprSplitRatio = trancheAPRSplitRatio;
+    
+    if (nav > _lastNAV) {
+      unclaimedFees += (nav - _lastNAV) * fee / FULL_ALLOC;
+    }
+    (uint256 _priceAA, int256 _totalAAGain) = _virtualPriceAux(AATranche, nav, _lastNAV, _lastNAVAA, _aprSplitRatio);
+    (uint256 _priceBB, int256 _totalBBGain) = _virtualPriceAux(BBTranche, nav, _lastNAV, _lastNAVBB, _aprSplitRatio);
+    lastNAVAA = uint256(int256(_lastNAVAA) + _totalAAGain);
+
+    
+    if (_totalBBGain < 0 && -_totalBBGain >= int256(_lastNAVBB)) {
+      
+      
+      require(skipDefaultCheck, ""4"");
+      
+      
+      lastNAVBB = 0;
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      _emergencyShutdown(true);
+    } else {
+      
+      lastNAVBB = uint256(int256(_lastNAVBB) + _totalBBGain);
+    }
+    priceAA = _priceAA;
+    priceBB = _priceBB;
+  }
+
+  
+  
+  
+  function _virtualBalance(address _tranche) internal view returns (uint256) {
+    
+    return IdleCDOTranche(_tranche).totalSupply() * virtualPrice(_tranche) / ONE_TRANCHE_TOKEN;
+  }
+
+  
+  
+  
+  function _instantBalance(address _tranche) internal view returns (uint256) {
+    return IdleCDOTranche(_tranche).totalSupply() * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  function _virtualPriceAux(
+    address _tranche,
+    uint256 _nav,
+    uint256 _lastNAV,
+    uint256 _lastTrancheNAV,
+    uint256 _trancheAPRSplitRatio
+  ) internal virtual view returns (uint256 _virtualPrice, int256 _totalTrancheGain) {
+    
+    uint256 trancheSupply = IdleCDOTranche(_tranche).totalSupply();
+    if (_lastNAV == 0 || trancheSupply == 0) {
+      return (oneToken, 0);
+    }
+
+    
+    
+    
+    
+    
+    
+    int256 totalGain = int256(_nav) - int256(_lastNAV);
+    
+    if (totalGain == 0) {
+      return (_tranchePrice(_tranche), 0);
+    }
+
+    
+    if (totalGain > 0) {
+      totalGain -= totalGain * int256(fee) / int256(FULL_ALLOC);
+    }
+
+    address _AATranche = AATranche;
+    address _BBTranche = BBTranche;
+    bool _isAATranche = _tranche == _AATranche;
+    
+    
+    if (IdleCDOTranche(_isAATranche ? _BBTranche : _AATranche).totalSupply() == 0) {
+      _totalTrancheGain = totalGain;
+    } else {
+      
+      if (totalGain > 0) {
+        
+        int256 totalBBGain = totalGain * int256(FULL_ALLOC - _trancheAPRSplitRatio) / int256(FULL_ALLOC);
+        
+        _totalTrancheGain = _isAATranche ? (totalGain - totalBBGain) : totalBBGain;
+      } else if (uint256(-totalGain) <= (lossToleranceBps * _lastNAV) / FULL_ALLOC) {
+        
+        uint256 _lastNAVBB = lastNAVBB;
+        int256 totalBBLoss = totalGain * int256(_lastNAVBB) / int256(lastNAVAA + _lastNAVBB);
+        
+        _totalTrancheGain = _isAATranche ? (totalGain - totalBBLoss) : totalBBLoss;
+      } else { 
+        
+        int256 _juniorTVL = int256(_isAATranche ? _lastNAV - _lastTrancheNAV : _lastTrancheNAV);
+        int256 _newJuniorTVL = _juniorTVL + totalGain; 
+        
+        if (_newJuniorTVL > 0) {
+          
+          _totalTrancheGain = _isAATranche ? int256(0) : totalGain;
+        } else {
+          
+          if (!_isAATranche) {
+            
+            return (0, -_juniorTVL);
+          }
+          
+          _totalTrancheGain = _newJuniorTVL;
+        }
+      }
+    }
+    
+    _virtualPrice = uint256(int256(_lastTrancheNAV) + _totalTrancheGain) * ONE_TRANCHE_TOKEN / trancheSupply;
+  }
+
+  
+  
+  
+  
+  
+  function _mintShares(uint256 _amount, address _to, address _tranche) internal virtual returns (uint256 _minted) {
+    
+    _minted = _amount * ONE_TRANCHE_TOKEN / _tranchePrice(_tranche);
+    IdleCDOTranche(_tranche).mint(_to, _minted);
+    
+    if (_tranche == AATranche) {
+      lastNAVAA += _amount;
+    } else {
+      lastNAVBB += _amount;
+    }
+  }
+
+  
+  
+  function _depositFees() internal virtual {
+    uint256 _amount = unclaimedFees;
+    if (_amount != 0) {
+      
+      _mintShares(_amount, feeReceiver, AATranche);
+      
+      unclaimedFees = 0;
+      
+      _updateSplitRatio(_getAARatio(true));
+    }
+  }
+
+  
+  
+  
+  
+  
+  function _withdraw(uint256 _amount, address _tranche) virtual internal nonReentrant returns (uint256 toRedeem) {
+    
+    _checkSameTx();
+    
+    _checkDefault();
+    
+    _updateAccounting();
+    
+    if (_amount == 0) {
+      _amount = IERC20Detailed(_tranche).balanceOf(msg.sender);
+    }
+    require(_amount != 0, '0');
+    address _token = token;
+    
+    uint256 balanceUnderlying = _contractTokenBalance(_token);
+    
+    toRedeem = _amount * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+    uint256 _want = toRedeem;
+    if (toRedeem > balanceUnderlying) {
+      
+      
+      
+      toRedeem = _liquidate(toRedeem - balanceUnderlying, revertIfTooLow) + balanceUnderlying;
+    }
+    
+    IdleCDOTranche(_tranche).burn(msg.sender, _amount);
+
+    
+    if (_tranche == AATranche) {
+      lastNAVAA -= _want;
+    } else {
+      lastNAVBB -= _want;
+    }
+
+    
+    _updateSplitRatio(_getAARatio(true));
+  
+    
+    
+    IERC20Detailed(_token).safeTransfer(msg.sender, toRedeem);
+  }
+
+  
+  
+  function _updateSplitRatio(uint256 tvlAARatio) internal virtual {
+    uint256 _minSplit = minAprSplitAYS;
+    _minSplit = _minSplit == 0 ? AA_RATIO_LIM_DOWN : _minSplit;
+
+    if (isAYSActive) {
+      uint256 aux;
+      if (tvlAARatio >= AA_RATIO_LIM_UP) {
+        aux = tvlAARatio == FULL_ALLOC ? FULL_ALLOC : AA_RATIO_LIM_UP;
+      } else if (tvlAARatio > _minSplit) {
+        aux = tvlAARatio;
+      } else {
+        aux = _minSplit;
+      }
+      trancheAPRSplitRatio = aux * tvlAARatio / FULL_ALLOC;
+    }
+  }
+
+  
+  
+  
+  
+  
+  function _getAARatio(bool _instant) internal view returns (uint256) {
+    function(address) internal view returns (uint256) _getNAV =
+      _instant ? _instantBalance : _virtualBalance;
+    uint256 AABal = _getNAV(AATranche);
+    uint256 contractVal = AABal + _getNAV(BBTranche);
+    if (contractVal == 0) {
+      return 0;
+    }
+    
+    return AABal * FULL_ALLOC / contractVal;
+  }
+
+  
+  
+  function _checkDefault() virtual internal {
+    uint256 currPrice = _strategyPrice();
+    if (!skipDefaultCheck) {
+      
+      require(lastStrategyPrice * (FULL_ALLOC - maxDecreaseDefault) / FULL_ALLOC <= currPrice, ""4"");
+    }
+    lastStrategyPrice = currPrice;
+  }
+
+  
+  function _strategyPrice() internal view returns (uint256) {
+    return IIdleCDOStrategy(strategy).price();
+  }
+
+  
+  
+  
+  
+  function _liquidate(uint256 _amount, bool _revertIfNeeded) internal virtual returns (uint256 _redeemedTokens) {
+    _redeemedTokens = IIdleCDOStrategy(strategy).redeemUnderlying(_amount);
+    if (_revertIfNeeded) {
+      uint256 _tolerance = liquidationTolerance;
+      if (_tolerance == 0) {
+        _tolerance = 100;
+      }
+      
+      require(_redeemedTokens + _tolerance >= _amount, '5');
+    }
+
+    if (_redeemedTokens > _amount) {
+      _redeemedTokens = _amount;
+    }
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  function _sellReward(address _rewardToken, bytes memory _path, uint256 _amount, uint256 _minAmount)
+    internal virtual
+    returns (uint256, uint256) {
+    
+    if (_amount == 0) {
+      _amount = _contractTokenBalance(_rewardToken);
+    }
+    if (_amount == 0) {
+      return (0, 0);
+    }
+  
+    if (_path.length != 0) {
+      
+      ISwapRouter _swapRouter = ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
+      IERC20Detailed(_rewardToken).safeIncreaseAllowance(address(_swapRouter), _amount);
+      
+      ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+        path: _path,
+        recipient: address(this),
+        deadline: block.timestamp + 100,
+        amountIn: _amount,
+        amountOutMinimum: _minAmount
+      });
+      
+      return (_amount, _swapRouter.exactInput(params));
+    } else {
+      
+      IUniswapV2Router02 _uniRouter = uniswapRouterV2;
+      
+      IERC20Detailed(_rewardToken).safeIncreaseAllowance(address(_uniRouter), _amount);
+      
+      address[] memory _pathUniv2 = new address[](3);
+      _pathUniv2[0] = _rewardToken;
+      _pathUniv2[1] = weth;
+      _pathUniv2[2] = token;
+      uint256[] memory _amounts = _uniRouter.swapExactTokensForTokens(
+        _amount,
+        _minAmount,
+        _pathUniv2,
+        address(this),
+        block.timestamp + 100
+      );
+      
+      return (_amounts[0], _amounts[_amounts.length - 1]);
+    }
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  
+  function _sellAllRewards(IIdleCDOStrategy _strategy, uint256[] memory _sellAmounts, uint256[] memory _minAmount, bool[] memory _skipReward, bytes memory _extraData)
+    internal virtual
+    returns (uint256[] memory _soldAmounts, uint256[] memory _swappedAmounts, uint256 _totSold) {
+    
+    
+    address[] memory _rewards = _strategy.getRewardTokens();
+    address _rewardToken;
+    bytes[] memory _paths = new bytes[](_rewards.length);
+    if (_extraData.length > 0) {
+      _paths = abi.decode(_extraData, (bytes[]));
+    }
+    uint256 rewardsLen = _rewards.length;
+    
+    _soldAmounts = new uint256[](rewardsLen);
+    _swappedAmounts = new uint256[](rewardsLen);
+    
+    for (uint256 i; i < rewardsLen; ++i) {
+      _rewardToken = _rewards[i];
+      
+      if (_skipReward[i]) { continue; }
+      
+      if (_rewardToken == stkAave) {
+        _rewardToken = AAVE;
+      }
+      
+      (_soldAmounts[i], _swappedAmounts[i]) = _sellReward(_rewardToken, _paths[i], _sellAmounts[i], _minAmount[i]);
+      _totSold += _swappedAmounts[i];
+    }
+  }
+
+  
+  
+  function _tranchePrice(address _tranche) internal view returns (uint256) {
+    if (IdleCDOTranche(_tranche).totalSupply() == 0) {
+      return oneToken;
+    }
+    return _tranche == AATranche ? priceAA : priceBB;
+  }
+
+  
+  
+  
+  
+  
+  function _getApr(address _tranche, uint256 _AATrancheSplitRatio) internal view returns (uint256) {
+    uint256 stratApr = IIdleCDOStrategy(strategy).getApr();
+    uint256 _trancheAPRSplitRatio = trancheAPRSplitRatio;
+    bool isAATranche = _tranche == AATranche;
+    if (_AATrancheSplitRatio == 0) {
+      
+      return isAATranche ? 0 : stratApr;
+    }
+    return isAATranche ?
+      
+      stratApr * _trancheAPRSplitRatio / _AATrancheSplitRatio :
+      
+      
+      
+      stratApr * (FULL_ALLOC - _trancheAPRSplitRatio) / (FULL_ALLOC - _AATrancheSplitRatio);
+  }
+
+  
+  function _lockedRewards() internal view virtual returns (uint256 _locked) {
+    uint256 _releaseBlocksPeriod = releaseBlocksPeriod;
+    uint256 _blocksSinceLastHarvest = block.number - latestHarvestBlock;
+    uint256 _harvestedRewards = harvestedRewards;
+
+    
+    if (_harvestedRewards > 1 && _blocksSinceLastHarvest < _releaseBlocksPeriod) {
+      
+      _locked = _harvestedRewards * (_releaseBlocksPeriod - _blocksSinceLastHarvest) / _releaseBlocksPeriod;
+    }
+  }
+
+  
+  
+  
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  function harvest(
+    
+    
+    
+    
+    bool[] calldata _skipFlags,
+    bool[] calldata _skipReward,
+    uint256[] calldata _minAmount,
+    uint256[] calldata _sellAmounts,
+    bytes[] calldata _extraData
+  ) public
+    virtual
+    returns (uint256[][] memory _res) {
+    _checkOnlyOwnerOrRebalancer();
+    
+    _res = new uint256[][](3);
+    
+    IIdleCDOStrategy _strategy = IIdleCDOStrategy(strategy);
+    
+    if (!_skipFlags[3]) {
+      uint256 _totSold;
+
+      if (!_skipFlags[0]) {
+        
+        _res[2] = _strategy.redeemRewards(_extraData[0]);
+        
+        (_res[0], _res[1], _totSold) = _sellAllRewards(_strategy, _sellAmounts, _minAmount, _skipReward, _extraData[1]);
+      }
+      
+      latestHarvestBlock = block.number;
+      
+      harvestedRewards = _totSold == 0 ? 1 : _totSold;
+
+      
+      
+      _updateAccounting();
+
+      if (!_skipFlags[2]) {
+        
+        _depositFees();
+      }
+    }
+
+    
+    
+    uint256 underlyingBal = _contractTokenBalance(token);
+    uint256 idealUnlent = getContractValue() * unlentPerc / FULL_ALLOC;
+    if (underlyingBal > idealUnlent) {
+      
+      _strategy.deposit(underlyingBal - idealUnlent);
+    }
+  }
+
+  
+  
+  
+  
+  
+  function liquidate(uint256 _amount, bool _revertIfNeeded) external virtual returns (uint256) {
+    _checkOnlyOwnerOrRebalancer();
+    return _liquidate(_amount, _revertIfNeeded);
+  }
+
+  
+  
+  
+
+  
+  
+  function setMaxDecreaseDefault(uint256 _maxDecreaseDefault) external {
+    _checkOnlyOwner();
+    require(_maxDecreaseDefault < FULL_ALLOC, '7');
+    maxDecreaseDefault = _maxDecreaseDefault;
+  }
+
+  
+  function setIsAYSActive(bool _active) external {
+    _checkOnlyOwner();
+    isAYSActive = _active;
+  }
+
+  
+  function setAllowAAWithdraw(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    allowAAWithdraw = _allowed;
+  }
+
+  
+  function setAllowBBWithdraw(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    allowBBWithdraw = _allowed;
+  }
+
+  
+  function setSkipDefaultCheck(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    skipDefaultCheck = _allowed;
+  }
+
+  
+  function setRevertIfTooLow(bool _allowed) external virtual {
+    _checkOnlyOwner();
+    revertIfTooLow = _allowed;
+  }
+
+  
+  function setRebalancer(address _rebalancer) external {
+    _checkOnlyOwner();
+    require((rebalancer = _rebalancer) != address(0), '0');
+  }
+
+  
+  function setFeeReceiver(address _feeReceiver) external {
+    _checkOnlyOwner();
+    require((feeReceiver = _feeReceiver) != address(0), '0');
+  }
+
+  
+  function setGuardian(address _guardian) external {
+    _checkOnlyOwner();
+    require((guardian = _guardian) != address(0), '0');
+  }
+
+  
+  function setLiquidationTolerance(uint256 _diff) external virtual {
+    _checkOnlyOwner();
+    liquidationTolerance = _diff;
+  }
+
+  
+  function setStkIDLEPerUnderlying(uint256 _val) external virtual {
+    _checkOnlyOwner();
+    stkIDLEPerUnderlying = _val;
+  }
+
+  
+  function setMinAprSplitAYS(uint256 _aprSplit) external {
+    _checkOnlyOwner();
+    require((minAprSplitAYS = _aprSplit) <= FULL_ALLOC, '7');
+    minAprSplitAYS = _aprSplit;
+  }
+
+  
+  function setFee(uint256 _fee) external {
+    _checkOnlyOwner();
+    require((fee = _fee) <= MAX_FEE, '7');
+  }
+
+  
+  function setUnlentPerc(uint256 _unlentPerc) external {
+    _checkOnlyOwner();
+    require((unlentPerc = _unlentPerc) <= FULL_ALLOC, '7');
+  }
+
+  
+  
+  
+  
+  function setReleaseBlocksPeriod(uint256 _releaseBlocksPeriod) external virtual {
+    _checkOnlyOwner();
+    releaseBlocksPeriod = _releaseBlocksPeriod;
+  }
+
+  
+  function setTrancheAPRSplitRatio(uint256 _trancheAPRSplitRatio) external {
+    _checkOnlyOwner();
+    require((trancheAPRSplitRatio = _trancheAPRSplitRatio) <= FULL_ALLOC, '7');
+  }
+
+  
+  function setLossToleranceBps(uint256 _diffBps) external {
+    _checkOnlyOwner();
+    lossToleranceBps = _diffBps;
+  }
+
+  
+  
+  function toggleStkIDLEForTranche(address _tranche) external virtual {
+    _checkOnlyOwner();
+    address aa = AATranche;
+    require(_tranche == BBTranche || _tranche == aa, '9');
+    if (_tranche == aa) {
+      AAStaking = AAStaking == address(0) ? address(1) : address(0);
+      return;
+    }
+
+    BBStaking = BBStaking == address(0) ? address(1) : address(0);
+  }
+
+  
+  
+  
+  
+  function updateAccounting() external {
+    _checkOnlyOwnerOrGuardian();
+    skipDefaultCheck = true;
+    _updateAccounting();
+    
+    
+    skipDefaultCheck = false;
+  }
+
+  
+  
+  function emergencyShutdown() external {
+    _checkOnlyOwnerOrGuardian();
+    _emergencyShutdown(false);
+  }
+
+  function _emergencyShutdown(bool isAAWithdrawAllowed) internal virtual {
+    
+    _pause();
+    
+    allowAAWithdraw = isAAWithdrawAllowed;
+    allowBBWithdraw = false;
+    
+    
+    skipDefaultCheck = true;
+    revertIfTooLow = true;
+  }
+
+  
+  
+  function restoreOperations() external virtual {
+    _checkOnlyOwner();
+    
+    _unpause();
+    
+    allowAAWithdraw = true;
+    allowBBWithdraw = true;
+    
+    skipDefaultCheck = false;
+    revertIfTooLow = true;
+  }
+
+  
+  
+  function pause() external  {
+    _checkOnlyOwnerOrGuardian();
+    _pause();
+  }
+
+  
+  
+  function unpause() external {
+    _checkOnlyOwnerOrGuardian();
+    _unpause();
+  }
+
+  
+  
+  
+
+  
+  function _checkOnlyOwnerOrGuardian() internal view {
+    require(msg.sender == guardian || msg.sender == owner(), ""6"");
+  }
+
+  
+  function _checkOnlyOwnerOrRebalancer() internal view {
+    require(msg.sender == rebalancer || msg.sender == owner(), ""6"");
+  }
+
+  
+  
+  
+  function _contractTokenBalance(address _token) internal view returns (uint256) {
+    return IERC20Detailed(_token).balanceOf(address(this));
+  }
+
+  
+  
+  
+  function _allowUnlimitedSpend(address _token, address _spender) internal {
+    IERC20Detailed(_token).safeIncreaseAllowance(_spender, type(uint256).max);
+  }
+
+  
+  function _updateCallerBlock() internal {
+    _lastCallerBlock = keccak256(abi.encodePacked(tx.origin, block.number));
+  }
+
+  
+  function _checkSameTx() internal view {
+    require(keccak256(abi.encodePacked(tx.origin, block.number)) != _lastCallerBlock, ""8"");
+  }
+
+  
+  
+  
+  
+  function _concat(string memory a, string memory b) internal pure returns (string memory) {
+    return string(abi.encodePacked(a, b));
+  }
+}",6618,1,0,1,"Here are the potential vulnerabilities in the provided Solidity smart contract:
+
+1. Initialization Vulnerability:
+   - The constructor sets `token` to a fixed address, which seems incorrect
+   - No validation for critical parameters in `initialize()` method
+
+2. Access Control Risks:
+   - Multiple sensitive functions rely on owner/guardian/rebalancer checks
+   - Potential centralization of power with these roles
+
+3. Price Manipulation:
+   - The `_virtualPriceAux()` method has complex logic that could be exploited
+   - Price calculation might be manipulatable under certain conditions
+
+4. Liquidation Risks:
+   - `_liquidate()` method allows partial liquidation with tolerance
+   - Potential for economic attacks during withdrawal
+
+5. Reward Selling Mechanism:
+   - `_sellAllRewards()` uses external swap paths without strict validation
+   - Potential for sandwich attacks or unexpected token swaps
+
+6. Default Check Bypass:
+   - `skipDefaultCheck` can be set to bypass strategy price checks
+   - Potential for circumventing safety mechanisms
+
+7. Emergency Shutdown Limitations:
+   - Emergency shutdown doesn't fully prevent all contract interactions
+   - Potential for partial exploit during critical situations
+
+8. Unchecked External Calls:
+   - Multiple external contract interactions without comprehensive validation
+   - Risks from malicious or compromised external contracts
+
+9. Replay Protection Weakness:
+   - `_checkSameTx()` method provides limited protection against potential replay attacks
+
+10. Fee Mechanism:
+    - Fee calculation and distribution could be manipulated
+    - Potential for economic exploitation
+
+These vulnerabilities suggest the need for comprehensive security audits and potential modifications to improve contract robustness.","---
+
+### **[H-2] IdleCDO is Vulnerable to Share Price Inflation Attacks**
+
+**Report Description**:  
+The deposit mechanism in the IdleCDO contract is vulnerable to a share price inflation attack, particularly when the vault is empty. An attacker can deposit a minimal amount (e.g., 1 wei) to mint the first share. They can then front-run a legitimate depositor's transaction by transferring a large amount of the underlying asset directly to the contract. This inflates the total assets without minting new shares, drastically increasing the price per share. When the victim's deposit is processed, the amount of shares they receive rounds down to zero, causing them to lose their entire deposit to the attacker. This attack exploits the lack of safeguards against manipulation of the share price during the initial deposit phase.
+
+---
+
+**Match in Response List**:  
+Matches partially with **""Price Manipulation""** in the response list:  
+- The response mentions that the `_virtualPriceAux()` method has complex logic that could be exploited and that price calculation might be manipulatable under certain conditions.
+
+---
+
+**Validation**:  
+**Partially Correct**.  
+- The response identifies a potential price manipulation issue, which is conceptually related to the share price inflation attack described in the issue. However, it does not explicitly address the specific scenario of an empty vault and the associated risks of front-running and share price inflation.  
+- The response also fails to mention the critical aspect of rounding errors leading to the victim's deposit being effectively stolen.  
+- While the response acknowledges the possibility of price manipulation, it does not provide sufficient detail or mitigation strategies for the specific attack vector described in the issue.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[H-2] IdleCDO is Vulnerable to Share Price Inflation Attacks**: Partially matches with **""Price Manipulation""**.
+
+**Missed Issues from Issue Report**:  
+- The specific details of the share price inflation attack, including the empty vault scenario, front-running, and rounding errors, are not fully addressed in the response list.
+
+---
+
+### **Recommendations for Improvement**:
+1. **Expand on Price Manipulation**:  
+   The response list should explicitly address the risk of share price inflation attacks, particularly in scenarios where the vault is empty. It should also highlight the importance of implementing safeguards, such as:
+   - Preventing deposits when the vault is empty.
+   - Using a minimum share price or initial deposit threshold to avoid manipulation.
+   - Mitigating rounding errors to ensure fair share distribution.
+
+2. **Address Front-Running Risks**:  
+   The response list should include a discussion of front-running risks and potential mitigations, such as:
+   - Implementing transaction ordering mechanisms.
+   - Using time-weighted average prices (TWAP) or other mechanisms to prevent sudden price manipulation.
+
+3. **Detail Specific Attack Scenarios**:  
+   The response list should provide more specific examples of how price manipulation could occur, including scenarios like the one described in the issue report. This would improve the comprehensiveness and accuracy of the responses.
+
+---"
+IdleCDOEpochVariant.sol,"// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+
+import {IdleCDO} from ""./IdleCDO.sol"";
+import {IKeyring} from ""./interfaces/keyring/IKeyring.sol"";
+import {IdleCDOTranche} from ""./IdleCDOTranche.sol"";
+import {IdleCreditVault} from ""./strategies/idle/IdleCreditVault.sol"";
+import {IERC20Detailed} from ""./interfaces/IERC20Detailed.sol"";
+import {IIdleCDOStrategy} from ""./interfaces/IIdleCDOStrategy.sol"";
+import {SafeERC20Upgradeable} from ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+
+error EpochRunning();
+error EpochNotRunning();
+error DeadlineNotMet();
+error NotAllowed();
+error Default();
+
+/// @title IdleCDO variant that supports epochs. 
+/// @dev When epoch is running no deposits or withdrawals are allowed. When epoch ends 
+/// lenders can request withdrawals, that will be fullfilled by the end of the next epoch.
+/// If the apr for the new epoch is lower than the last one, lenders can request 'instant' 
+/// withdrawals that will be fullfilled when the epoch starts and after instantWithdrawDelay (3 days).
+/// Funds for instant and normal withdrawals are sent to the strategy contract (IdleCreditVault)
+contract IdleCDOEpochVariant is IdleCDO {
+  using SafeERC20Upgradeable for IERC20Detailed;
+
+  /// @notice flag to check if epoch is running
+  bool public isEpochRunning;
+  /// @notice flag to allow AA withdraw requests
+  bool public allowAAWithdrawRequest;
+  /// @notice flag to allow BB withdraw requests
+  bool public allowBBWithdrawRequest;
+  /// @notice duration of the epoch
+  uint256 public epochDuration;
+  /// @notice delay to allow instant withdraw requests after next epoch starts
+  uint256 public instantWithdrawDelay;
+  /// @notice expected interest for the current epoch
+  uint256 public expectedEpochInterest;
+  /// @notice end date of the current epoch
+  uint256 public epochEndDate;
+  /// @notice deadline to allow instant withdraw requests
+  uint256 public instantWithdrawDeadline;
+  /// @notice apr of the last epoch
+  uint256 public lastEpochApr;
+  /// @notice min apr change to trigger instant withdraw
+  uint256 public instantWithdrawAprDelta;
+  /// @notice fees from pending withdraw request for the curr epoch
+  uint256 public pendingWithdrawFees;
+  /// @notice net underlyings gained last epoch
+  uint256 public lastEpochInterest;
+  /// @notice flag to allow instant withdraws
+  bool public allowInstantWithdraw;
+  /// @notice flag to completely disable instant withdraw
+  bool public disableInstantWithdraw;
+  /// @notice flag to check if borrower defaulted
+  bool public defaulted;
+  /// @notice Keyring wallet checker address
+  address public keyring;
+  /// @notice keyring policyId
+  uint256 public keyringPolicyId;
+
+  event AccrueInterest(uint256 interest, uint256 fees);
+  event BorrowerDefault(uint256 funds);
+
+  function _additionalInit() internal virtual override {
+    // no unlent perc
+    unlentPerc = 0;
+
+    // Set the contract with monotranche as default (can still be changed if needed)
+    // losses are split according to tvl, senior has no priority
+    lossToleranceBps = FULL_ALLOC;
+    // all yield to senior
+    isAYSActive = false;
+    trancheAPRSplitRatio = FULL_ALLOC;
+    // deposit directly in the strategy
+    directDeposit = true;
+
+    // set epoch params
+    epochDuration = 30 days;
+    instantWithdrawDelay = 3 days;
+    // prevent normal withdrawals, only requests for withdrawal are allowed
+    allowAAWithdraw = false;
+    allowBBWithdraw = false;
+    // allow requests for withdrawals
+    allowAAWithdrawRequest = true;
+    allowBBWithdrawRequest = true;
+    // min apr delta to trigger instant withdraw
+    instantWithdrawAprDelta = 1.5e18; // 1.5%
+
+    // set keyring address
+    keyring = 0xD18d17791f2071Bf3C855bA770420a9EdEa0728d;
+    keyringPolicyId = 4;
+  }
+
+  /// @notice Check if msg sender is owner or manager
+  function _checkOnlyOwnerOrManager() internal view {
+    if (msg.sender != owner() && msg.sender != IdleCreditVault(strategy).manager()) {
+      revert NotAllowed();
+    }
+  }
+
+  ///
+  /// Only owner or manager methods 
+  ///
+
+  /// @notice update epoch duration
+  /// @param _epochDuration duration in seconds
+  function setEpochDuration(uint256 _epochDuration) external {
+    _checkOnlyOwnerOrManager();
+    epochDuration = _epochDuration;
+  }
+
+  /// @notice update instant withdraw params
+  /// @param _delay delay in seconds
+  /// @param _aprDelta min apr delta to trigger instant withdraw
+  /// @param _disable flag to disable instant withdraw
+  function setInstantWithdrawParams(uint256 _delay, uint256 _aprDelta, bool _disable) external {
+    _checkOnlyOwnerOrManager();
+    instantWithdrawDelay = _delay;
+    instantWithdrawAprDelta = _aprDelta;
+    disableInstantWithdraw = _disable;
+  }
+
+  /// @notice update keyring address
+  /// @param _keyring address of the keyring contract
+  /// @param _keyringPolicyId policyId to check for wallet
+  function setKeyringParams(address _keyring, uint256 _keyringPolicyId) external {
+    _checkOnlyOwnerOrManager();
+    keyring = _keyring;
+    keyringPolicyId = _keyringPolicyId;
+  }
+
+  /// @notice Start the epoch. No deposits or withdrawals are allowed after this.
+  /// @dev We calculate the total funds that the borrower should return at the end of the epoch
+  /// ie interests + fees from normal withdraw requests. We send to the borrower underlyings amounts ie interests + 
+  /// new deposits - instant withdraw requests if any. If funds are not enough to satisfy all requests
+  /// then borrower should return the difference before instantWithdrawDeadline. After epoch start there
+  /// should be no underlyings in this contract
+  function startEpoch() external {
+    _checkOnlyOwnerOrManager();
+
+    // Check that epoch is not running
+    if (isEpochRunning) {
+      revert EpochRunning();
+    }
+
+    isEpochRunning = true;
+    // prevent deposits
+    _pause();
+
+    // prevent withdrawals requests
+    allowAAWithdrawRequest = false;
+    allowBBWithdrawRequest = false;
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+
+    // calculate expected interest 
+    // NOTE: all withdrawal requests, burn tranche tokens and decrease getContractValue,
+    // this can be done only prior to the start of the epoch so getContractValue() is the total amount net
+    // of all withdrawal requests. We add the fee that we should get for normal pending withdraws
+    expectedEpochInterest = _calcInterest(getContractValue()) + pendingWithdrawFees;
+
+    // set expected epoch end date
+    epochEndDate = block.timestamp + epochDuration;
+    // set instant withdraw deadline
+    instantWithdrawDeadline = block.timestamp + instantWithdrawDelay;
+
+    // transfer in this contract funds from interest payment, that were sent to the strategy in stopEpoch
+    _strategy.sendInterestAndDeposits(lastEpochInterest + _strategy.totEpochDeposits());
+
+    // we should first check if there are *instant* redeem requests pending 
+    // and if yes we should send as much underlyings as possible to the IdleCreditVault contract
+    // if there is any surplus then we send those to the borrower
+    uint256 pendingInstant = _strategy.pendingInstantWithdraws();
+    uint256 totUnderlyings = _contractTokenBalance(token);
+
+    // if there are more requests than the current underlyings we simply send all underlyings
+    // to the IdleCreditVault contract
+    if (pendingInstant > totUnderlyings) {
+      // transfer funds to strategy
+      _strategy.collectInstantWithdrawFunds(totUnderlyings);
+      return;
+    }
+    // otherwise we send the amount needed to satisfy the requests to the strategy 
+    _strategy.collectInstantWithdrawFunds(pendingInstant);
+    // allow instant withdraws right away without waiting for the deadline
+    allowInstantWithdraw = true;
+    // and transfer the surplus to the borrower
+    try this.sendFundsToBorrower(totUnderlyings - pendingInstant) {
+      // funds transferred correctly
+    } catch {
+      _handleBorrowerDefault(totUnderlyings - pendingInstant);
+    }
+  }
+
+  /// @notice workaround to have safeTransfer to borrower as external and use it in a try/catch block
+  /// @param _amount Amount of underlyings to transfer
+  function sendFundsToBorrower(uint256 _amount) external {
+     if (msg.sender != address(this)) {
+      revert NotAllowed();
+    }
+    IERC20Detailed(token).safeTransfer(IdleCreditVault(strategy).borrower(), _amount);
+  }
+
+  /// @notice Stop epoch, accrue interest to the vault and get funds to fullfill normal
+  /// (ie non-instant) withdraw requests from the prev epoch.
+  /// @param _newApr New apr to set for the next epoch
+  /// @param _interest Interest gained in the epoch. This will overwrite the expected interest
+  /// must be 0 if there is no need to overwrite the expected interest and if > 0 then it should
+  /// be greater than the pending withdraw fees and newApr must be 0
+  /// @dev Only owner or manager can call this function. Borrower MUST approve this contract
+  function stopEpoch(uint256 _newApr, uint256 _interest) external {
+    _checkOnlyOwnerOrManager();
+
+    // Check that epoch is running
+    if (!isEpochRunning) {
+      revert EpochNotRunning();
+    }
+    // Check that end date is passed
+    if (block.timestamp < epochEndDate) {
+      revert EpochRunning();
+    }
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+
+    // Check that there are no pending instant withdraws, ie `getInstantWithdrawFunds` was called
+    // before closing the epoch
+    if (_strategy.pendingInstantWithdraws() > 0) {
+      revert NotAllowed();
+    }
+
+    uint256 _pendingWithdrawFees = pendingWithdrawFees;
+    uint256 _pendingWithdraws = _strategy.pendingWithdraws();
+
+    // overridden interest should be greater than pending withdraw fees and the apr should be 
+    // 0 otherwise withdrawal requests may not be fullfilled as they consider also the interest
+    // gained in the next epoch 
+    if (_interest > 0 && (_interest < _pendingWithdrawFees || _newApr != 0)) {
+      revert NotAllowed();
+    }
+
+    uint256 _expectedInterest = _interest > 0 ? _interest : expectedEpochInterest;
+
+    // accrue interest to idleCDO, this will increase tranche prices.
+    // Send also tot withdraw requests amount to the IdleCreditVault contract
+    try this.getFundsFromBorrower(_expectedInterest, _pendingWithdraws, 0) {
+      // transfer in strategy and decrease pendingWithdraws
+      if (_pendingWithdraws > 0) {
+        _strategy.collectWithdrawFunds(_pendingWithdraws);
+      }
+
+      // Transfer pending withdraw fees to feeReceiver before update accounting
+      // NOTE: Fees are sent with 2 different transfer calls to avoid complicated calculations
+      if (_pendingWithdrawFees > 0) {
+        IERC20Detailed(token).safeTransfer(feeReceiver, _pendingWithdrawFees);
+      }
+
+      // update tranche prices and unclaimed fees
+      _updateAccounting();
+
+      // transfer fees
+      uint256 _fees = unclaimedFees;
+      IERC20Detailed(token).safeTransfer(feeReceiver, _fees);
+      unclaimedFees = 0;
+
+      // save net gain (this does not include interest gained for pending withdrawals)
+      uint256 netInterest = _expectedInterest - _fees - _pendingWithdrawFees;
+      lastEpochInterest = netInterest;
+      // mint strategyTokens equal to interest and send underlying to strategy to avoid double counting for NAV
+      _strategy.deposit(netInterest);
+
+      // save last apr
+      lastEpochApr = _strategy.getApr();
+      // set apr for next epoch
+      _strategy.setApr(_newApr);
+
+      // stop epoch
+      isEpochRunning = false;
+      expectedEpochInterest = 0;
+      pendingWithdrawFees = 0;
+
+      // allow deposits
+      _unpause();
+      // allow withdrawals requests
+      allowAAWithdrawRequest = true;
+      allowBBWithdrawRequest = true;
+      // block instant withdraws as these can be done only after the deadline
+      allowInstantWithdraw = false;
+
+      emit AccrueInterest(_expectedInterest, _fees + _pendingWithdrawFees);
+    } catch {
+      isEpochRunning = false;
+      // if borrower defaults, prev instant withdraw requests can still be withdrawn
+      // as were already fullfilled prior to the default (all funds already sent to the strategy)
+      allowInstantWithdraw = true;
+      _handleBorrowerDefault(_expectedInterest + _pendingWithdraws);
+    }
+  }
+
+  /// @dev Get interest and funds for fullfill withdraw requests (normal and instant) from borrower,
+  /// method is external so it can be used in the try/catch blocks
+  /// @param _amount Amount of interest to transfer
+  /// @param _withdrawRequests Total withdraw requests
+  /// @param _instantWithdrawRequests Total instant withdraw requests
+  function getFundsFromBorrower(uint256 _amount, uint256 _withdrawRequests, uint256 _instantWithdrawRequests) external {
+    if (msg.sender != address(this)) {
+      revert NotAllowed();
+    }
+
+    uint256 _tot = _amount + _withdrawRequests + _instantWithdrawRequests;
+    if (_tot == 0) {
+      return;
+    }
+    IERC20Detailed(token).safeTransferFrom(IdleCreditVault(strategy).borrower(), address(this), _tot);
+  }
+
+  /// @notice Get funds from borrower to fullfill instant withdraw requests
+  /// Manager should call this method after instantWithdrawDeadline (when epoch is running)
+  function getInstantWithdrawFunds() external {
+    _checkOnlyOwnerOrManager();
+
+    if (!isEpochRunning) {
+      revert EpochNotRunning();
+    }
+
+    if (block.timestamp < instantWithdrawDeadline) {
+      revert DeadlineNotMet();
+    }
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+    uint256 _instantWithdraws = _strategy.pendingInstantWithdraws();
+    // transfer funds for instant withdraw to this contract
+    try this.getFundsFromBorrower(0, 0, _instantWithdraws) {
+      // transfer funds to IdleCreditVault and decrease pendingInstantWithdraws
+      if (_instantWithdraws > 0) {
+        _strategy.collectInstantWithdrawFunds(_instantWithdraws);
+      }
+      // allow instant withdraws
+      allowInstantWithdraw = true;
+    } catch {
+      _handleBorrowerDefault(_instantWithdraws);
+    }
+  }
+
+  /// @notice Handle borrower default
+  function _handleBorrowerDefault(uint256 funds) internal {
+    defaulted = true;
+
+    // deposits should be already prevented
+    if (!paused()) {
+      _pause();
+    }
+
+    // stop the current epoch
+    isEpochRunning = false;
+
+    // prevent withdrawals requests
+    allowAAWithdrawRequest = false;
+    allowBBWithdrawRequest = false;
+
+    // allow strategyTokens transfers 
+    IdleCreditVault(strategy).allowTransfers();
+
+    emit BorrowerDefault(funds);
+  }
+
+  /// @notice Prevent deposits and redeems for all classes of tranches
+  function _emergencyShutdown(bool) internal override {
+    // prevent deposits
+    _pause();
+    // prevent withdraws requests
+    allowAAWithdrawRequest = false;
+    allowBBWithdrawRequest = false;
+    // Allow deposits/withdraws (once selectively re-enabled, eg for AA holders)
+    // without checking for lending protocol default
+    skipDefaultCheck = true;
+    revertIfTooLow = true;
+  }
+
+  /// @notice allow deposits and redeems for all classes of tranches
+  /// @dev can be called by the owner only
+  function restoreOperations() external override {
+    _checkOnlyOwner();
+    // Check if the pool was defaulted
+    if (defaulted) {
+      revert NotAllowed();
+    }
+    // restore deposits
+    _unpause();
+    // restore withdraws
+    allowAAWithdrawRequest = true;
+    allowBBWithdrawRequest = true;
+    // Allow deposits/withdraws but checks for lending protocol default
+    skipDefaultCheck = false;
+    revertIfTooLow = true;
+  }
+
+  /// 
+  /// User methods
+  ///
+
+  /// @notice Deposit funds in the vault. Overrides the parent method and adds a check for wallet 
+  function _deposit(uint256 _amount, address _tranche, address _referral) internal override whenNotPaused returns (uint256) {
+    if (!isWalletAllowed(msg.sender)) {
+      revert NotAllowed();
+    }
+    return super._deposit(_amount, _tranche, _referral);
+  }
+
+  /// @notice Request a withdraw from the vault
+  /// @param _amount Amount of tranche tokens 
+  /// @param _tranche Tranche to withdraw from
+  /// @return Amount of underlyings requested
+  function requestWithdraw(uint256 _amount, address _tranche) external returns (uint256) {
+    address aa = AATranche;
+    address bb = BBTranche;
+    // check if _tranche is valid and if withdraws for that tranche are allowed 
+    if (!(_tranche == aa || _tranche == bb) || 
+      (!allowAAWithdrawRequest && _tranche == aa) || 
+      (!allowBBWithdrawRequest && _tranche == bb) ||
+      !isWalletAllowed(msg.sender)
+    ) {
+      revert NotAllowed();
+    }
+  
+    // we trigger an update accounting to check for eventual losses
+    _updateAccounting();
+
+    IdleCreditVault creditVault = IdleCreditVault(strategy);
+    uint256 _underlyings = _amount * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+    uint256 _userTrancheTokens = IERC20Detailed(_tranche).balanceOf(msg.sender);
+
+    if (!disableInstantWithdraw) {
+      // If apr decresed wrt last epoch, request instant withdraw and burn tranche tokens directly
+      if (lastEpochApr > (creditVault.getApr() + instantWithdrawAprDelta)) {
+        // Calc max withdrawable if amount passed is 0
+        _underlyings = _amount == 0 ? maxWithdrawableInstant(msg.sender, _tranche) : _underlyings;
+        // burn strategy tokens from cdo
+        creditVault.requestInstantWithdraw(_underlyings, msg.sender);
+
+        // burn tranche tokens and decrease NAV
+        if (_amount == 0) {
+          _amount = _userTrancheTokens;
+        }
+        _withdrawOps(_amount, _underlyings, _tranche);
+        return _underlyings;
+      }
+    }
+
+    // recalculate underlyings considering also interest accrued in the epoch as normal withdraws
+    // will still accrue interest for the next epoch
+    if (_amount == 0) {
+      _underlyings = _userTrancheTokens * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+      _amount = _userTrancheTokens;
+    }
+
+    uint256 interest = _calcInterest(_underlyings) * trancheAPRSplitRatio / FULL_ALLOC;
+    uint256 fees = interest * fee / FULL_ALLOC;
+    uint256 netInterest = interest - fees;
+    // user is requesting principal + interest of next epoch minus fees
+    _underlyings += netInterest;
+    // add expected fees to pending withdraw fees counter
+    pendingWithdrawFees += fees;
+    
+    // request normal withdraw, we burn strategy tokens without interest for the new epoch
+    creditVault.requestWithdraw(_underlyings, msg.sender, netInterest);
+    // burn tranche tokens and decrease NAV without interest for the next epoch as it was not yet counted in NAV
+    _withdrawOps(_amount, _underlyings - netInterest, _tranche);
+    return _underlyings;
+  }
+
+  /// @notice Calculate the interest of an epoch for the given amount
+  /// @param _amount Amount of underlyings
+  function _calcInterest(uint256 _amount) internal view returns (uint256) {
+    return _amount * (IdleCreditVault(strategy).getApr() / 100) * epochDuration / (365 days * ONE_TRANCHE_TOKEN);
+  }
+
+  /// @notice Get the max amount of underlyings that can be withdrawn by user
+  /// @param _user User address
+  /// @param _tranche Tranche to withdraw from
+  function maxWithdrawable(address _user, address _tranche) external view returns (uint256) {
+    uint256 currentUnderlyings = IERC20Detailed(_tranche).balanceOf(_user) * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+    // add interest for one epoch
+    uint256 interest = _calcInterest(currentUnderlyings) * trancheAPRSplitRatio / FULL_ALLOC;
+    // sum and remove fees
+    return currentUnderlyings + interest - (interest * fee / FULL_ALLOC);
+  }
+
+  /// @notice Get the max amount of underlyings that can be withdrawn instantly by user
+  /// @param _user User address
+  /// @param _tranche Tranche to withdraw from
+  function maxWithdrawableInstant(address _user, address _tranche) public view returns (uint256) {
+    return IERC20Detailed(_tranche).balanceOf(_user) * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+  }
+
+  /// @notice Burn tranche tokens and update NAV and trancheAPRSplitRatio
+  /// @param _amount Amount of tranche tokens
+  /// @param _underlyings Amount of underlyings
+  /// @param _tranche Tranche to withdraw from
+  function _withdrawOps(uint256 _amount, uint256 _underlyings, address _tranche) internal {
+    // burn tranche token
+    IdleCDOTranche(_tranche).burn(msg.sender, _amount);
+
+    // update NAV with the _amount of underlyings removed
+    if (_tranche == AATranche) {
+      lastNAVAA -= _underlyings;
+    } else {
+      lastNAVBB -= _underlyings;
+    }
+
+    // update trancheAPRSplitRatio
+    _updateSplitRatio(_getAARatio(true));
+  }
+
+  /// @notice Claim a withdraw request from the vault. Can be done when epoch is not running
+  /// as funds will get transferred from borrower when epoch ends
+  function claimWithdrawRequest() external {
+    // Check that epoch is not running
+    if (isEpochRunning) {
+      revert EpochRunning();
+    }
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+
+    // if borrower did not paid prev withdraw requests, revert. if instead he defaulted
+    // only on instant withdraw requests but prev normal withdraws were fullfilled, we can still
+    // allow normal withdraws
+    if (defaulted && _strategy.pendingWithdraws() != 0) {
+      revert Default();
+    }
+
+    // underlyings requested
+    _strategy.claimWithdrawRequest(msg.sender);
+  }
+
+  /// @notice Claim an instant withdraw request from the vault. Can be done when epoch is running
+  /// as funds will get transferred from borrower when epoch starts
+  function claimInstantWithdrawRequest() external {
+    // Check that instant withdraws are available
+    if (!allowInstantWithdraw) {
+      revert NotAllowed();
+    }
+    IdleCreditVault(strategy).claimInstantWithdrawRequest(msg.sender);
+  }
+
+  /// @notice Check if wallet is allowed to interact with the contract
+  /// @param _user User address
+  /// @return true if wallet is allowed
+  function isWalletAllowed(address _user) public view returns (bool) {
+    address _keyring = keyring;
+    if (_keyring == address(0)) {
+      return true;
+    }
+    return IKeyring(_keyring).checkCredential(keyringPolicyId, _user);
+  }
+
+  /// 
+  /// Overridden method not used in this contract (to reduce bytcode size)
+  ///
+
+  /// NOTE: normal withdraw are not allowed
+  function withdrawAA(uint256) external override returns (uint256) {}
+  function withdrawBB(uint256) external override returns (uint256) {}
+  function _withdraw(uint256, address) override pure internal returns (uint256) {}
+  function setAllowAAWithdraw(bool) external override {}
+  function setAllowBBWithdraw(bool) external override {}
+  function liquidate(uint256, bool) external override returns (uint256) {}
+  function _liquidate(uint256, bool) internal override returns (uint256) {}
+  function setRevertIfTooLow(bool) external override {}
+  function setLiquidationTolerance(uint256) external override {}
+
+  /// NOTE: strategy price is alway equal to 1 underlying
+  function _checkDefault() override internal {}
+  function setSkipDefaultCheck(bool) external override {}
+
+  /// NOTE: harvest is not performed to transfer funds to the strategy (startEpoch is used)
+  function harvest(
+    bool[] calldata,
+    bool[] calldata,
+    uint256[] calldata,
+    uint256[] calldata,
+    bytes[] calldata
+  ) public override returns (uint256[][] memory) {}
+
+  /// NOTE: there are no rewards to sell nor incentives
+  function _sellAllRewards(IIdleCDOStrategy, uint256[] memory, uint256[] memory, bool[] memory, bytes memory)
+    internal override returns (uint256[] memory, uint256[] memory, uint256) {}
+  function _sellReward(address, bytes memory, uint256, uint256)
+    internal override returns (uint256, uint256) {}
+  function getIncentiveTokens() external view override returns (address[] memory) {}
+  function setReleaseBlocksPeriod(uint256) external override {}
+  function _lockedRewards() internal view override returns (uint256) {}
+
+  /// NOTE: stkIDLE gating is not used
+  function toggleStkIDLEForTranche(address) external override {}
+  function _checkStkIDLEBal(address, uint256) internal view override {}
+  function setStkIDLEPerUnderlying(uint256) external override {}
+
+  /// NOTE: fees are not deposited in this contract
+  function _depositFees() internal override {}
+}
+","[H-1] Initial Deposits Can Be Stolen Before First Epoch Begins A flaw in the `claimWithdrawRequest` function allows withdrawal requests to be claimed immediately before the first epoch begins. An attacker can repeatedly deposit and withdraw to claim unearned, projected interest, draining the principal deposited by other users.  [M-1] Griefing Attack Allows One User to Drain Another's Funds A user can grief other depositors by donating assets to the contract to inflate the share price *after* others have deposited. This allows the attacker to withdraw a disproportionately large share of the underlying assets, draining the principal from other users.  [M-2] Withdrawal Fees Can Be Bypassed via Multiple Small Withdrawals Withdrawal fees can be bypassed by splitting a large withdrawal into many smaller ones. Due to rounding errors in the fee calculation, each small transaction can generate a fee of zero, leading to a loss of protocol revenue.  [M-3] Incorrect Interest Calculation Leads to Loss of Yield for Senior Tranche When funds are withdrawn from the junior tranche, the interest calculation for the final epoch incorrectly uses the junior tranche's zero APR. This results in no yield being generated for the senior tranche during that period, causing a loss of funds for senior depositors.",1,3,5691,602,"pragma solidity 0.8.10;
+
+import {IdleCDO} from ""./IdleCDO.sol"";
+import {IKeyring} from ""./interfaces/keyring/IKeyring.sol"";
+import {IdleCDOTranche} from ""./IdleCDOTranche.sol"";
+import {IdleCreditVault} from ""./strategies/idle/IdleCreditVault.sol"";
+import {IERC20Detailed} from ""./interfaces/IERC20Detailed.sol"";
+import {IIdleCDOStrategy} from ""./interfaces/IIdleCDOStrategy.sol"";
+import {SafeERC20Upgradeable} from ""@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol"";
+
+error EpochRunning();
+error EpochNotRunning();
+error DeadlineNotMet();
+error NotAllowed();
+error Default();
+
+
+
+
+
+
+
+contract IdleCDOEpochVariant is IdleCDO {
+  using SafeERC20Upgradeable for IERC20Detailed;
+
+  
+  bool public isEpochRunning;
+  
+  bool public allowAAWithdrawRequest;
+  
+  bool public allowBBWithdrawRequest;
+  
+  uint256 public epochDuration;
+  
+  uint256 public instantWithdrawDelay;
+  
+  uint256 public expectedEpochInterest;
+  
+  uint256 public epochEndDate;
+  
+  uint256 public instantWithdrawDeadline;
+  
+  uint256 public lastEpochApr;
+  
+  uint256 public instantWithdrawAprDelta;
+  
+  uint256 public pendingWithdrawFees;
+  
+  uint256 public lastEpochInterest;
+  
+  bool public allowInstantWithdraw;
+  
+  bool public disableInstantWithdraw;
+  
+  bool public defaulted;
+  
+  address public keyring;
+  
+  uint256 public keyringPolicyId;
+
+  event AccrueInterest(uint256 interest, uint256 fees);
+  event BorrowerDefault(uint256 funds);
+
+  function _additionalInit() internal virtual override {
+    
+    unlentPerc = 0;
+
+    
+    
+    lossToleranceBps = FULL_ALLOC;
+    
+    isAYSActive = false;
+    trancheAPRSplitRatio = FULL_ALLOC;
+    
+    directDeposit = true;
+
+    
+    epochDuration = 30 days;
+    instantWithdrawDelay = 3 days;
+    
+    allowAAWithdraw = false;
+    allowBBWithdraw = false;
+    
+    allowAAWithdrawRequest = true;
+    allowBBWithdrawRequest = true;
+    
+    instantWithdrawAprDelta = 1.5e18; 
+
+    
+    keyring = 0xD18d17791f2071Bf3C855bA770420a9EdEa0728d;
+    keyringPolicyId = 4;
+  }
+
+  
+  function _checkOnlyOwnerOrManager() internal view {
+    if (msg.sender != owner() && msg.sender != IdleCreditVault(strategy).manager()) {
+      revert NotAllowed();
+    }
+  }
+
+  
+  
+  
+
+  
+  
+  function setEpochDuration(uint256 _epochDuration) external {
+    _checkOnlyOwnerOrManager();
+    epochDuration = _epochDuration;
+  }
+
+  
+  
+  
+  
+  function setInstantWithdrawParams(uint256 _delay, uint256 _aprDelta, bool _disable) external {
+    _checkOnlyOwnerOrManager();
+    instantWithdrawDelay = _delay;
+    instantWithdrawAprDelta = _aprDelta;
+    disableInstantWithdraw = _disable;
+  }
+
+  
+  
+  
+  function setKeyringParams(address _keyring, uint256 _keyringPolicyId) external {
+    _checkOnlyOwnerOrManager();
+    keyring = _keyring;
+    keyringPolicyId = _keyringPolicyId;
+  }
+
+  
+  
+  
+  
+  
+  
+  function startEpoch() external {
+    _checkOnlyOwnerOrManager();
+
+    
+    if (isEpochRunning) {
+      revert EpochRunning();
+    }
+
+    isEpochRunning = true;
+    
+    _pause();
+
+    
+    allowAAWithdrawRequest = false;
+    allowBBWithdrawRequest = false;
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+
+    
+    
+    
+    
+    expectedEpochInterest = _calcInterest(getContractValue()) + pendingWithdrawFees;
+
+    
+    epochEndDate = block.timestamp + epochDuration;
+    
+    instantWithdrawDeadline = block.timestamp + instantWithdrawDelay;
+
+    
+    _strategy.sendInterestAndDeposits(lastEpochInterest + _strategy.totEpochDeposits());
+
+    
+    
+    
+    uint256 pendingInstant = _strategy.pendingInstantWithdraws();
+    uint256 totUnderlyings = _contractTokenBalance(token);
+
+    
+    
+    if (pendingInstant > totUnderlyings) {
+      
+      _strategy.collectInstantWithdrawFunds(totUnderlyings);
+      return;
+    }
+    
+    _strategy.collectInstantWithdrawFunds(pendingInstant);
+    
+    allowInstantWithdraw = true;
+    
+    try this.sendFundsToBorrower(totUnderlyings - pendingInstant) {
+      
+    } catch {
+      _handleBorrowerDefault(totUnderlyings - pendingInstant);
+    }
+  }
+
+  
+  
+  function sendFundsToBorrower(uint256 _amount) external {
+     if (msg.sender != address(this)) {
+      revert NotAllowed();
+    }
+    IERC20Detailed(token).safeTransfer(IdleCreditVault(strategy).borrower(), _amount);
+  }
+
+  
+  
+  
+  
+  
+  
+  
+  function stopEpoch(uint256 _newApr, uint256 _interest) external {
+    _checkOnlyOwnerOrManager();
+
+    
+    if (!isEpochRunning) {
+      revert EpochNotRunning();
+    }
+    
+    if (block.timestamp < epochEndDate) {
+      revert EpochRunning();
+    }
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+
+    
+    
+    if (_strategy.pendingInstantWithdraws() > 0) {
+      revert NotAllowed();
+    }
+
+    uint256 _pendingWithdrawFees = pendingWithdrawFees;
+    uint256 _pendingWithdraws = _strategy.pendingWithdraws();
+
+    
+    
+    
+    if (_interest > 0 && (_interest < _pendingWithdrawFees || _newApr != 0)) {
+      revert NotAllowed();
+    }
+
+    uint256 _expectedInterest = _interest > 0 ? _interest : expectedEpochInterest;
+
+    
+    
+    try this.getFundsFromBorrower(_expectedInterest, _pendingWithdraws, 0) {
+      
+      if (_pendingWithdraws > 0) {
+        _strategy.collectWithdrawFunds(_pendingWithdraws);
+      }
+
+      
+      
+      if (_pendingWithdrawFees > 0) {
+        IERC20Detailed(token).safeTransfer(feeReceiver, _pendingWithdrawFees);
+      }
+
+      
+      _updateAccounting();
+
+      
+      uint256 _fees = unclaimedFees;
+      IERC20Detailed(token).safeTransfer(feeReceiver, _fees);
+      unclaimedFees = 0;
+
+      
+      uint256 netInterest = _expectedInterest - _fees - _pendingWithdrawFees;
+      lastEpochInterest = netInterest;
+      
+      _strategy.deposit(netInterest);
+
+      
+      lastEpochApr = _strategy.getApr();
+      
+      _strategy.setApr(_newApr);
+
+      
+      isEpochRunning = false;
+      expectedEpochInterest = 0;
+      pendingWithdrawFees = 0;
+
+      
+      _unpause();
+      
+      allowAAWithdrawRequest = true;
+      allowBBWithdrawRequest = true;
+      
+      allowInstantWithdraw = false;
+
+      emit AccrueInterest(_expectedInterest, _fees + _pendingWithdrawFees);
+    } catch {
+      isEpochRunning = false;
+      
+      
+      allowInstantWithdraw = true;
+      _handleBorrowerDefault(_expectedInterest + _pendingWithdraws);
+    }
+  }
+
+  
+  
+  
+  
+  
+  function getFundsFromBorrower(uint256 _amount, uint256 _withdrawRequests, uint256 _instantWithdrawRequests) external {
+    if (msg.sender != address(this)) {
+      revert NotAllowed();
+    }
+
+    uint256 _tot = _amount + _withdrawRequests + _instantWithdrawRequests;
+    if (_tot == 0) {
+      return;
+    }
+    IERC20Detailed(token).safeTransferFrom(IdleCreditVault(strategy).borrower(), address(this), _tot);
+  }
+
+  
+  
+  function getInstantWithdrawFunds() external {
+    _checkOnlyOwnerOrManager();
+
+    if (!isEpochRunning) {
+      revert EpochNotRunning();
+    }
+
+    if (block.timestamp < instantWithdrawDeadline) {
+      revert DeadlineNotMet();
+    }
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+    uint256 _instantWithdraws = _strategy.pendingInstantWithdraws();
+    
+    try this.getFundsFromBorrower(0, 0, _instantWithdraws) {
+      
+      if (_instantWithdraws > 0) {
+        _strategy.collectInstantWithdrawFunds(_instantWithdraws);
+      }
+      
+      allowInstantWithdraw = true;
+    } catch {
+      _handleBorrowerDefault(_instantWithdraws);
+    }
+  }
+
+  
+  function _handleBorrowerDefault(uint256 funds) internal {
+    defaulted = true;
+
+    
+    if (!paused()) {
+      _pause();
+    }
+
+    
+    isEpochRunning = false;
+
+    
+    allowAAWithdrawRequest = false;
+    allowBBWithdrawRequest = false;
+
+    
+    IdleCreditVault(strategy).allowTransfers();
+
+    emit BorrowerDefault(funds);
+  }
+
+  
+  function _emergencyShutdown(bool) internal override {
+    
+    _pause();
+    
+    allowAAWithdrawRequest = false;
+    allowBBWithdrawRequest = false;
+    
+    
+    skipDefaultCheck = true;
+    revertIfTooLow = true;
+  }
+
+  
+  
+  function restoreOperations() external override {
+    _checkOnlyOwner();
+    
+    if (defaulted) {
+      revert NotAllowed();
+    }
+    
+    _unpause();
+    
+    allowAAWithdrawRequest = true;
+    allowBBWithdrawRequest = true;
+    
+    skipDefaultCheck = false;
+    revertIfTooLow = true;
+  }
+
+  
+  
+  
+
+  
+  function _deposit(uint256 _amount, address _tranche, address _referral) internal override whenNotPaused returns (uint256) {
+    if (!isWalletAllowed(msg.sender)) {
+      revert NotAllowed();
+    }
+    return super._deposit(_amount, _tranche, _referral);
+  }
+
+  
+  
+  
+  
+  function requestWithdraw(uint256 _amount, address _tranche) external returns (uint256) {
+    address aa = AATranche;
+    address bb = BBTranche;
+    
+    if (!(_tranche == aa || _tranche == bb) || 
+      (!allowAAWithdrawRequest && _tranche == aa) || 
+      (!allowBBWithdrawRequest && _tranche == bb) ||
+      !isWalletAllowed(msg.sender)
+    ) {
+      revert NotAllowed();
+    }
+  
+    
+    _updateAccounting();
+
+    IdleCreditVault creditVault = IdleCreditVault(strategy);
+    uint256 _underlyings = _amount * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+    uint256 _userTrancheTokens = IERC20Detailed(_tranche).balanceOf(msg.sender);
+
+    if (!disableInstantWithdraw) {
+      
+      if (lastEpochApr > (creditVault.getApr() + instantWithdrawAprDelta)) {
+        
+        _underlyings = _amount == 0 ? maxWithdrawableInstant(msg.sender, _tranche) : _underlyings;
+        
+        creditVault.requestInstantWithdraw(_underlyings, msg.sender);
+
+        
+        if (_amount == 0) {
+          _amount = _userTrancheTokens;
+        }
+        _withdrawOps(_amount, _underlyings, _tranche);
+        return _underlyings;
+      }
+    }
+
+    
+    
+    if (_amount == 0) {
+      _underlyings = _userTrancheTokens * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+      _amount = _userTrancheTokens;
+    }
+
+    uint256 interest = _calcInterest(_underlyings) * trancheAPRSplitRatio / FULL_ALLOC;
+    uint256 fees = interest * fee / FULL_ALLOC;
+    uint256 netInterest = interest - fees;
+    
+    _underlyings += netInterest;
+    
+    pendingWithdrawFees += fees;
+    
+    
+    creditVault.requestWithdraw(_underlyings, msg.sender, netInterest);
+    
+    _withdrawOps(_amount, _underlyings - netInterest, _tranche);
+    return _underlyings;
+  }
+
+  
+  
+  function _calcInterest(uint256 _amount) internal view returns (uint256) {
+    return _amount * (IdleCreditVault(strategy).getApr() / 100) * epochDuration / (365 days * ONE_TRANCHE_TOKEN);
+  }
+
+  
+  
+  
+  function maxWithdrawable(address _user, address _tranche) external view returns (uint256) {
+    uint256 currentUnderlyings = IERC20Detailed(_tranche).balanceOf(_user) * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+    
+    uint256 interest = _calcInterest(currentUnderlyings) * trancheAPRSplitRatio / FULL_ALLOC;
+    
+    return currentUnderlyings + interest - (interest * fee / FULL_ALLOC);
+  }
+
+  
+  
+  
+  function maxWithdrawableInstant(address _user, address _tranche) public view returns (uint256) {
+    return IERC20Detailed(_tranche).balanceOf(_user) * _tranchePrice(_tranche) / ONE_TRANCHE_TOKEN;
+  }
+
+  
+  
+  
+  
+  function _withdrawOps(uint256 _amount, uint256 _underlyings, address _tranche) internal {
+    
+    IdleCDOTranche(_tranche).burn(msg.sender, _amount);
+
+    
+    if (_tranche == AATranche) {
+      lastNAVAA -= _underlyings;
+    } else {
+      lastNAVBB -= _underlyings;
+    }
+
+    
+    _updateSplitRatio(_getAARatio(true));
+  }
+
+  
+  
+  function claimWithdrawRequest() external {
+    
+    if (isEpochRunning) {
+      revert EpochRunning();
+    }
+
+    IdleCreditVault _strategy = IdleCreditVault(strategy);
+
+    
+    
+    
+    if (defaulted && _strategy.pendingWithdraws() != 0) {
+      revert Default();
+    }
+
+    
+    _strategy.claimWithdrawRequest(msg.sender);
+  }
+
+  
+  
+  function claimInstantWithdrawRequest() external {
+    
+    if (!allowInstantWithdraw) {
+      revert NotAllowed();
+    }
+    IdleCreditVault(strategy).claimInstantWithdrawRequest(msg.sender);
+  }
+
+  
+  
+  
+  function isWalletAllowed(address _user) public view returns (bool) {
+    address _keyring = keyring;
+    if (_keyring == address(0)) {
+      return true;
+    }
+    return IKeyring(_keyring).checkCredential(keyringPolicyId, _user);
+  }
+
+  
+  
+  
+
+  
+  function withdrawAA(uint256) external override returns (uint256) {}
+  function withdrawBB(uint256) external override returns (uint256) {}
+  function _withdraw(uint256, address) override pure internal returns (uint256) {}
+  function setAllowAAWithdraw(bool) external override {}
+  function setAllowBBWithdraw(bool) external override {}
+  function liquidate(uint256, bool) external override returns (uint256) {}
+  function _liquidate(uint256, bool) internal override returns (uint256) {}
+  function setRevertIfTooLow(bool) external override {}
+  function setLiquidationTolerance(uint256) external override {}
+
+  
+  function _checkDefault() override internal {}
+  function setSkipDefaultCheck(bool) external override {}
+
+  
+  function harvest(
+    bool[] calldata,
+    bool[] calldata,
+    uint256[] calldata,
+    uint256[] calldata,
+    bytes[] calldata
+  ) public override returns (uint256[][] memory) {}
+
+  
+  function _sellAllRewards(IIdleCDOStrategy, uint256[] memory, uint256[] memory, bool[] memory, bytes memory)
+    internal override returns (uint256[] memory, uint256[] memory, uint256) {}
+  function _sellReward(address, bytes memory, uint256, uint256)
+    internal override returns (uint256, uint256) {}
+  function getIncentiveTokens() external view override returns (address[] memory) {}
+  function setReleaseBlocksPeriod(uint256) external override {}
+  function _lockedRewards() internal view override returns (uint256) {}
+
+  
+  function toggleStkIDLEForTranche(address) external override {}
+  function _checkStkIDLEBal(address, uint256) internal view override {}
+  function setStkIDLEPerUnderlying(uint256) external override {}
+
+  
+  function _depositFees() internal override {}
+}",3395,1,3,4,"Here are the key vulnerabilities in this Solidity smart contract:
+
+1. Centralization Risk:
+- Owner/manager has extensive control over contract parameters
+- Can modify epoch duration, instant withdraw parameters, and Keyring settings
+- Potential for abuse of administrative privileges
+
+2. External Call Risks:
+- Multiple external calls with try/catch patterns that might leave contract in inconsistent state
+- Potential for reentrancy or unexpected contract interactions
+
+3. Access Control Weaknesses:
+- Insufficient validation in some external functions
+- Reliance on single `_checkOnlyOwnerOrManager()` for critical functions
+- Potential for unauthorized access if owner/manager keys are compromised
+
+4. Default Handling Vulnerability:
+- `_handleBorrowerDefault()` might not fully recover contract state
+- Potential for loss of funds during default scenarios
+
+5. Integer Precision Issues:
+- Complex interest calculations with potential for rounding errors
+- Use of fixed-point arithmetic without comprehensive safeguards
+
+6. Incomplete Error Handling:
+- Some external calls use bare try/catch without comprehensive error management
+- Potential for silently failing transactions
+
+7. Keyring Dependency:
+- Optional wallet allowlist can be bypassed by setting `keyring` to zero address
+- Potential security bypass if Keyring contract is compromised
+
+8. Lack of Comprehensive Withdrawal Checks:
+- Instant withdrawal logic has potential edge cases
+- Withdrawal request mechanisms might be exploitable
+
+These vulnerabilities suggest the contract requires thorough review and potential redesign to enhance security and robustness.","---
+
+### **[H-1] Initial Deposits Can Be Stolen Before First Epoch Begins**
+
+**Report Description**:  
+The `claimWithdrawRequest` function allows withdrawal requests to be claimed immediately before the first epoch begins. This creates an opportunity for an attacker to repeatedly deposit and withdraw funds, claiming unearned, projected interest. This exploit can drain the principal deposited by other users, leading to significant financial losses for the protocol.
+
+**Match in Response List**:  
+Matches partially with **""Lack of Comprehensive Withdrawal Checks""**.
+
+**Validation**:  
+**Partially Correct**.  
+The response identifies potential issues with withdrawal mechanisms but does not specifically address the vulnerability of claiming unearned interest before the first epoch begins. While the response acknowledges edge cases in withdrawal logic, it fails to explicitly highlight the risk of repeated deposits and withdrawals to exploit projected interest. A more detailed analysis of the `claimWithdrawRequest` function and its interaction with epoch timing is necessary to fully address this issue.
+
+---
+
+### **[M-1] Griefing Attack Allows One User to Drain Another's Funds**
+
+**Report Description**:  
+A griefing attack is possible where a user donates assets to the contract after others have deposited. This artificially inflates the share price, allowing the attacker to withdraw a disproportionately large share of the underlying assets. This results in the attacker draining the principal from other users, causing financial harm to honest participants.
+
+**Match in Response List**:  
+**No match found**.
+
+**Validation**:  
+**Incorrect**.  
+The response list does not address the griefing attack or the specific issue of share price manipulation through asset donations. This is a critical oversight, as griefing attacks are a well-known vulnerability in DeFi protocols. Mitigating this issue would require implementing mechanisms to prevent share price manipulation, such as time-weighted average price (TWAP) calculations or restrictions on withdrawals immediately after large donations.
+
+---
+
+### **[M-2] Withdrawal Fees Can Be Bypassed via Multiple Small Withdrawals**
+
+**Report Description**:  
+The withdrawal fee mechanism can be bypassed by splitting a large withdrawal into many smaller ones. Due to rounding errors in the fee calculation, each small transaction may generate a fee of zero. This results in a loss of protocol revenue and creates an incentive for users to exploit this loophole.
+
+**Match in Response List**:  
+Matches partially with **""Integer Precision Issues""**.
+
+**Validation**:  
+**Partially Correct**.  
+The response identifies potential issues with rounding errors in interest calculations but does not explicitly address the bypassing of withdrawal fees through multiple small transactions. While the mention of ""integer precision issues"" is relevant, the response lacks specificity regarding the fee calculation mechanism and its vulnerability to rounding errors. A more detailed explanation of how rounding errors impact withdrawal fees is necessary to fully address this issue.
+
+---
+
+### **[M-3] Incorrect Interest Calculation Leads to Loss of Yield for Senior Tranche**
+
+**Report Description**:  
+When funds are withdrawn from the junior tranche, the interest calculation for the final epoch incorrectly uses the junior tranche's zero APR. This results in no yield being generated for the senior tranche during that period, causing a loss of funds for senior depositors.
+
+**Match in Response List**:  
+Matches partially with **""Integer Precision Issues""**.
+
+**Validation**:  
+**Partially Correct**.  
+The response mentions ""complex interest calculations with potential for rounding errors,"" which is tangentially related to the issue. However, it does not specifically address the incorrect use of the junior tranche's zero APR in the interest calculation for the senior tranche. This is a critical flaw in the protocol's logic that directly impacts yield distribution. A more precise analysis of the interest calculation mechanism and its dependency on tranche-specific APRs is required to fully address this issue.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[H-1] Initial Deposits Can Be Stolen Before First Epoch Begins**  
+- **[M-2] Withdrawal Fees Can Be Bypassed via Multiple Small Withdrawals**  
+- **[M-3] Incorrect Interest Calculation Leads to Loss of Yield for Senior Tranche**
+
+**Missed Issues from Issue Report**:  
+- **[M-1] Griefing Attack Allows One User to Drain Another's Funds**
+
+---
+
+### **Recommendations for Improvement**
+
+1. **Address Griefing Attacks**:  
+   The response list should include a discussion of griefing attacks and share price manipulation. Mitigation strategies, such as TWAP calculations or withdrawal restrictions, should be proposed.
+
+2. **Enhance Specificity**:  
+   While the response list identifies general categories of vulnerabilities, it lacks specificity in addressing the issues raised in the report. For example, the ""Integer Precision Issues"" response should explicitly mention how rounding errors can impact withdrawal fees and interest calculations.
+
+3. **Expand Coverage of Withdrawal Mechanisms**:  
+   The response list should provide a more comprehensive analysis of withdrawal mechanisms, including potential exploits related to epoch timing and fee calculations.
+
+4. **Improve Logical Flow**:  
+   The response list should map vulnerabilities to specific contract functions or mechanisms, making it easier to evaluate whether the issues have been adequately addressed.
+
+---"

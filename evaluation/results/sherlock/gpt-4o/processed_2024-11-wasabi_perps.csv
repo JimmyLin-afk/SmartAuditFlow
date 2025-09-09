@@ -1,0 +1,1636 @@
+contract_name,code_snippet,ground_truth,tokens,loc,code_snippet_rm,processtokens,high_severity_count,medium_severity_count,vulnumber,Findings,Comparison
+WasabiLongPool.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+import ""./BaseWasabiPool.sol"";
+import ""./Hash.sol"";
+import ""./PerpUtils.sol"";
+import ""./addressProvider/IAddressProvider.sol"";
+
+contract WasabiLongPool is BaseWasabiPool {
+    using Hash for Position;
+    using Hash for ClosePositionRequest;
+    using Hash for ClosePositionOrder;
+    using SafeERC20 for IERC20;
+
+    /// @dev initializer for proxy
+    /// @param _addressProvider address provider contract
+    /// @param _manager the PerpManager contract
+    function initialize(IAddressProvider _addressProvider, PerpManager _manager) public virtual initializer {
+        __WasabiLongPool_init(_addressProvider, _manager);
+    }
+
+    function __WasabiLongPool_init(IAddressProvider _addressProvider, PerpManager _manager) internal virtual onlyInitializing {
+        __BaseWasabiPool_init(true, _addressProvider, _manager);
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function openPosition(
+        OpenPositionRequest calldata _request,
+        Signature calldata _signature
+    ) external payable returns (Position memory) {
+        return openPositionFor(_request, _signature, msg.sender);
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function openPositionFor(
+        OpenPositionRequest calldata _request,
+        Signature calldata _signature,
+        address _trader
+    ) public virtual payable nonReentrant returns (Position memory) {
+        // Validate Request
+        _validateOpenPositionRequest(_request, _signature);
+
+        // Validate sender
+        if (msg.sender != _trader) {
+            if (msg.sender != address(addressProvider.getWasabiRouter())) {
+                revert SenderNotTrader();
+            }
+        }
+        if (_request.existingPosition.id != 0) {
+            if (_request.existingPosition.trader != _trader) {
+                if (msg.sender != address(addressProvider.getWasabiRouter())) {
+                    revert SenderNotTrader();
+                }
+            }
+        }
+
+        // Borrow principal from the vault
+        IWasabiVault vault = getVault(_request.currency);
+        vault.checkMaxLeverage(_request.downPayment, _request.downPayment + _request.principal);
+        vault.borrow(_request.principal);
+
+        // Purchase target token
+        (uint256 amountSpent, uint256 collateralAmount) = PerpUtils.executeSwapFunctions(
+            _request.functionCallDataList,
+            IERC20(_request.currency),
+            IERC20(_request.targetCurrency)
+        );
+
+        if (collateralAmount < _request.minTargetAmount) revert InsufficientCollateralReceived();
+        if (amountSpent == 0) revert InsufficientPrincipalUsed();
+
+        return _finalizePosition(_trader, _request, collateralAmount);
+    }
+
+    function addCollateral(
+        AddCollateralRequest calldata _request,
+        Signature calldata _signature
+    ) external payable nonReentrant returns (Position memory) {
+        // Validate Request
+        _validateAddCollateralRequest(_request, _signature);
+
+        // Validate sender
+        if (msg.sender != _request.position.trader) {
+            if (msg.sender != address(addressProvider.getWasabiRouter())) {
+                revert SenderNotTrader();
+            }
+        }
+
+        // Pay interest plus amount of principal reduced to the vault
+        uint256 principalReduced = _request.amount - _request.interest;
+        _recordRepayment(principalReduced, _request.position.currency, false, principalReduced, _request.interest);
+
+        // Update position
+        Position memory position = _request.position;
+        position.principal -= principalReduced;
+        position.downPayment += principalReduced;
+        position.lastFundingTimestamp = block.timestamp;
+        positions[_request.position.id] = position.hash();
+
+        emit CollateralAdded(_request.position.id, _request.position.trader, principalReduced, 0, principalReduced, _request.interest);
+
+        return position;
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function removeCollateral(
+        RemoveCollateralRequest calldata _request,
+        Signature calldata _signature
+    ) external payable nonReentrant returns (Position memory) {
+        // Validate Request
+        _validateRemoveCollateralRequest(_request, _signature);
+
+        // Validate sender
+        if (msg.sender != _request.position.trader) {
+            revert SenderNotTrader();
+        }
+
+        // Borrow more principal from the vault
+        IWasabiVault vault = getVault(_request.position.currency);
+        vault.borrow(_request.amount);
+
+        // Update position
+        Position memory position = _request.position;
+        position.principal += _request.amount;
+        positions[_request.position.id] = position.hash();
+        
+        // Pay out amount to the trader
+        IERC20(_request.position.currency).safeTransfer(_request.position.trader, _request.amount);
+
+        emit CollateralRemoved(_request.position.id, _request.position.trader, 0, 0, _request.amount);
+
+        return position;
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function closePosition(
+        PayoutType _payoutType,
+        ClosePositionRequest calldata _request,
+        Signature calldata _signature,
+        ClosePositionOrder calldata _order,
+        Signature calldata _orderSignature // signed by trader
+    ) external payable nonReentrant onlyRole(Roles.LIQUIDATOR_ROLE) {
+        uint256 id = _request.position.id;
+        address trader = _request.position.trader;
+        if (id != _order.positionId) revert InvalidOrder();
+        if (_request.expiration < block.timestamp) revert OrderExpired();
+        if (_order.expiration < block.timestamp) revert OrderExpired();
+
+        _validateSigner(trader, _order.hash(), _orderSignature);
+        _validateSignature(_request.hash(), _signature);
+        
+        ClosePositionInternalArgs memory args = ClosePositionInternalArgs({
+            _interest: _request.interest,
+            _amount: _request.amount,
+            _executionFee: _order.executionFee,
+            _payoutType: _payoutType,
+            _isLiquidation: false,
+            _referrer: _request.referrer
+        });
+        CloseAmounts memory closeAmounts = _closePositionInternal(
+            args, 
+            _request.position, 
+            _request.functionCallDataList
+        );
+
+        uint256 actualMakerAmount = closeAmounts.collateralSold;
+        uint256 actualTakerAmount = closeAmounts.payout + closeAmounts.closeFee + closeAmounts.interestPaid + closeAmounts.principalRepaid;
+
+        // order price      = order.takerAmount / order.makerAmount
+        // executed price   = actualTakerAmount / actualMakerAmount
+        // TP: executed price >= order price
+        //      actualTakerAmount / actualMakerAmount >= order.takerAmount / order.makerAmount
+        //      actualTakerAmount * order.makerAmount >= order.takerAmount * actualMakerAmount
+        // SL: executed price <= order price
+        //      actualTakerAmount / actualMakerAmount <= order.takerAmount / order.makerAmount
+        //      actualTakerAmount * order.makerAmount <= order.takerAmount * actualMakerAmount
+
+        uint8 orderType = _order.orderType;
+        if (orderType > 1) {
+            revert InvalidOrder();
+        } else if (orderType == 0 
+            ? actualTakerAmount * _order.makerAmount < _order.takerAmount * actualMakerAmount
+            : actualTakerAmount * _order.makerAmount > _order.takerAmount * actualMakerAmount
+        ) {
+            revert PriceTargetNotReached();
+        }
+
+        if (positions[id] == CLOSED_POSITION_HASH) {
+            emit PositionClosedWithOrder(
+                id,
+                trader,
+                orderType,
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee
+            );
+        } else {
+            emit PositionDecreasedWithOrder(
+                id, 
+                trader, 
+                orderType,
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee,
+                closeAmounts.pastFees,
+                closeAmounts.collateralSold,
+                closeAmounts.downPaymentReduced
+            );
+        }
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function closePosition(
+        PayoutType _payoutType,
+        ClosePositionRequest calldata _request,
+        Signature calldata _signature
+    ) external payable nonReentrant {
+        _validateSignature(_request.hash(), _signature);
+        uint256 id = _request.position.id;
+        address trader = _request.position.trader;
+        _checkCanClosePosition(trader);
+        if (_request.expiration < block.timestamp) revert OrderExpired();
+        
+        ClosePositionInternalArgs memory args = ClosePositionInternalArgs({
+            _interest: _request.interest,
+            _amount: _request.amount,
+            _executionFee: 0,
+            _payoutType: _payoutType,
+            _isLiquidation: false,
+            _referrer: _request.referrer
+        });
+        CloseAmounts memory closeAmounts = _closePositionInternal(
+            args, 
+            _request.position, 
+            _request.functionCallDataList
+        );
+        
+        if (positions[id] == CLOSED_POSITION_HASH) {
+            emit PositionClosed(
+                id,
+                trader,
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee
+            );
+        } else {
+            emit PositionDecreased(
+                id, 
+                trader, 
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee,
+                closeAmounts.pastFees,
+                closeAmounts.collateralSold,
+                closeAmounts.downPaymentReduced
+            );
+        }
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function liquidatePosition(
+        PayoutType _payoutType,
+        uint256 _interest,
+        Position calldata _position,
+        FunctionCallData[] calldata _swapFunctions,
+        address _referrer
+    ) external payable nonReentrant onlyRole(Roles.LIQUIDATOR_ROLE) {
+        ClosePositionInternalArgs memory args = ClosePositionInternalArgs({
+            _interest: _interest,
+            _amount: 0,
+            _executionFee: 0,
+            _payoutType: _payoutType,
+            _isLiquidation: true,
+            _referrer: _referrer
+        });
+        CloseAmounts memory closeAmounts =
+            _closePositionInternal(args, _position, _swapFunctions);
+        uint256 liquidationThreshold = _position.principal * 5 / 100;
+        if (closeAmounts.payout + closeAmounts.liquidationFee > liquidationThreshold) revert LiquidationThresholdNotReached();
+
+        emit PositionLiquidated(
+            _position.id,
+            _position.trader,
+            closeAmounts.payout,
+            closeAmounts.principalRepaid,
+            closeAmounts.interestPaid,
+            closeAmounts.closeFee
+        );
+    }
+
+    /// @inheritdoc IWasabiPerps
+    function recordInterest(Position[] calldata _positions, uint256[] calldata _interests, FunctionCallData[] calldata _swapFunctions) external nonReentrant onlyRole(Roles.LIQUIDATOR_ROLE) {
+        if (_positions.length != _interests.length) revert InvalidInput();
+        if (_swapFunctions.length != 0) revert InvalidInput(); // No swap functions are needed for long interest
+
+        uint256 totalInterest;
+        address currency = _positions[0].currency;
+        IWasabiVault vault = getVault(currency);
+
+        for (uint256 i = 0; i < _positions.length; ) {
+            Position memory position = _positions[i];
+            uint256 interest = _interests[i];
+
+            if (positions[position.id] != position.hash()) revert InvalidPosition();
+            if (position.currency != currency) revert InvalidCurrency();
+
+            uint256 maxInterest = _getDebtController()
+                .computeMaxInterest(position.currency, position.principal, position.lastFundingTimestamp);
+            if (interest > maxInterest || interest == 0) revert InvalidInterestAmount();
+            totalInterest += interest;
+
+            position.principal += interest;
+            position.lastFundingTimestamp = block.timestamp;
+            positions[position.id] = position.hash();
+
+            emit InterestPaid(
+                position.id,
+                interest,
+                interest,
+                0,
+                0
+            );
+
+            unchecked {
+                i++;
+            }
+        }
+
+        // Instead of borrowing the interest and then repaying it, we can just record the repayment without any transfers
+        vault.recordRepayment(totalInterest, 0, false);
+    }
+
+    /// @dev Closes a given position
+    /// @param _args the close position arguments
+    /// @param _position the position
+    /// @param _swapFunctions the swap functions
+    /// @return closeAmounts the close amounts
+    function _closePositionInternal(
+        ClosePositionInternalArgs memory _args,
+        Position calldata _position,
+        FunctionCallData[] calldata _swapFunctions
+    ) internal virtual returns (CloseAmounts memory closeAmounts) {
+        uint256 id = _position.id;
+        if (positions[id] != _position.hash()) revert InvalidPosition();
+        if (_swapFunctions.length == 0) revert SwapFunctionNeeded();
+
+        uint256 collateralAmount = _position.collateralAmount;
+        uint256 downPayment = _position.downPayment;
+
+        if (_args._amount == 0 || _args._amount > collateralAmount) {
+            _args._amount = collateralAmount;
+        }
+        _args._interest = _computeInterest(_position, _args._interest);
+
+        // Sell tokens
+        (closeAmounts.collateralSold, closeAmounts.payout) = PerpUtils.executeSwapFunctions(
+            _swapFunctions, 
+            IERC20(_position.collateralCurrency), 
+            IERC20(_position.currency)
+        );
+
+        if (closeAmounts.collateralSold > _args._amount) revert TooMuchCollateralSpent();
+
+        uint256 principalToRepay;
+        if (closeAmounts.collateralSold == collateralAmount) {
+            // Fully closing the position
+            principalToRepay = _position.principal;
+            closeAmounts.pastFees = _position.feesToBePaid;
+            closeAmounts.downPaymentReduced = downPayment;
+        } else {
+            // Partial close - scale the principal and fees to be paid accordingly
+            principalToRepay = _position.principal * closeAmounts.collateralSold / collateralAmount;
+            closeAmounts.pastFees = _position.feesToBePaid * closeAmounts.collateralSold / collateralAmount;
+            closeAmounts.downPaymentReduced = downPayment * closeAmounts.collateralSold / collateralAmount;
+        }
+
+        // 1. Deduct principal
+        (closeAmounts.payout, closeAmounts.principalRepaid) = PerpUtils.deduct(closeAmounts.payout, principalToRepay);
+
+        // 2. Deduct interest
+        (closeAmounts.payout, closeAmounts.interestPaid) = PerpUtils.deduct(closeAmounts.payout, _args._interest);
+
+        // 3. Deduct fees
+        (closeAmounts.payout, closeAmounts.closeFee) =
+            PerpUtils.deduct(
+                closeAmounts.payout,
+                PerpUtils.computeCloseFee(_position, closeAmounts.payout + closeAmounts.principalRepaid, isLongPool) + _args._executionFee);
+
+        // 4. Deduct liquidation fee
+        if (_args._isLiquidation) {
+            (closeAmounts.payout, closeAmounts.liquidationFee) = PerpUtils.deduct(
+                closeAmounts.payout, 
+                _getDebtController().getLiquidationFee(downPayment, _position.currency, _position.collateralCurrency)
+            );
+        }
+        
+        // Repay principal + interest to the vault
+        _recordRepayment(
+            principalToRepay,
+            _position.currency,
+            _args._isLiquidation,
+            closeAmounts.principalRepaid,
+            closeAmounts.interestPaid
+        );
+
+        _payCloseAmounts(
+            _args._payoutType,
+            _position.currency,
+            _position.trader,
+            _args._referrer,
+            closeAmounts
+        );
+
+        if (closeAmounts.collateralSold != collateralAmount) {
+            Position memory position = _position;
+            position.downPayment -= closeAmounts.downPaymentReduced;
+            position.principal -= closeAmounts.principalRepaid;
+            position.collateralAmount -= closeAmounts.collateralSold;
+            position.feesToBePaid -= closeAmounts.pastFees;
+            positions[id] = position.hash();
+        } else {
+            positions[id] = CLOSED_POSITION_HASH;
+        }
+    }
+
+    function _finalizePosition(
+        address _trader,
+        OpenPositionRequest calldata _request,
+        uint256 _collateralAmount
+    ) internal returns (Position memory) {
+        bool isEdit = _request.existingPosition.id != 0;
+
+        Position memory position = Position(
+            _request.id,
+            _trader,
+            _request.currency,
+            _request.targetCurrency,
+            isEdit ? _request.existingPosition.lastFundingTimestamp : block.timestamp,
+            _request.existingPosition.downPayment + _request.downPayment,
+            _request.existingPosition.principal + _request.principal,
+            _request.existingPosition.collateralAmount + _collateralAmount,
+            _request.existingPosition.feesToBePaid + _request.fee
+        );
+
+        positions[_request.id] = position.hash();
+
+        if (isEdit) {
+            emit PositionIncreased(
+                _request.id, 
+                _trader,
+                _request.downPayment, 
+                _request.principal, 
+                _collateralAmount, 
+                _request.fee
+            );
+        } else {
+            emit PositionOpened(
+                _request.id,
+                _trader,
+                _request.currency,
+                _request.targetCurrency,
+                _request.downPayment,
+                _request.principal,
+                _collateralAmount,
+                _request.fee
+            );
+        }
+
+        return position;
+    }
+}
+","[M-1] Flash Loan Attack to Avoid Interest Payments A user can use a flash loan to temporarily inflate their share of the vault, close their position to pay interest, and then withdraw. By owning a majority of the vault shares during the interest payment, they receive most of their own interest back, leading to almost interest-free loans.  [M-4] Inconsistent Liquidation Logic Between Long and Short Pools The calculation for the `liquidationThreshold’ is different for long and short positions. For long positions, it's based on the principal , while for short positions, it's based on the collateral amount (principal + down payment) . This discrepancy creates different liquidation conditions for long and short traders.  [M-7] Take Profit Orders Do Not Prioritize User Profit Take Profit orders are evaluated against a gross amount before deducting accrued interest. This can cause a position to be closed when the price target is met but after high interest has accrued, resulting in a lower net payout to the user than they might expect.",3850,476,"pragma solidity ^0.8.23;
+
+import ""./BaseWasabiPool.sol"";
+import ""./Hash.sol"";
+import ""./PerpUtils.sol"";
+import ""./addressProvider/IAddressProvider.sol"";
+
+contract WasabiLongPool is BaseWasabiPool {
+    using Hash for Position;
+    using Hash for ClosePositionRequest;
+    using Hash for ClosePositionOrder;
+    using SafeERC20 for IERC20;
+
+    
+    
+    
+    function initialize(IAddressProvider _addressProvider, PerpManager _manager) public virtual initializer {
+        __WasabiLongPool_init(_addressProvider, _manager);
+    }
+
+    function __WasabiLongPool_init(IAddressProvider _addressProvider, PerpManager _manager) internal virtual onlyInitializing {
+        __BaseWasabiPool_init(true, _addressProvider, _manager);
+    }
+
+    
+    function openPosition(
+        OpenPositionRequest calldata _request,
+        Signature calldata _signature
+    ) external payable returns (Position memory) {
+        return openPositionFor(_request, _signature, msg.sender);
+    }
+
+    
+    function openPositionFor(
+        OpenPositionRequest calldata _request,
+        Signature calldata _signature,
+        address _trader
+    ) public virtual payable nonReentrant returns (Position memory) {
+        
+        _validateOpenPositionRequest(_request, _signature);
+
+        
+        if (msg.sender != _trader) {
+            if (msg.sender != address(addressProvider.getWasabiRouter())) {
+                revert SenderNotTrader();
+            }
+        }
+        if (_request.existingPosition.id != 0) {
+            if (_request.existingPosition.trader != _trader) {
+                if (msg.sender != address(addressProvider.getWasabiRouter())) {
+                    revert SenderNotTrader();
+                }
+            }
+        }
+
+        
+        IWasabiVault vault = getVault(_request.currency);
+        vault.checkMaxLeverage(_request.downPayment, _request.downPayment + _request.principal);
+        vault.borrow(_request.principal);
+
+        
+        (uint256 amountSpent, uint256 collateralAmount) = PerpUtils.executeSwapFunctions(
+            _request.functionCallDataList,
+            IERC20(_request.currency),
+            IERC20(_request.targetCurrency)
+        );
+
+        if (collateralAmount < _request.minTargetAmount) revert InsufficientCollateralReceived();
+        if (amountSpent == 0) revert InsufficientPrincipalUsed();
+
+        return _finalizePosition(_trader, _request, collateralAmount);
+    }
+
+    function addCollateral(
+        AddCollateralRequest calldata _request,
+        Signature calldata _signature
+    ) external payable nonReentrant returns (Position memory) {
+        
+        _validateAddCollateralRequest(_request, _signature);
+
+        
+        if (msg.sender != _request.position.trader) {
+            if (msg.sender != address(addressProvider.getWasabiRouter())) {
+                revert SenderNotTrader();
+            }
+        }
+
+        
+        uint256 principalReduced = _request.amount - _request.interest;
+        _recordRepayment(principalReduced, _request.position.currency, false, principalReduced, _request.interest);
+
+        
+        Position memory position = _request.position;
+        position.principal -= principalReduced;
+        position.downPayment += principalReduced;
+        position.lastFundingTimestamp = block.timestamp;
+        positions[_request.position.id] = position.hash();
+
+        emit CollateralAdded(_request.position.id, _request.position.trader, principalReduced, 0, principalReduced, _request.interest);
+
+        return position;
+    }
+
+    
+    function removeCollateral(
+        RemoveCollateralRequest calldata _request,
+        Signature calldata _signature
+    ) external payable nonReentrant returns (Position memory) {
+        
+        _validateRemoveCollateralRequest(_request, _signature);
+
+        
+        if (msg.sender != _request.position.trader) {
+            revert SenderNotTrader();
+        }
+
+        
+        IWasabiVault vault = getVault(_request.position.currency);
+        vault.borrow(_request.amount);
+
+        
+        Position memory position = _request.position;
+        position.principal += _request.amount;
+        positions[_request.position.id] = position.hash();
+        
+        
+        IERC20(_request.position.currency).safeTransfer(_request.position.trader, _request.amount);
+
+        emit CollateralRemoved(_request.position.id, _request.position.trader, 0, 0, _request.amount);
+
+        return position;
+    }
+
+    
+    function closePosition(
+        PayoutType _payoutType,
+        ClosePositionRequest calldata _request,
+        Signature calldata _signature,
+        ClosePositionOrder calldata _order,
+        Signature calldata _orderSignature 
+    ) external payable nonReentrant onlyRole(Roles.LIQUIDATOR_ROLE) {
+        uint256 id = _request.position.id;
+        address trader = _request.position.trader;
+        if (id != _order.positionId) revert InvalidOrder();
+        if (_request.expiration < block.timestamp) revert OrderExpired();
+        if (_order.expiration < block.timestamp) revert OrderExpired();
+
+        _validateSigner(trader, _order.hash(), _orderSignature);
+        _validateSignature(_request.hash(), _signature);
+        
+        ClosePositionInternalArgs memory args = ClosePositionInternalArgs({
+            _interest: _request.interest,
+            _amount: _request.amount,
+            _executionFee: _order.executionFee,
+            _payoutType: _payoutType,
+            _isLiquidation: false,
+            _referrer: _request.referrer
+        });
+        CloseAmounts memory closeAmounts = _closePositionInternal(
+            args, 
+            _request.position, 
+            _request.functionCallDataList
+        );
+
+        uint256 actualMakerAmount = closeAmounts.collateralSold;
+        uint256 actualTakerAmount = closeAmounts.payout + closeAmounts.closeFee + closeAmounts.interestPaid + closeAmounts.principalRepaid;
+
+        
+        
+        
+        
+        
+        
+        
+        
+
+        uint8 orderType = _order.orderType;
+        if (orderType > 1) {
+            revert InvalidOrder();
+        } else if (orderType == 0 
+            ? actualTakerAmount * _order.makerAmount < _order.takerAmount * actualMakerAmount
+            : actualTakerAmount * _order.makerAmount > _order.takerAmount * actualMakerAmount
+        ) {
+            revert PriceTargetNotReached();
+        }
+
+        if (positions[id] == CLOSED_POSITION_HASH) {
+            emit PositionClosedWithOrder(
+                id,
+                trader,
+                orderType,
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee
+            );
+        } else {
+            emit PositionDecreasedWithOrder(
+                id, 
+                trader, 
+                orderType,
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee,
+                closeAmounts.pastFees,
+                closeAmounts.collateralSold,
+                closeAmounts.downPaymentReduced
+            );
+        }
+    }
+
+    
+    function closePosition(
+        PayoutType _payoutType,
+        ClosePositionRequest calldata _request,
+        Signature calldata _signature
+    ) external payable nonReentrant {
+        _validateSignature(_request.hash(), _signature);
+        uint256 id = _request.position.id;
+        address trader = _request.position.trader;
+        _checkCanClosePosition(trader);
+        if (_request.expiration < block.timestamp) revert OrderExpired();
+        
+        ClosePositionInternalArgs memory args = ClosePositionInternalArgs({
+            _interest: _request.interest,
+            _amount: _request.amount,
+            _executionFee: 0,
+            _payoutType: _payoutType,
+            _isLiquidation: false,
+            _referrer: _request.referrer
+        });
+        CloseAmounts memory closeAmounts = _closePositionInternal(
+            args, 
+            _request.position, 
+            _request.functionCallDataList
+        );
+        
+        if (positions[id] == CLOSED_POSITION_HASH) {
+            emit PositionClosed(
+                id,
+                trader,
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee
+            );
+        } else {
+            emit PositionDecreased(
+                id, 
+                trader, 
+                closeAmounts.payout,
+                closeAmounts.principalRepaid,
+                closeAmounts.interestPaid,
+                closeAmounts.closeFee,
+                closeAmounts.pastFees,
+                closeAmounts.collateralSold,
+                closeAmounts.downPaymentReduced
+            );
+        }
+    }
+
+    
+    function liquidatePosition(
+        PayoutType _payoutType,
+        uint256 _interest,
+        Position calldata _position,
+        FunctionCallData[] calldata _swapFunctions,
+        address _referrer
+    ) external payable nonReentrant onlyRole(Roles.LIQUIDATOR_ROLE) {
+        ClosePositionInternalArgs memory args = ClosePositionInternalArgs({
+            _interest: _interest,
+            _amount: 0,
+            _executionFee: 0,
+            _payoutType: _payoutType,
+            _isLiquidation: true,
+            _referrer: _referrer
+        });
+        CloseAmounts memory closeAmounts =
+            _closePositionInternal(args, _position, _swapFunctions);
+        uint256 liquidationThreshold = _position.principal * 5 / 100;
+        if (closeAmounts.payout + closeAmounts.liquidationFee > liquidationThreshold) revert LiquidationThresholdNotReached();
+
+        emit PositionLiquidated(
+            _position.id,
+            _position.trader,
+            closeAmounts.payout,
+            closeAmounts.principalRepaid,
+            closeAmounts.interestPaid,
+            closeAmounts.closeFee
+        );
+    }
+
+    
+    function recordInterest(Position[] calldata _positions, uint256[] calldata _interests, FunctionCallData[] calldata _swapFunctions) external nonReentrant onlyRole(Roles.LIQUIDATOR_ROLE) {
+        if (_positions.length != _interests.length) revert InvalidInput();
+        if (_swapFunctions.length != 0) revert InvalidInput(); 
+
+        uint256 totalInterest;
+        address currency = _positions[0].currency;
+        IWasabiVault vault = getVault(currency);
+
+        for (uint256 i = 0; i < _positions.length; ) {
+            Position memory position = _positions[i];
+            uint256 interest = _interests[i];
+
+            if (positions[position.id] != position.hash()) revert InvalidPosition();
+            if (position.currency != currency) revert InvalidCurrency();
+
+            uint256 maxInterest = _getDebtController()
+                .computeMaxInterest(position.currency, position.principal, position.lastFundingTimestamp);
+            if (interest > maxInterest || interest == 0) revert InvalidInterestAmount();
+            totalInterest += interest;
+
+            position.principal += interest;
+            position.lastFundingTimestamp = block.timestamp;
+            positions[position.id] = position.hash();
+
+            emit InterestPaid(
+                position.id,
+                interest,
+                interest,
+                0,
+                0
+            );
+
+            unchecked {
+                i++;
+            }
+        }
+
+        
+        vault.recordRepayment(totalInterest, 0, false);
+    }
+
+    
+    
+    
+    
+    
+    function _closePositionInternal(
+        ClosePositionInternalArgs memory _args,
+        Position calldata _position,
+        FunctionCallData[] calldata _swapFunctions
+    ) internal virtual returns (CloseAmounts memory closeAmounts) {
+        uint256 id = _position.id;
+        if (positions[id] != _position.hash()) revert InvalidPosition();
+        if (_swapFunctions.length == 0) revert SwapFunctionNeeded();
+
+        uint256 collateralAmount = _position.collateralAmount;
+        uint256 downPayment = _position.downPayment;
+
+        if (_args._amount == 0 || _args._amount > collateralAmount) {
+            _args._amount = collateralAmount;
+        }
+        _args._interest = _computeInterest(_position, _args._interest);
+
+        
+        (closeAmounts.collateralSold, closeAmounts.payout) = PerpUtils.executeSwapFunctions(
+            _swapFunctions, 
+            IERC20(_position.collateralCurrency), 
+            IERC20(_position.currency)
+        );
+
+        if (closeAmounts.collateralSold > _args._amount) revert TooMuchCollateralSpent();
+
+        uint256 principalToRepay;
+        if (closeAmounts.collateralSold == collateralAmount) {
+            
+            principalToRepay = _position.principal;
+            closeAmounts.pastFees = _position.feesToBePaid;
+            closeAmounts.downPaymentReduced = downPayment;
+        } else {
+            
+            principalToRepay = _position.principal * closeAmounts.collateralSold / collateralAmount;
+            closeAmounts.pastFees = _position.feesToBePaid * closeAmounts.collateralSold / collateralAmount;
+            closeAmounts.downPaymentReduced = downPayment * closeAmounts.collateralSold / collateralAmount;
+        }
+
+        
+        (closeAmounts.payout, closeAmounts.principalRepaid) = PerpUtils.deduct(closeAmounts.payout, principalToRepay);
+
+        
+        (closeAmounts.payout, closeAmounts.interestPaid) = PerpUtils.deduct(closeAmounts.payout, _args._interest);
+
+        
+        (closeAmounts.payout, closeAmounts.closeFee) =
+            PerpUtils.deduct(
+                closeAmounts.payout,
+                PerpUtils.computeCloseFee(_position, closeAmounts.payout + closeAmounts.principalRepaid, isLongPool) + _args._executionFee);
+
+        
+        if (_args._isLiquidation) {
+            (closeAmounts.payout, closeAmounts.liquidationFee) = PerpUtils.deduct(
+                closeAmounts.payout, 
+                _getDebtController().getLiquidationFee(downPayment, _position.currency, _position.collateralCurrency)
+            );
+        }
+        
+        
+        _recordRepayment(
+            principalToRepay,
+            _position.currency,
+            _args._isLiquidation,
+            closeAmounts.principalRepaid,
+            closeAmounts.interestPaid
+        );
+
+        _payCloseAmounts(
+            _args._payoutType,
+            _position.currency,
+            _position.trader,
+            _args._referrer,
+            closeAmounts
+        );
+
+        if (closeAmounts.collateralSold != collateralAmount) {
+            Position memory position = _position;
+            position.downPayment -= closeAmounts.downPaymentReduced;
+            position.principal -= closeAmounts.principalRepaid;
+            position.collateralAmount -= closeAmounts.collateralSold;
+            position.feesToBePaid -= closeAmounts.pastFees;
+            positions[id] = position.hash();
+        } else {
+            positions[id] = CLOSED_POSITION_HASH;
+        }
+    }
+
+    function _finalizePosition(
+        address _trader,
+        OpenPositionRequest calldata _request,
+        uint256 _collateralAmount
+    ) internal returns (Position memory) {
+        bool isEdit = _request.existingPosition.id != 0;
+
+        Position memory position = Position(
+            _request.id,
+            _trader,
+            _request.currency,
+            _request.targetCurrency,
+            isEdit ? _request.existingPosition.lastFundingTimestamp : block.timestamp,
+            _request.existingPosition.downPayment + _request.downPayment,
+            _request.existingPosition.principal + _request.principal,
+            _request.existingPosition.collateralAmount + _collateralAmount,
+            _request.existingPosition.feesToBePaid + _request.fee
+        );
+
+        positions[_request.id] = position.hash();
+
+        if (isEdit) {
+            emit PositionIncreased(
+                _request.id, 
+                _trader,
+                _request.downPayment, 
+                _request.principal, 
+                _collateralAmount, 
+                _request.fee
+            );
+        } else {
+            emit PositionOpened(
+                _request.id,
+                _trader,
+                _request.currency,
+                _request.targetCurrency,
+                _request.downPayment,
+                _request.principal,
+                _collateralAmount,
+                _request.fee
+            );
+        }
+
+        return position;
+    }
+}",3388,0,3,3,"Below is the list of vulnerabilities and potential issues in the provided smart contract:
+
+### 1. **Signature Reentrancy Risk**
+   - The contract lacks adequate protection against relay/replay attacks for off-chain signatures. There is no nonce or dedicated mechanism to ensure signatures are not re-used maliciously. This could result in opening or closing a position multiple times depending on the signature reuse scenario.
+
+### 2. **Lack of Input Validation**
+   - User inputs such as `_request.id`, `_request.currency`, `_request.targetCurrency`, amounts in `_request.downPayment`, and `_request.principal` are not sufficiently validated, which could lead to incorrect operations or attack vectors.
+   - `functionCallDataList` in various functions (`openPosition`, `closePosition`, etc.) is wide open—if improperly handled, it could result in unintended consequences from external calls.
+
+### 3. **Unchecked External Call Results**
+   - The `PerpUtils.executeSwapFunctions()` function, which executes external function calls, operates on an external contract. Its return values (like `amountSpent` and `collateralAmount`) are accepted without deeper validation or safety checks. Misbehaving external contracts could manipulate this for attacks.
+
+### 4. **Reentrancy Protection**
+   - Although the code has `nonReentrant` guards on many functions, the `_payCloseAmounts` and `_closePositionInternal` functions may still interact with external contracts directly, and could result in reentrancy risks if `IERC20.safeTransfer` is manipulated by a malicious token contract.
+
+### 5. **ERC20 Improper Handling**
+   - No check for `IERC20(_request.position.currency)` or `_request.targetCurrency`; some ERC20 tokens have non-standard behavior, such as returning `false` on a successful transfer instead of reverting, which could lead to subtle failures.
+
+### 6. **Position Overlap**
+   - Positions can be edited or ""increased"" by calling `openPositionFor`. However, there is no check to ensure that two positions opened for the same trader with the same identifier (`_request.id`) are logically consistent. This might cause data corruption or unintended aggregations.
+
+### 7. **Fee and Liquidation Policy Enforcement**
+   - Fees (`closeFee`, etc.) and liquidation thresholds use configurable parameters but might be manipulated over time because governance or external dependencies aren't fully hardened. This feature could be weaponized if exploited by privileged roles.
+
+### 8. **Overflows/Divisions**
+   - Several mathematical operations (e.g., `principal * closeAmounts.collateralSold / collateralAmount`) assume Solidity's default protection against overflows, but division without validation (e.g., division by zero scenarios) is not explicitly handled. Unintended inputs could break functionality.
+
+### 9. **Event Logging Inconsistencies**
+   - Some state-changing functions, such as `recordInterest`, rely on external contract interactions yet lack sufficient confirmation via events for all internal changes. This hinders auditing and monitoring.
+
+### 10. **Privileged Role Misuse**
+   - The `Roles.LIQUIDATOR_ROLE` has significant control over closing positions (`liquidationFee`, `payout`, etc.) and accessing sensitive operations, which could be abused by malicious or compromised liquidators.
+
+### 11. **Initialization and Upgrade Risks**
+   - The `initialize`/`__WasabiLongPool_init` could be called only once due to the `initializer` modifier. However, there is no mechanism to validate if the initialization happened successfully or was prevented unexpectedly by design flaws. Additionally, storage layouts in upgrades must be consistent but aren't obviously enforced.
+
+### 12. **Oracle Manipulation Vulnerability**
+   - The `vault.checkMaxLeverage()` function and operation of swaps or value transfers depend on external data (e.g., potential leverage oracles). A poorly secured price or leverage oracle could skew logic or compromise the protocol.
+
+### 13. **Error-Prone Logic for Trader Validation**
+   - Logic verifying `msg.sender` as the trader or router (`address(addressProvider.getWasabiRouter())`) may allow attackers to spoof a router address or router misbehavior.
+
+### 14. **Gas Consumption Risk**
+   - Functions such as `recordInterest` process large arrays (`_positions`, `_interests`), and their unbounded size could cause exceeding gas limits, leading to transaction failures. This is especially impactful with on-chain global states.
+
+### 15. **Unimplemented Access Control**
+   - Key internal functions (`_closePositionInternal`, `_payCloseAmounts`, `_recordRepayment`) include core financial logic and allow arbitrary processing but are insufficiently restricted or protected, leaving them vulnerable in derived contracts.
+
+In summary, while the contract contains certain safeguards (e.g., `nonReentrant`), these vulnerabilities leave it susceptible to reentrancy, signature reuse, privilege abuse, improper mathematical operations, and unchecked external interactions. Proper mitigation would require thorough input validation, enhanced access control, event emission consistency, oracle hardening, and stricter interaction with external contracts.","---
+
+### **[M-1] Flash Loan Attack to Avoid Interest Payments**
+
+**Report Description**:  
+A user can exploit a flash loan to temporarily inflate their share of the vault, close their position to pay interest, and then withdraw. By owning a majority of the vault shares during the interest payment, they effectively receive most of their own interest back, resulting in nearly interest-free loans. This creates a financial loophole that undermines the protocol's intended interest mechanism.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. None of the responses in the `response_list` address the specific issue of flash loan exploitation to avoid interest payments. While some responses discuss input validation, reentrancy, and external call risks, they do not cover the mechanics of flash loans being used to manipulate vault share distribution and interest payments. This is a critical gap, as flash loan vulnerabilities are a well-documented attack vector in DeFi protocols.
+
+---
+
+### **[M-4] Inconsistent Liquidation Logic Between Long and Short Pools**
+
+**Report Description**:  
+The calculation for the `liquidationThreshold` differs between long and short positions. For long positions, it is based on the principal, while for short positions, it is based on the collateral amount (principal + down payment). This inconsistency creates unequal liquidation conditions for long and short traders, potentially leading to unfair treatment and exploitable scenarios.
+
+**Match in Response List**:  
+Matches partially with **""Fee and Liquidation Policy Enforcement""**.
+
+**Validation**:  
+**Partially Correct**. The response mentions that fees and liquidation thresholds are configurable and could be manipulated, but it does not specifically address the inconsistency in the liquidation logic between long and short positions. While the response acknowledges potential risks in liquidation policies, it misses the critical concern of unequal treatment between long and short traders due to differing calculation methods. This inconsistency could lead to exploitable scenarios or unfair outcomes, which is not sufficiently covered in the response.
+
+---
+
+### **[M-7] Take Profit Orders Do Not Prioritize User Profit**
+
+**Report Description**:  
+Take Profit orders are evaluated against a gross amount before deducting accrued interest. This can result in a position being closed when the price target is met, but after high interest has accrued, the user receives a lower net payout than expected. This misalignment between user expectations and actual outcomes could lead to dissatisfaction and loss of trust in the protocol.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. None of the responses in the `response_list` address the issue of Take Profit orders being evaluated against gross amounts without considering accrued interest. This is a significant oversight, as it directly impacts user experience and trust in the protocol. The response list does not mention any logic or mechanisms related to Take Profit orders or their evaluation criteria.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[M-4] Inconsistent Liquidation Logic Between Long and Short Pools**
+
+**Missed Issues from Issue Report**:  
+- **[M-1] Flash Loan Attack to Avoid Interest Payments**  
+- **[M-7] Take Profit Orders Do Not Prioritize User Profit**
+
+---
+
+### **Recommendations for Improvement**
+
+1. **Flash Loan Exploitation**:  
+   The response list should include a discussion on flash loan vulnerabilities, particularly in scenarios where they can be used to manipulate vault share distribution or interest payments. Mitigation strategies such as time-weighted average balances or restrictions on flash loan usage should be considered.
+
+2. **Liquidation Logic Consistency**:  
+   The response list should explicitly address the inconsistency in liquidation logic between long and short positions. Ensuring uniform calculation methods or providing justification for the differences is critical to maintaining fairness and preventing exploitation.
+
+3. **Take Profit Order Evaluation**:  
+   The response list should include a detailed analysis of how Take Profit orders are evaluated and the potential misalignment between gross and net amounts. Solutions such as incorporating accrued interest into the evaluation criteria or providing clear user documentation could mitigate this issue.
+
+4. **Comprehensive Coverage**:  
+   The response list should be expanded to cover all identified vulnerabilities in the issue report. This includes addressing specific attack vectors, user experience concerns, and inconsistencies in protocol logic.
+
+By addressing these gaps, the response list can provide a more thorough and accurate assessment of the vulnerabilities in the smart contract."
+BlastVault.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+import ""../blast/AbstractBlastContract.sol"";
+import ""./WasabiVault.sol"";
+
+contract BlastVault is WasabiVault, AbstractBlastContract {
+
+    error UnexpectedTotalSupply();
+
+    /// @dev Initializer for proxy
+    /// @notice This function should only be called to initialize a new vault - for upgrading an existing V1 vault use `reinitialize`
+    /// @param _longPool The WasabiLongPool contract
+    /// @param _shortPool The WasabiShortPool contract
+    /// @param _addressProvider The address provider
+    /// @param _manager The PerpManager contract that will own this vault
+    /// @param _asset The asset
+    /// @param name The name of the vault
+    /// @param symbol The symbol of the vault
+    function initialize(
+        IWasabiPerps _longPool,
+        IWasabiPerps _shortPool,
+        IAddressProvider _addressProvider,
+        PerpManager _manager,
+        IERC20 _asset,
+        string memory name,
+        string memory symbol
+    ) public override initializer {
+        __AbstractBlastContract_init();
+        __WasabiVault_init(_longPool, _shortPool, _addressProvider, _manager, _asset, name, symbol);
+    }
+
+    /// @dev claim all gas
+    function claimGas(address contractAddress, address recipientOfGas) external onlyAdmin returns (uint256) {
+        return _getBlast().claimMaxGas(contractAddress, recipientOfGas);
+    }
+
+    /// @dev claims yield
+    function claimYield(uint256 _expectedVaultSupply) external onlyAdmin {
+        if (totalSupply() != _expectedVaultSupply) {
+            revert UnexpectedTotalSupply();
+        }
+        address assetAddress = asset();
+        if (assetAddress == BlastConstants.WETH || assetAddress == BlastConstants.USDB) {
+            IERC20Rebasing token = IERC20Rebasing(assetAddress);
+            uint256 claimable = token.getClaimableAmount(address(this));
+            if (claimable > 0) {
+                uint256 claimed = token.claim(address(this), claimable);
+                totalAssetValue += claimed;
+                emit NativeYieldClaimed(assetAddress, claimed);
+            }
+        } else {
+            revert CannotClaimNonYieldBearingAsset(assetAddress);
+        }
+    }
+}
+","[M-2] Arbitrage Opportunity on Blast Yield Claims The `BlastVault’ contract claims Blast yield in discrete steps, creating a predictable, instantaneous increase in share value. This allows MEV bots to sandwich the claim transaction by depositing before the claim and withdrawing after, arbitraging the yield at the expense of long-term depositors.",495,57,"pragma solidity ^0.8.23;
+
+import ""../blast/AbstractBlastContract.sol"";
+import ""./WasabiVault.sol"";
+
+contract BlastVault is WasabiVault, AbstractBlastContract {
+
+    error UnexpectedTotalSupply();
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    function initialize(
+        IWasabiPerps _longPool,
+        IWasabiPerps _shortPool,
+        IAddressProvider _addressProvider,
+        PerpManager _manager,
+        IERC20 _asset,
+        string memory name,
+        string memory symbol
+    ) public override initializer {
+        __AbstractBlastContract_init();
+        __WasabiVault_init(_longPool, _shortPool, _addressProvider, _manager, _asset, name, symbol);
+    }
+
+    
+    function claimGas(address contractAddress, address recipientOfGas) external onlyAdmin returns (uint256) {
+        return _getBlast().claimMaxGas(contractAddress, recipientOfGas);
+    }
+
+    
+    function claimYield(uint256 _expectedVaultSupply) external onlyAdmin {
+        if (totalSupply() != _expectedVaultSupply) {
+            revert UnexpectedTotalSupply();
+        }
+        address assetAddress = asset();
+        if (assetAddress == BlastConstants.WETH || assetAddress == BlastConstants.USDB) {
+            IERC20Rebasing token = IERC20Rebasing(assetAddress);
+            uint256 claimable = token.getClaimableAmount(address(this));
+            if (claimable > 0) {
+                uint256 claimed = token.claim(address(this), claimable);
+                totalAssetValue += claimed;
+                emit NativeYieldClaimed(assetAddress, claimed);
+            }
+        } else {
+            revert CannotClaimNonYieldBearingAsset(assetAddress);
+        }
+    }
+}",354,0,1,1,"Here are the vulnerabilities in the provided Solidity smart contract:
+
+1. **Lack of Access Control for Initialization**:
+   - The `initialize` function is public and can be called by anyone if the `initializer` modifier is incorrectly implemented or bypassed. If the initializer is not properly restricted or misused, it could result in reinitialization vulnerabilities.
+
+2. **Reentrancy Risk in `claimYield`**:
+   - The `token.claim()` function involves an external call. If the ERC20 token implements malicious logic, reentrancy attacks could occur, especially since the contract modifies state (`totalAssetValue += claimed`) after the external call.
+
+3. **Improper Handling of Return Values**:
+   - The return value of the `token.claim()` call is used directly without verifying if the transfer or the claim was successful. A malicious or non-standard ERC20 implementation could compromise this logic.
+
+4. **Hardcoded Assistance Assumptions**:
+   - The contract assumes only specific addresses (`BlastConstants.WETH`, `BlastConstants.USDB`) as yield-bearing assets. Any other legitimate yield-bearing tokens will trigger the revert condition unnecessarily.
+
+5. **Lack of Validation for External Inputs**:
+   - The `_expectedVaultSupply` parameter in `claimYield` is determined by external input and it's directly compared against `totalSupply()`. If the caller provides a falsified value, it could disrupt the execution flow or revert the transaction.
+
+6. **Lack of Error Message for One Revert Condition**:
+   - The `CannotClaimNonYieldBearingAsset` revert statement does not include a clear error message, which can make debugging more difficult.
+
+7. **Reliance on External Contract Behavior**:
+   - The contract heavily relies on external contracts like `IERC20Rebasing` to behave correctly (e.g., `getClaimableAmount` and `claim`). An upgrade or a failure in these external contracts could break functionality.
+
+8. **Potential Delegated Call Risk in `_getBlast()`**:
+   - The `claimGas` function uses `_getBlast().claimMaxGas()`. If `_getBlast` or `claimMaxGas` is maliciously overridden or contains a bug, it could result in unintended functionality. The implementation of `_getBlast` is not visible in the provided code.
+
+9. **Implicit Assumptions for Admin Role**:
+   - The `onlyAdmin` modifier assumes proper role management. If this is not implemented securely or misconfigured, unauthorized users could access critical functions like `claimYield` or `claimGas`.
+
+10. **No Circuit Breaker or Emergency Mechanism**:
+    - There is no mechanism to pause the contract in case of an emergency or critical exploit.
+
+11. **Brittle Asset Compatibility**:
+    - The logic in `claimYield` only supports specific token types and requires them to conform to the `IERC20Rebasing` interface. This reduces flexibility and increases the risk of incompatibility with tokens outside this specification.
+
+12. **Event Emission Issue**:
+    - The event `NativeYieldClaimed` is emitted, but if the `claimable` amount is zero, this function doesn't do anything, potentially leading to unnoticed issues.
+
+To address these risks, proper access control, thorough validation of inputs, event emission consistency, reentrancy protections (e.g., `Checks-Effects-Interactions` pattern or OpenZeppelin's `ReentrancyGuard`), and compatibility checks with external contracts should be implemented and/or verified.","---
+
+### **[M-2] Arbitrage Opportunity on Blast Yield Claims**
+
+**Report Description**:  
+The `BlastVault` contract claims Blast yield in discrete steps, creating a predictable, instantaneous increase in share value. This predictability allows MEV (Miner Extractable Value) bots to sandwich the claim transaction by depositing just before the claim and withdrawing immediately after. This results in arbitraging the yield at the expense of long-term depositors, leading to unfair distribution of rewards and potential financial losses for honest users.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**.  
+The response list does not address the issue of arbitrage opportunities caused by predictable yield claims. None of the responses in the list discuss MEV risks, sandwich attacks, or the predictability of share value increases. This is a critical oversight, as MEV-related vulnerabilities are a significant concern in DeFi protocols. Mitigating such risks often involves redesigning the yield distribution mechanism to make it less predictable or implementing measures like time-weighted rewards to discourage short-term exploitation.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- **[M-2] Arbitrage Opportunity on Blast Yield Claims**: The response list does not address the arbitrage opportunity caused by predictable yield claims, which is a significant vulnerability in the `BlastVault` contract.
+
+---
+
+### **Recommendations**:  
+To address the arbitrage opportunity described in the issue report, the following measures should be considered:  
+1. **Randomized or Continuous Yield Distribution**: Instead of discrete steps, distribute yield continuously or in a randomized manner to reduce predictability.  
+2. **Time-Weighted Rewards**: Implement a mechanism where rewards are distributed based on the duration of deposits, discouraging short-term deposits for arbitrage.  
+3. **Anti-MEV Measures**: Use techniques like transaction ordering or batching to make it harder for MEV bots to exploit predictable events.  
+4. **Dynamic Share Value Updates**: Avoid instantaneous share value increases by smoothing out the updates over time.  
+
+These measures align with Solidity best practices and DeFi security standards to mitigate MEV risks and ensure fair reward distribution."
+IBlast.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+enum YieldMode {
+    AUTOMATIC,
+    VOID,
+    CLAIMABLE
+}
+
+enum GasMode {
+    VOID,
+    CLAIMABLE 
+}
+
+interface IBlast{
+    // configure
+    function configureContract(address contractAddress, YieldMode _yield, GasMode gasMode, address governor) external;
+    function configure(YieldMode _yield, GasMode gasMode, address governor) external;
+
+    // base configuration options
+    function configureClaimableYield() external;
+    function configureClaimableYieldOnBehalf(address contractAddress) external;
+    function configureAutomaticYield() external;
+    function configureAutomaticYieldOnBehalf(address contractAddress) external;
+    function configureVoidYield() external;
+    function configureVoidYieldOnBehalf(address contractAddress) external;
+    function configureClaimableGas() external;
+    function configureClaimableGasOnBehalf(address contractAddress) external;
+    function configureVoidGas() external;
+    function configureVoidGasOnBehalf(address contractAddress) external;
+    function configureGovernor(address _governor) external;
+    function configureGovernorOnBehalf(address _newGovernor, address contractAddress) external;
+
+    // claim yield
+    function claimYield(address contractAddress, address recipientOfYield, uint256 amount) external returns (uint256);
+    function claimAllYield(address contractAddress, address recipientOfYield) external returns (uint256);
+
+    // claim gas
+    function claimAllGas(address contractAddress, address recipientOfGas) external returns (uint256);
+    function claimGasAtMinClaimRate(address contractAddress, address recipientOfGas, uint256 minClaimRateBips) external returns (uint256);
+    function claimMaxGas(address contractAddress, address recipientOfGas) external returns (uint256);
+    function claimGas(address contractAddress, address recipientOfGas, uint256 gasToClaim, uint256 gasSecondsToConsume) external returns (uint256);
+
+    // read functions
+    function readClaimableYield(address contractAddress) external view returns (uint256);
+    function readYieldConfiguration(address contractAddress) external view returns (uint8);
+    function readGasParams(address contractAddress) external view returns (uint256 etherSeconds, uint256 etherBalance, uint256 lastUpdated, GasMode);
+}
+
+interface IERC20Rebasing {
+  // changes the yield mode of the caller and update the balance
+  // to reflect the configuration
+  function configure(YieldMode) external returns (uint256);
+  // ""claimable"" yield mode accounts can call this this claim their yield
+  // to another address
+  function claim(address recipient, uint256 amount) external returns (uint256);
+  // read the claimable amount for an account
+  function getClaimableAmount(address account) external view returns (uint256);
+}
+
+interface IWETHRebasing is IERC20Rebasing {
+    function deposit() external payable;
+    function withdraw(uint) external;
+}
+
+interface IBlastPoints {
+    function configurePointsOperator(address operator) external;
+}
+","[M-3] claimAllGas Function Causes Loss of Funds The protocol uses the `claimAllGas` function, which claims gas rewards immediately, including for unvested amounts, thereby incurring an early-claim penalty from Blast. This results in a consistent loss of funds compared to using `claimMaxGas`, which only claims fully vested rewards .",640,69,"pragma solidity ^0.8.23;
+
+enum YieldMode {
+    AUTOMATIC,
+    VOID,
+    CLAIMABLE
+}
+
+enum GasMode {
+    VOID,
+    CLAIMABLE 
+}
+
+interface IBlast{
+    
+    function configureContract(address contractAddress, YieldMode _yield, GasMode gasMode, address governor) external;
+    function configure(YieldMode _yield, GasMode gasMode, address governor) external;
+
+    
+    function configureClaimableYield() external;
+    function configureClaimableYieldOnBehalf(address contractAddress) external;
+    function configureAutomaticYield() external;
+    function configureAutomaticYieldOnBehalf(address contractAddress) external;
+    function configureVoidYield() external;
+    function configureVoidYieldOnBehalf(address contractAddress) external;
+    function configureClaimableGas() external;
+    function configureClaimableGasOnBehalf(address contractAddress) external;
+    function configureVoidGas() external;
+    function configureVoidGasOnBehalf(address contractAddress) external;
+    function configureGovernor(address _governor) external;
+    function configureGovernorOnBehalf(address _newGovernor, address contractAddress) external;
+
+    
+    function claimYield(address contractAddress, address recipientOfYield, uint256 amount) external returns (uint256);
+    function claimAllYield(address contractAddress, address recipientOfYield) external returns (uint256);
+
+    
+    function claimAllGas(address contractAddress, address recipientOfGas) external returns (uint256);
+    function claimGasAtMinClaimRate(address contractAddress, address recipientOfGas, uint256 minClaimRateBips) external returns (uint256);
+    function claimMaxGas(address contractAddress, address recipientOfGas) external returns (uint256);
+    function claimGas(address contractAddress, address recipientOfGas, uint256 gasToClaim, uint256 gasSecondsToConsume) external returns (uint256);
+
+    
+    function readClaimableYield(address contractAddress) external view returns (uint256);
+    function readYieldConfiguration(address contractAddress) external view returns (uint8);
+    function readGasParams(address contractAddress) external view returns (uint256 etherSeconds, uint256 etherBalance, uint256 lastUpdated, GasMode);
+}
+
+interface IERC20Rebasing {
+  
+  
+  function configure(YieldMode) external returns (uint256);
+  
+  
+  function claim(address recipient, uint256 amount) external returns (uint256);
+  
+  function getClaimableAmount(address account) external view returns (uint256);
+}
+
+interface IWETHRebasing is IERC20Rebasing {
+    function deposit() external payable;
+    function withdraw(uint) external;
+}
+
+interface IBlastPoints {
+    function configurePointsOperator(address operator) external;
+}",561,0,1,1,"The Solidity smart contract provided above is mainly a collection of interfaces. While interfaces themselves do not contain implementations, they establish a contract for functionality. Vulnerabilities would primarily arise from how these interfaces are implemented in a concrete contract. But there are still potential issues to be aware of:
+
+---
+
+### **1. Lack of Access Control**
+   - Many functions (e.g., `configure`, `configureGovernor`, `claimYield`, `claimGas`) allow changes to configurations or claim actions but do not specify any restrictions or role-based access control. If these functions are implemented without proper access control, any arbitrary address could misconfigure or exploit the system.
+
+---
+
+### **2. Centralization Risks**
+   - Functions like `configureGovernorOnBehalf()` suggest potential centralization as a governor or admin might have excessive control over configurations and other contract operations. Malicious actors could exploit this centralization in implementation.
+
+---
+
+### **3. Potential for Reentrancy Attacks**
+   - In the implementation of functions such as `claimYield`, `claimAllYield`, or `claimGas`, if they interact with external contracts, they may be vulnerable to **reentrancy attacks**, especially if proper checks (`Checks-Effects-Interactions`) are not followed.
+
+---
+
+### **4. Lack of Input Validation**
+   - Functions like `claim`, `claimYield`, `claimAllGas`, etc., don't specify any restrictions on input parameters such as `amount`, `minClaimRateBips`, or `gasToClaim`. Without proper validation in implementation, these could be used to drain funds or misallocate resources.
+
+---
+
+### **5. Insufficient Safeguards Around `Governor` Configuration**
+   - The absence of restrictions in `configureGovernor` and `configureGovernorOnBehalf` allows unauthorized or malicious changes to the governor, potentially compromising the entire contract.
+
+---
+
+### **6. Overpowered ""OnBehalf"" Functions**
+   - Functions like `configureClaimableYieldOnBehalf`, `configureVoidGasOnBehalf`, and others allow arbitrary addresses to configure sensitive settings for other contracts, potentially leading to misconfiguration and abuse.
+
+---
+
+### **7. Absence of Rate-Limiting or Claim Throttling**
+   - Claim functions (`claimYield`, `claimGas`, etc.) appear to have no indication of rate-limiting, which could lead to abuse where users repeatedly claim resources, potentially affecting other users of the system.
+
+---
+
+### **8. Misconfigurations From Enumeration Default Values**
+   - Enums like `YieldMode` and `GasMode` have default values (`AUTOMATIC`, `VOID`). If these are unintentionally used when configurations are unset, a system may behave incorrectly.
+
+---
+
+### **9. Lack of Fallback Functionality**
+   - The interfaces define no fallback or receive functions, meaning any direct receipt of Ether (for functions like `IWETHRebasing.deposit`) might lead to errors if incorrectly implemented.
+
+---
+
+### **10. Potential Arithmetic Issues**
+   - While Solidity ^0.8.23 has built-in overflow/underflow protection, improper usage of unchecked blocks during implementation could reintroduce arithmetic vulnerabilities.
+
+---
+
+### **11. Lack of Documentation or Context**
+   - The purpose and expected behavior of many functions and interactions (e.g., `claimGasAtMinClaimRate`) are unclear. Without detailed documentation, implementers or users might misconfigure the system or fail to meet key security guarantees.
+
+---
+
+### **12. External Dependencies Risks**
+   - Interfaces like `IWETHRebasing` and `IBlastPoints` rely on external systems. If external contracts are buggy, malicious, or compromised, they could lead to cascading vulnerabilities.
+
+---
+
+### **Key Suggestion**
+Focus on secure implementations for these interfaces, addressing **access control**, **input validation**, proper **reentrancy protections**, and ensuring adherence to best coding practices like **Checks-Effects-Interactions** and proper use of **nonReentrant** modifiers.","---
+
+### **[M-3] claimAllGas Function Causes Loss of Funds**
+
+**Report Description**:  
+The `claimAllGas` function claims gas rewards immediately, including unvested amounts, which incurs an early-claim penalty from Blast. This results in a consistent loss of funds compared to using `claimMaxGas`, which only claims fully vested rewards. The issue highlights a design flaw that leads to financial inefficiency and potential user dissatisfaction.
+
+---
+
+**Match in Response List**:  
+Matches partially with **""7. Absence of Rate-Limiting or Claim Throttling""** in the response list.
+
+---
+
+**Validation**:  
+**Partially Correct**.  
+The response identifies a related issue under **""Absence of Rate-Limiting or Claim Throttling""**, which discusses the potential for abuse in claim functions like `claimGas`. However, it does not directly address the specific problem of financial inefficiency caused by the `claimAllGas` function claiming unvested rewards and incurring penalties. The response misses the critical concern of the design flaw leading to consistent loss of funds, which is the core issue in the report. While the response touches on the broader category of claim function vulnerabilities, it does not provide sufficient coverage or specificity for this particular issue.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- **[M-3] claimAllGas Function Causes Loss of Funds**
+
+**Missed Issues from Issue Report**:  
+- The specific design flaw in `claimAllGas` leading to financial inefficiency and penalties is not fully addressed in the response list.
+
+---
+
+### **Recommendations for Improvement**:  
+1. The response list should explicitly address the financial inefficiency caused by the `claimAllGas` function claiming unvested rewards and incurring penalties. This could include suggestions for modifying the function to only claim vested rewards or providing users with clear warnings about the penalties associated with early claims.
+2. The response list should differentiate between general claim function vulnerabilities (e.g., rate-limiting) and specific design flaws that lead to financial losses, ensuring that each issue is addressed with appropriate detail and context.
+
+---"
+WasabiRouter.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+import ""./WasabiRouter.sol"";
+import ""../blast/AbstractBlastContract.sol"";
+
+contract BlastRouter is WasabiRouter, AbstractBlastContract {
+    /// @dev Initializes the router as per UUPSUpgradeable
+    /// @param _longPool The long pool address
+    /// @param _shortPool The short pool address
+    /// @param _weth The WETH address
+    /// @param _manager The PerpManager address
+    /// @param _swapRouter The swap router address
+    /// @param _feeReceiver The address to receive withdrawal fees
+    /// @param _withdrawFeeBips The fee to be charged on vault withdrawals if no swap is performed (in bips)
+    function initialize(
+        IWasabiPerps _longPool,
+        IWasabiPerps _shortPool,
+        IWETH _weth,
+        PerpManager _manager,
+        address _swapRouter,
+        address _feeReceiver,
+        uint256 _withdrawFeeBips
+    ) public override initializer {
+        __WasabiRouter_init(_longPool, _shortPool, _weth, _manager, _swapRouter, _feeReceiver, _withdrawFeeBips);
+        __AbstractBlastContract_init();
+    }
+
+    /// @dev claim all gas
+    function claimGas(address contractAddress, address recipientOfGas) external onlyAdmin returns (uint256) {
+        return _getBlast().claimMaxGas(contractAddress, recipientOfGas);
+    }
+}
+","[M-5] WasabiRouter::swapVaultToToken Function Can Be DoS'd The `swapVaultToToken` function reverts if the router contract has a non-zero token balance at the end of the transaction. An attacker can permanently DoS this function by sending 1 wei of a token or ETH to the contract address, causing all future swaps to fail.  [M-6] Withdrawal Fee Bypassed When Swapping Tokens The `swapVaultToToken` function fails to apply a withdrawal fee when an internal swap is performed, allowing users to bypass fees that are correctly charged in other withdrawal scenarios. This leads to a loss of protocol revenue.",321,34,"pragma solidity ^0.8.23;
+
+import ""./WasabiRouter.sol"";
+import ""../blast/AbstractBlastContract.sol"";
+
+contract BlastRouter is WasabiRouter, AbstractBlastContract {
+    
+    
+    
+    
+    
+    
+    
+    
+    function initialize(
+        IWasabiPerps _longPool,
+        IWasabiPerps _shortPool,
+        IWETH _weth,
+        PerpManager _manager,
+        address _swapRouter,
+        address _feeReceiver,
+        uint256 _withdrawFeeBips
+    ) public override initializer {
+        __WasabiRouter_init(_longPool, _shortPool, _weth, _manager, _swapRouter, _feeReceiver, _withdrawFeeBips);
+        __AbstractBlastContract_init();
+    }
+
+    
+    function claimGas(address contractAddress, address recipientOfGas) external onlyAdmin returns (uint256) {
+        return _getBlast().claimMaxGas(contractAddress, recipientOfGas);
+    }
+}",194,0,2,2,"The provided Solidity smart contract contains the following potential vulnerabilities:
+
+1. **Lack of Access Control Validation in `initialize`**:
+   - The `initialize` function is not protected against re-initialization by unauthorized parties. While it uses the `initializer` modifier, it should be invoked carefully in upgradeable contracts. If it's called improperly, it could result in reconfiguration attacks.
+
+2. **No Validation on External Calls in `claimGas`**:
+   - The `claimGas` function calls `_getBlast().claimMaxGas()` on an external contract (`_getBlast()`), but it does not validate the result or behavior of this external call. This could lead to reliance on untrusted contracts, reentrancy attacks, or unexpected behavior.
+
+3. **Lack of Input Validation on `claimGas`**:
+   - There is no validation to ensure that `contractAddress` and `recipientOfGas` are legitimate or safe to use. Malicious inputs could lead to unintended consequences, such as transferring gas to the wrong address.
+
+4. **Insufficient Documentation for Privileged Functions**:
+   - Critical functions (`initialize` and `claimGas`) rely on privileged access (`initializer` and `onlyAdmin`), but their exact access control implementations and responsibilities are not fully clear. Mismanagement or a lack of transparency could lead to improper usage.
+
+5. **Insecure Assumptions with `onlyAdmin` Modifier**:
+   - The `onlyAdmin` modifier depends on proper configuration of admin roles. If the admin role is compromised or misconfigured, attackers could exploit this vulnerability.
+
+6. **Hidden Dependency Risks**:
+   - The imported contracts `WasabiRouter` and `AbstractBlastContract` may introduce inherited vulnerabilities. For example, if they contain insecure logic or improperly implemented functions, this contract will inherit those risks.
+
+7. **Upgradeable Contract Risks**:
+   - The use of `initializer` suggests this is an upgradeable contract. If the upgrade mechanism or proxy is misconfigured, it could lead to contract replacement or state manipulation attacks.
+
+8. **Potential Misuse of `_getBlast()`**:
+   - The `_getBlast()` function is assumed to return a valid contract address. If `_getBlast()` logic is flawed or malicious, it could return invalid addresses, allowing attackers to exploit the contract.
+
+To secure this contract, validate inputs, carefully handle external calls, ensure proper access controls, document privileged roles, and audit inherited components and upgrade mechanisms thoroughly.","---
+
+### **[M-5] WasabiRouter::swapVaultToToken Function Can Be DoS'd**
+
+**Report Description**:  
+The `swapVaultToToken` function in the `WasabiRouter` contract reverts if the router contract has a non-zero token balance at the end of the transaction. An attacker can exploit this by sending 1 wei of a token or ETH to the contract address, causing all future swaps to fail. This creates a Denial of Service (DoS) vulnerability, preventing legitimate users from executing swaps and disrupting the protocol's functionality.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** None of the responses in the `response_list` address the DoS vulnerability caused by the `swapVaultToToken` function's reliance on the contract's token balance. The responses focus on access control, external calls, input validation, and upgradeable contract risks, but they do not mention the specific issue of a DoS attack caused by malicious token or ETH transfers to the contract. This is a critical oversight, as DoS vulnerabilities are a significant risk in Solidity smart contracts and should be explicitly addressed.
+
+---
+
+### **[M-6] Withdrawal Fee Bypassed When Swapping Tokens**
+
+**Report Description**:  
+The `swapVaultToToken` function does not apply a withdrawal fee when an internal swap is performed. This allows users to bypass the withdrawal fee that is correctly charged in other withdrawal scenarios. As a result, the protocol loses revenue, and users can exploit this inconsistency to avoid paying fees.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** None of the responses in the `response_list` address the issue of the withdrawal fee being bypassed during internal swaps in the `swapVaultToToken` function. The responses focus on access control, external calls, input validation, and upgradeable contract risks, but they do not mention the specific issue of fee bypassing. This is a critical gap, as fee bypassing directly impacts the protocol's revenue and fairness, and it should be explicitly addressed in the response.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+1. **[M-5] WasabiRouter::swapVaultToToken Function Can Be DoS'd**:  
+   The `response_list` does not address the DoS vulnerability caused by malicious token or ETH transfers to the contract. This is a critical oversight.  
+
+2. **[M-6] Withdrawal Fee Bypassed When Swapping Tokens**:  
+   The `response_list` does not address the issue of the withdrawal fee being bypassed during internal swaps. This is a significant gap, as it directly impacts the protocol's revenue.
+
+---
+
+### **Recommendations**
+
+1. **For [M-5]**:  
+   - The response should explicitly address the DoS vulnerability in the `swapVaultToToken` function. A potential solution could involve implementing a mechanism to ignore unsolicited token or ETH transfers or using a separate accounting mechanism to track legitimate balances.
+
+2. **For [M-6]**:  
+   - The response should address the fee bypass issue by ensuring that the withdrawal fee is consistently applied across all withdrawal scenarios, including internal swaps. This could involve refactoring the `swapVaultToToken` function to include fee calculations or centralizing fee logic to avoid inconsistencies.
+
+3. **General Improvements**:  
+   - The `response_list` should be expanded to include specific vulnerabilities related to the `WasabiRouter` contract, such as DoS risks and fee inconsistencies. This would ensure comprehensive coverage of the issues identified in the `issue` report.
+
+---"
