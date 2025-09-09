@@ -1,0 +1,3930 @@
+contract_name,code_snippet,ground_truth,Vul. High,Vul. Medium,tokens,loc,code_snippet_rm,processtokens,high_severity_count,medium_severity_count,vulnumber,Findings,Comparison
+OracleLess.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../interfaces/openzeppelin/ReentrancyGuard.sol"";
+import ""./AutomationMaster.sol"";
+import ""../libraries/ArrayMutation.sol"";
+
+contract OracleLess is IOracleLess, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    AutomationMaster public immutable MASTER;
+    IPermit2 public immutable permit2;
+
+    uint96[] public pendingOrderIds;
+
+    mapping(uint96 => Order) public orders;
+
+    constructor(AutomationMaster _master, IPermit2 _permit2) {
+        MASTER = _master;
+        permit2 = _permit2;
+    }
+
+    ///@return pendingOrders a full list of all pending orders with full order details
+    ///@notice this should not be called in a write function due to gas usage
+    function getPendingOrders()
+        external
+        view
+        returns (Order[] memory pendingOrders)
+    {
+        pendingOrders = new Order[](pendingOrderIds.length);
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            Order memory order = orders[pendingOrderIds[i]];
+            pendingOrders[i] = order;
+        }
+    }
+
+    function createOrder(
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint16 feeBips,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override returns (uint96 orderId) {
+        //procure tokens
+        procureTokens(tokenIn, amountIn, recipient, permit, permitPayload);
+
+        //construct and store order
+        orderId = MASTER.generateOrderId(recipient);
+        orders[orderId] = Order({
+            orderId: orderId,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            amountIn: amountIn,
+            minAmountOut: minAmountOut,
+            recipient: recipient,
+            feeBips: feeBips
+        });
+
+        //store pending order
+        pendingOrderIds.push(orderId);
+
+        emit OrderCreated(orderId);
+    }
+
+    function adminCancelOrder(uint96 orderId) external onlyOwner {
+        Order memory order = orders[orderId];
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    function cancelOrder(uint96 orderId) external override {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.recipient, ""Only Order Owner"");
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    function modifyOrder(
+        uint96 orderId,
+        IERC20 _tokenOut,
+        uint256 amountInDelta,
+        uint256 _minAmountOut,
+        address _recipient,
+        bool increasePosition,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override {
+        _modifyOrder(
+            orderId,
+            _tokenOut,
+            amountInDelta,
+            _minAmountOut,
+            _recipient,
+            increasePosition,
+            permit,
+            permitPayload
+        );
+        emit OrderModified(orderId);
+    }
+
+    function fillOrder(
+        uint96 pendingOrderIdx,
+        uint96 orderId,
+        address target,
+        bytes calldata txData
+    ) external override {
+        //fetch order
+        Order memory order = orders[orderId];
+
+        require(
+            order.orderId == pendingOrderIds[pendingOrderIdx],
+            ""Order Fill Mismatch""
+        );
+
+        //perform swap
+        (uint256 amountOut, uint256 tokenInRefund) = execute(
+            target,
+            txData,
+            order
+        );
+
+        //handle accounting
+        //remove from array
+        pendingOrderIds = ArrayMutation.removeFromArray(
+            pendingOrderIdx,
+            pendingOrderIds
+        );
+
+        //handle fee
+        (uint256 feeAmount, uint256 adjustedAmount) = applyFee(
+            amountOut,
+            order.feeBips
+        );
+        if (feeAmount != 0) {
+            order.tokenOut.safeTransfer(address(MASTER), feeAmount);
+        }
+
+        //send tokenOut to recipient
+        order.tokenOut.safeTransfer(order.recipient, adjustedAmount);
+
+        //refund any unspent tokenIn
+        //this should generally be 0 when using exact input for swaps, which is recommended
+        if (tokenInRefund != 0) {
+            order.tokenIn.safeTransfer(order.recipient, tokenInRefund);
+        }
+    }
+
+    function _cancelOrder(Order memory order) internal returns (bool) {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            if (pendingOrderIds[i] == order.orderId) {
+                //remove from pending array
+                pendingOrderIds = ArrayMutation.removeFromArray(
+                    i,
+                    pendingOrderIds
+                );
+
+                //refund tokenIn amountIn to recipient
+                order.tokenIn.safeTransfer(order.recipient, order.amountIn);
+
+                //emit event
+                emit OrderCancelled(order.orderId);
+
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _modifyOrder(
+        uint96 orderId,
+        IERC20 _tokenOut,
+        uint256 amountInDelta,
+        uint256 _minAmountOut,
+        address _recipient,
+        bool increasePosition,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        //fetch order
+        Order memory order = orders[orderId];
+
+        require(msg.sender == order.recipient, ""only order owner"");
+
+        //deduce any amountIn changes
+        uint256 newAmountIn = order.amountIn;
+        if (amountInDelta != 0) {
+            if (increasePosition) {
+                //take more tokens from order recipient
+                newAmountIn += amountInDelta;
+                procureTokens(
+                    order.tokenIn,
+                    amountInDelta,
+                    order.recipient,
+                    permit,
+                    permitPayload
+                );
+            } else {
+                //refund some tokens
+                //ensure delta is valid
+                require(amountInDelta < order.amountIn, ""invalid delta"");
+
+                //set new amountIn for accounting
+                newAmountIn -= amountInDelta;
+
+                //refund position partially
+                order.tokenIn.safeTransfer(order.recipient, amountInDelta);
+            }
+        }
+
+        //construct new order
+        Order memory newOrder = Order({
+            orderId: orderId,
+            tokenIn: order.tokenIn,
+            tokenOut: _tokenOut,
+            amountIn: newAmountIn,
+            minAmountOut: _minAmountOut,
+            feeBips: order.feeBips,
+            recipient: _recipient
+        });
+
+        //store new order
+        orders[orderId] = newOrder;
+    }
+
+    function execute(
+        address target,
+        bytes calldata txData,
+        Order memory order
+    ) internal returns (uint256 amountOut, uint256 tokenInRefund) {
+        //update accounting
+        uint256 initialTokenIn = order.tokenIn.balanceOf(address(this));
+        uint256 initialTokenOut = order.tokenOut.balanceOf(address(this));
+
+        //approve
+        order.tokenIn.safeApprove(target, order.amountIn);
+
+        //perform the call
+        (bool success, bytes memory reason) = target.call(txData);
+
+        if (!success) {
+            revert TransactionFailed(reason);
+        }
+
+        uint256 finalTokenIn = order.tokenIn.balanceOf(address(this));
+        require(finalTokenIn >= initialTokenIn - order.amountIn, ""over spend"");
+        uint256 finalTokenOut = order.tokenOut.balanceOf(address(this));
+
+        require(
+            finalTokenOut - initialTokenOut > order.minAmountOut,
+            ""Too Little Received""
+        );
+
+        amountOut = finalTokenOut - initialTokenOut;
+        tokenInRefund = order.amountIn - (initialTokenIn - finalTokenIn);
+    }
+
+    function procureTokens(
+        IERC20 token,
+        uint256 amount,
+        address owner,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        if (permit) {
+            IAutomation.Permit2Payload memory payload = abi.decode(
+                permitPayload,
+                (IAutomation.Permit2Payload)
+            );
+
+            permit2.permit(owner, payload.permitSingle, payload.signature);
+            permit2.transferFrom(
+                owner,
+                address(this),
+                uint160(amount),
+                address(token)
+            );
+        } else {
+            token.safeTransferFrom(owner, address(this), amount);
+        }
+    }
+
+    ///@notice apply the protocol fee to @param amount
+    ///@notice fee is in the form of tokenOut after a successful performUpkeep
+    function applyFee(
+        uint256 amount,
+        uint16 feeBips
+    ) internal pure returns (uint256 feeAmount, uint256 adjustedAmount) {
+        if (feeBips != 0) {
+            //determine adjusted amount and fee amount
+            adjustedAmount = (amount * (10000 - feeBips)) / 10000;
+            feeAmount = amount - adjustedAmount;
+        } else {
+            return (0, amount);
+        }
+    }
+}","[H-1] Unsafe Type Casting Leads to Fund Loss Unsafe downcasting from `uint256` to `uint160` for token amounts allows an attacker to create an order with a large value while only paying a small, wrapped-around amount. They can then modify or cancel this order to drain funds from the contract.  [H-2] Lack of Validation in `OracleLess` Allows Contract Draining The contract lacks validation on `tokenIn`, `target`, and `txData`. An attacker can use a malicious `tokenIn` to create an order, then execute it against a legitimate contract like USDT with malicious `txData` to transfer the contract's entire balance to themselves.  [H-3] Reentrancy in OracleLess Allows Fund Theft The `fillOrder()` and `modifyOrder()` functions are missing reentrancy guards. An attacker can re-enter `modifyOrder` from within a `fillOrder` call to steal funds by reducing their position size, receiving a refund, and parking the stolen funds in another order they control.  [H-4] Modifying a Canceled Order Allows Double Withdrawal The `modifyOrder` function does not check if an order is already canceled. An attacker can cancel an order to get a full refund, then call `modifyOrder` on the same canceled order to trigger a second refund, allowing them to withdraw tokens twice.  [H-6] Unrevoked Approvals Can Be Used to Steal Funds The `execute` function approves a target for the full `amountIn` but fails to revoke unused approval. A malicious target can use a small portion and later use the lingering approval to steal funds from subsequent user deposits.  [H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens The `createOrder` and `modifyOrder` functions use a user-specified `recipient` as the `from` address in `safeTransferFrom`. An attacker can specify a victim's address and steal their tokens if the victim has a pre-existing approval for the contract.  [M-5] In OracleLess.createOrder() feeBips value validation is missing The contract is missing input validation for `feeBips`. An attacker can create orders with `feeBips > 10000`, which will always revert on execution. These un-executable and potentially un-cancelable orders can be used to clog the order queue and DoS the system.  [M-6] A malicious attacker can create many orders that is not cancelable. The contract does not whitelist tokens, allowing an attacker to create an order with a malicious token that reverts on transfers from the contract. This makes the order impossible for the admin to cancel, griefing the protocol.  [M-8] Create order can be DOSed as there is no compulsory fee collected during the creation/cancellation of orders The protocol does not charge fees for creating or canceling orders. This allows an attacker to spam the pending order array with a large number of junk orders at low cost, leading to a Denial of Service when iterating through the array.  [M-10] `cancelOrder` order can be DOSed due to unbounded loop. The `_cancelOrder` function uses an unbounded loop to find an order to remove. An attacker can fill the `pendingOrderIds` array with junk orders, making the gas cost to cancel any legitimate order exceed the block gas limit.  [M-11] Malicious users can `createOrder` with 0 amount and make DOS for all The `createOrder` function does not enforce a minimum `amountIn`. An attacker can create a huge number of zero-amount orders at very low cost, leading to a Denial of Service by bloating the pending orders array that must be iterated over.",6,5,1895,298,"pragma solidity ^0.8.19;
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../interfaces/openzeppelin/ReentrancyGuard.sol"";
+import ""./AutomationMaster.sol"";
+import ""../libraries/ArrayMutation.sol"";
+
+contract OracleLess is IOracleLess, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    AutomationMaster public immutable MASTER;
+    IPermit2 public immutable permit2;
+
+    uint96[] public pendingOrderIds;
+
+    mapping(uint96 => Order) public orders;
+
+    constructor(AutomationMaster _master, IPermit2 _permit2) {
+        MASTER = _master;
+        permit2 = _permit2;
+    }
+
+    
+    
+    function getPendingOrders()
+        external
+        view
+        returns (Order[] memory pendingOrders)
+    {
+        pendingOrders = new Order[](pendingOrderIds.length);
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            Order memory order = orders[pendingOrderIds[i]];
+            pendingOrders[i] = order;
+        }
+    }
+
+    function createOrder(
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient,
+        uint16 feeBips,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override returns (uint96 orderId) {
+        
+        procureTokens(tokenIn, amountIn, recipient, permit, permitPayload);
+
+        
+        orderId = MASTER.generateOrderId(recipient);
+        orders[orderId] = Order({
+            orderId: orderId,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            amountIn: amountIn,
+            minAmountOut: minAmountOut,
+            recipient: recipient,
+            feeBips: feeBips
+        });
+
+        
+        pendingOrderIds.push(orderId);
+
+        emit OrderCreated(orderId);
+    }
+
+    function adminCancelOrder(uint96 orderId) external onlyOwner {
+        Order memory order = orders[orderId];
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    function cancelOrder(uint96 orderId) external override {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.recipient, ""Only Order Owner"");
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    function modifyOrder(
+        uint96 orderId,
+        IERC20 _tokenOut,
+        uint256 amountInDelta,
+        uint256 _minAmountOut,
+        address _recipient,
+        bool increasePosition,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override {
+        _modifyOrder(
+            orderId,
+            _tokenOut,
+            amountInDelta,
+            _minAmountOut,
+            _recipient,
+            increasePosition,
+            permit,
+            permitPayload
+        );
+        emit OrderModified(orderId);
+    }
+
+    function fillOrder(
+        uint96 pendingOrderIdx,
+        uint96 orderId,
+        address target,
+        bytes calldata txData
+    ) external override {
+        
+        Order memory order = orders[orderId];
+
+        require(
+            order.orderId == pendingOrderIds[pendingOrderIdx],
+            ""Order Fill Mismatch""
+        );
+
+        
+        (uint256 amountOut, uint256 tokenInRefund) = execute(
+            target,
+            txData,
+            order
+        );
+
+        
+        
+        pendingOrderIds = ArrayMutation.removeFromArray(
+            pendingOrderIdx,
+            pendingOrderIds
+        );
+
+        
+        (uint256 feeAmount, uint256 adjustedAmount) = applyFee(
+            amountOut,
+            order.feeBips
+        );
+        if (feeAmount != 0) {
+            order.tokenOut.safeTransfer(address(MASTER), feeAmount);
+        }
+
+        
+        order.tokenOut.safeTransfer(order.recipient, adjustedAmount);
+
+        
+        
+        if (tokenInRefund != 0) {
+            order.tokenIn.safeTransfer(order.recipient, tokenInRefund);
+        }
+    }
+
+    function _cancelOrder(Order memory order) internal returns (bool) {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            if (pendingOrderIds[i] == order.orderId) {
+                
+                pendingOrderIds = ArrayMutation.removeFromArray(
+                    i,
+                    pendingOrderIds
+                );
+
+                
+                order.tokenIn.safeTransfer(order.recipient, order.amountIn);
+
+                
+                emit OrderCancelled(order.orderId);
+
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _modifyOrder(
+        uint96 orderId,
+        IERC20 _tokenOut,
+        uint256 amountInDelta,
+        uint256 _minAmountOut,
+        address _recipient,
+        bool increasePosition,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        
+        Order memory order = orders[orderId];
+
+        require(msg.sender == order.recipient, ""only order owner"");
+
+        
+        uint256 newAmountIn = order.amountIn;
+        if (amountInDelta != 0) {
+            if (increasePosition) {
+                
+                newAmountIn += amountInDelta;
+                procureTokens(
+                    order.tokenIn,
+                    amountInDelta,
+                    order.recipient,
+                    permit,
+                    permitPayload
+                );
+            } else {
+                
+                
+                require(amountInDelta < order.amountIn, ""invalid delta"");
+
+                
+                newAmountIn -= amountInDelta;
+
+                
+                order.tokenIn.safeTransfer(order.recipient, amountInDelta);
+            }
+        }
+
+        
+        Order memory newOrder = Order({
+            orderId: orderId,
+            tokenIn: order.tokenIn,
+            tokenOut: _tokenOut,
+            amountIn: newAmountIn,
+            minAmountOut: _minAmountOut,
+            feeBips: order.feeBips,
+            recipient: _recipient
+        });
+
+        
+        orders[orderId] = newOrder;
+    }
+
+    function execute(
+        address target,
+        bytes calldata txData,
+        Order memory order
+    ) internal returns (uint256 amountOut, uint256 tokenInRefund) {
+        
+        uint256 initialTokenIn = order.tokenIn.balanceOf(address(this));
+        uint256 initialTokenOut = order.tokenOut.balanceOf(address(this));
+
+        
+        order.tokenIn.safeApprove(target, order.amountIn);
+
+        
+        (bool success, bytes memory reason) = target.call(txData);
+
+        if (!success) {
+            revert TransactionFailed(reason);
+        }
+
+        uint256 finalTokenIn = order.tokenIn.balanceOf(address(this));
+        require(finalTokenIn >= initialTokenIn - order.amountIn, ""over spend"");
+        uint256 finalTokenOut = order.tokenOut.balanceOf(address(this));
+
+        require(
+            finalTokenOut - initialTokenOut > order.minAmountOut,
+            ""Too Little Received""
+        );
+
+        amountOut = finalTokenOut - initialTokenOut;
+        tokenInRefund = order.amountIn - (initialTokenIn - finalTokenIn);
+    }
+
+    function procureTokens(
+        IERC20 token,
+        uint256 amount,
+        address owner,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        if (permit) {
+            IAutomation.Permit2Payload memory payload = abi.decode(
+                permitPayload,
+                (IAutomation.Permit2Payload)
+            );
+
+            permit2.permit(owner, payload.permitSingle, payload.signature);
+            permit2.transferFrom(
+                owner,
+                address(this),
+                uint160(amount),
+                address(token)
+            );
+        } else {
+            token.safeTransferFrom(owner, address(this), amount);
+        }
+    }
+
+    
+    
+    function applyFee(
+        uint256 amount,
+        uint16 feeBips
+    ) internal pure returns (uint256 feeAmount, uint256 adjustedAmount) {
+        if (feeBips != 0) {
+            
+            adjustedAmount = (amount * (10000 - feeBips)) / 10000;
+            feeAmount = amount - adjustedAmount;
+        } else {
+            return (0, amount);
+        }
+    }
+}",1655,6,5,11,"Here is a concise list of vulnerabilities in the provided Solidity smart contract:
+
+1. **Reentrancy Risk**:
+   - While `ReentrancyGuard` is used, the `fillOrder` function involves token transfers (`safeTransfer`), external calls (`target.call`), and the removal of items from the `pendingOrderIds` array. The combination of these operations may still pose reentrancy risk if not carefully checked.
+
+2. **Approval Reset Attack in `execute`**:
+   - The `safeApprove` method can reset an already existing approval to the target. This could potentially introduce vulnerabilities if approvals are not well managed.
+
+3. **Lack of Access Control for `target.call`**:
+   - In `execute`, there is no validation or restriction on the `target` address. This allows any external contract to be called, which could lead to arbitrary code execution or exploit scenarios.
+
+4. **Unchecked External Call in `execute`**:
+   - The external call on `target.call(txData)` does not validate that the `target` is trustworthy. If an attacker supplies malicious data or targets a malicious contract, it could exploit this function.
+
+5. **Integer Overflow/Underflow Risks (Despite Solidity 0.8)**:
+   - Although Solidity 0.8+ has built-in overflow/underflow checks, explicit calculations like `newAmountIn += amountInDelta` or `newAmountIn -= amountInDelta` could still result in unexpected behaviors if not logically constrained.
+
+6. **Insufficient Validation of Inputs**:
+   - Input parameters like `amountInDelta` in `_modifyOrder` are not thoroughly validated. For example, `amountInDelta` combined with `increasePosition == false` may result in improper token balances.
+
+7. **Token Approval Mismanagement in `execute`**:
+   - Approval for `order.tokenIn` is granted to an arbitrary `target` with no revocation after the external call. This could lead to scenarios where the approved amount remains accessible.
+
+8. **Insecure Relying on External Libraries**:
+   - The contract imports and uses external libraries such as `ArrayMutation` and functions like `ArrayMutation.removeFromArray`. If the library contains vulnerabilities, it could have downstream effects.
+
+9. **Lack of Checks for Fee Bips Input**:
+   - The `feeBips` parameter is used directly in calculations without validation. There is no check ensuring that `feeBips` is in the valid range (e.g., `0 <= feeBips <= 10,000`).
+
+10. **Order Ownership Validation in `modifyOrder`**:
+    - The function allows modification of sensitive parameters like `amountInDelta` and `_minAmountOut`. Although there is ownership validation, the consequences of too relaxed updates may create unintended changes in order integrity.
+
+11. **Lack of Event Emissions in Critical Functions**:
+    - Functions like `_cancelOrder` and `_modifyOrder` directly update state but don’t emit adequate events for key modifications, making audit and tracking difficult.
+
+12. **Gas Inefficiency in For-Loops**:
+    - In multiple functions (e.g., `_cancelOrder`, `getPendingOrders`), for-loops iterate through the `pendingOrderIds` array, which can consume excessive gas for large arrays. This could make the contract uncallable if the array size grows significantly.
+
+13. **Lack of Fallback/Receive Functions**:
+    - The contract doesn’t have a `receive` or `fallback` function to handle accidental Ether transfers, making it impossible to recover Ether mistakenly sent to the contract.
+
+14. **Token Compatibility Assumptions**:
+    - The contract assumes that all tokens comply with the ERC20 standard. Non-standard tokens with custom behaviors (e.g., tokens charging fees or deflationary tokens) could break the contract.
+
+Addressing these vulnerabilities is essential to enhance the contract's security and functionality.","---
+
+### **[H-1] Unsafe Type Casting Leads to Fund Loss**
+
+**Report Description**:  
+Unsafe downcasting from `uint256` to `uint160` for token amounts allows an attacker to create an order with a large value while only paying a small, wrapped-around amount. They can then modify or cancel this order to drain funds from the contract.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of unsafe type casting or its potential impact. Solidity best practices dictate avoiding unsafe type casting, especially when dealing with user-supplied values, as it can lead to severe vulnerabilities like fund loss.
+
+---
+
+### **[H-2] Lack of Validation in `OracleLess` Allows Contract Draining**
+
+**Report Description**:  
+The contract lacks validation on `tokenIn`, `target`, and `txData`. An attacker can use a malicious `tokenIn` to create an order, then execute it against a legitimate contract like USDT with malicious `txData` to transfer the contract's entire balance to themselves.
+
+**Match in Response List**:  
+Matches with **""Lack of Access Control for `target.call`""** and **""Unchecked External Call in `execute`""**.
+
+**Validation**:  
+**Correct**. The response identifies the lack of validation for the `target` address and the unchecked external call in `execute`. These are critical components of the vulnerability described in the issue. Proper validation of `target` and `txData` is essential to prevent arbitrary code execution and fund theft.
+
+---
+
+### **[H-3] Reentrancy in OracleLess Allows Fund Theft**
+
+**Report Description**:  
+The `fillOrder()` and `modifyOrder()` functions are missing reentrancy guards. An attacker can re-enter `modifyOrder` from within a `fillOrder` call to steal funds by reducing their position size, receiving a refund, and parking the stolen funds in another order they control.
+
+**Match in Response List**:  
+Matches with **""Reentrancy Risk""**.
+
+**Validation**:  
+**Correct**. The response highlights the reentrancy risk in `fillOrder` due to token transfers, external calls, and array modifications. While `ReentrancyGuard` is mentioned, the response correctly notes that the combination of operations still poses a risk if not carefully managed.
+
+---
+
+### **[H-4] Modifying a Canceled Order Allows Double Withdrawal**
+
+**Report Description**:  
+The `modifyOrder` function does not check if an order is already canceled. An attacker can cancel an order to get a full refund, then call `modifyOrder` on the same canceled order to trigger a second refund, allowing them to withdraw tokens twice.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the lack of validation for canceled orders in `modifyOrder`. Solidity best practices require state checks to prevent double-spending or double-withdrawal scenarios.
+
+---
+
+### **[H-6] Unrevoked Approvals Can Be Used to Steal Funds**
+
+**Report Description**:  
+The `execute` function approves a target for the full `amountIn` but fails to revoke unused approval. A malicious target can use a small portion and later use the lingering approval to steal funds from subsequent user deposits.
+
+**Match in Response List**:  
+Matches with **""Token Approval Mismanagement in `execute`""**.
+
+**Validation**:  
+**Correct**. The response identifies the issue of lingering approvals in `execute` and the associated risks. Revoking unused approvals is a critical security measure to prevent unauthorized fund transfers.
+
+---
+
+### **[H-8] Insecure Use of `safeTransferFrom` Allows Theft of User Tokens**
+
+**Report Description**:  
+The `createOrder` and `modifyOrder` functions use a user-specified `recipient` as the `from` address in `safeTransferFrom`. An attacker can specify a victim's address and steal their tokens if the victim has a pre-existing approval for the contract.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the misuse of `safeTransferFrom` with a user-specified `recipient`. Solidity best practices require strict validation of user-supplied addresses to prevent unauthorized token transfers.
+
+---
+
+### **[M-5] In `OracleLess.createOrder()` Fee Bips Value Validation is Missing**
+
+**Report Description**:  
+The contract is missing input validation for `feeBips`. An attacker can create orders with `feeBips > 10000`, which will always revert on execution. These un-executable and potentially un-cancelable orders can be used to clog the order queue and DoS the system.
+
+**Match in Response List**:  
+Matches with **""Lack of Checks for Fee Bips Input""**.
+
+**Validation**:  
+**Correct**. The response identifies the lack of validation for `feeBips` and the associated risks. Input validation is a fundamental security measure to prevent DoS attacks and ensure contract functionality.
+
+---
+
+### **[M-6] A Malicious Attacker Can Create Many Orders That Are Not Cancelable**
+
+**Report Description**:  
+The contract does not whitelist tokens, allowing an attacker to create an order with a malicious token that reverts on transfers from the contract. This makes the order impossible for the admin to cancel, griefing the protocol.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the lack of token whitelisting or the potential for griefing attacks. Whitelisting tokens is a common practice to prevent malicious token behavior.
+
+---
+
+### **[M-8] Create Order Can Be DoSed as There Is No Compulsory Fee Collected During the Creation/Cancellation of Orders**
+
+**Report Description**:  
+The protocol does not charge fees for creating or canceling orders. This allows an attacker to spam the pending order array with a large number of junk orders at low cost, leading to a Denial of Service when iterating through the array.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the lack of fees for order creation/cancellation or the associated DoS risk. Charging fees is a standard mitigation for spam attacks.
+
+---
+
+### **[M-10] `cancelOrder` Can Be DoSed Due to Unbounded Loop**
+
+**Report Description**:  
+The `_cancelOrder` function uses an unbounded loop to find an order to remove. An attacker can fill the `pendingOrderIds` array with junk orders, making the gas cost to cancel any legitimate order exceed the block gas limit.
+
+**Match in Response List**:  
+Matches with **""Gas Inefficiency in For-Loops""**.
+
+**Validation**:  
+**Correct**. The response identifies the gas inefficiency in for-loops and the associated risks. Optimizing loop operations is essential to prevent DoS attacks and ensure contract usability.
+
+---
+
+### **[M-11] Malicious Users Can `createOrder` with 0 Amount and Make DoS for All**
+
+**Report Description**:  
+The `createOrder` function does not enforce a minimum `amountIn`. An attacker can create a huge number of zero-amount orders at very low cost, leading to a Denial of Service by bloating the pending orders array that must be iterated over.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the lack of a minimum `amountIn` or the associated DoS risk. Enforcing minimum values is a common practice to prevent spam and ensure efficient contract operation.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[H-2] Lack of Validation in `OracleLess` Allows Contract Draining**  
+- **[H-3] Reentrancy in OracleLess Allows Fund Theft**  
+- **[H-6] Unrevoked Approvals Can Be Used to Steal Funds**  
+- **[M-5] In `OracleLess.createOrder()` Fee Bips Value Validation is Missing**  
+- **[M-10] `cancelOrder` Can Be DoSed Due to Unbounded Loop**
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- **[H-1] Unsafe Type Casting Leads to Fund Loss**  
+- **[H-4] Modifying a Canceled Order Allows Double Withdrawal**  
+- **[H-8] Insecure Use of `safeTransferFrom` Allows Theft of User Tokens**  
+- **[M-6] A Malicious Attacker Can Create Many Orders That Are Not Cancelable**  
+- **[M-8] Create Order Can Be DoSed as There Is No Compulsory Fee Collected During the Creation/Cancellation of Orders**  
+- **[M-11] Malicious Users Can `createOrder` with 0 Amount and Make DoS for All**
+
+---"
+Bracket.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import ""./IAutomation.sol"";
+import ""../libraries/ArrayMutation.sol"";
+import ""../interfaces/uniswapV3/UniswapV3Pool.sol"";
+import ""../interfaces/uniswapV3/IPermit2.sol"";
+import ""../interfaces/uniswapV3/ISwapRouter02.sol"";
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../interfaces/openzeppelin/ReentrancyGuard.sol"";
+
+///@notice This contract owns and handles all logic associated with the following order types:
+/// BRACKET_ORDER - automated fill at a fixed takeProfit price OR stop price, with independant slippapge for each option
+/// LIMIT_ORDER - BRACKET_ORDER at specified take profit price, with STOP set to 0
+/// STOP_ORDER - BRACKET_ORDER at specified stop price, with take profit set to 2 ** 256 - 1
+/// In order to configure a LIMIT_ORDER or STOP_ORDER, simply set the take profit or stop price to either 0 for the lower bound or 2^256 - 1 for the upper bound
+contract Bracket is Ownable, IBracket, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IAutomationMaster public immutable MASTER;
+    IPermit2 public immutable permit2;
+
+    uint96[] public pendingOrderIds;
+
+    mapping(uint96 => Order) public orders;
+
+    constructor(IAutomationMaster _master, IPermit2 _permit2) {
+        MASTER = _master;
+        permit2 = _permit2;
+    }
+
+    function getPendingOrders() external view returns (uint96[] memory) {
+        return pendingOrderIds;
+    }
+
+    //check upkeep
+    function checkUpkeep(
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            Order memory order = orders[pendingOrderIds[i]];
+            (
+                bool inRange,
+                bool takeProfit,
+                uint256 exchangeRate
+            ) = checkInRange(order);
+            if (inRange) {
+                return (
+                    true,
+                    abi.encode(
+                        MasterUpkeepData({
+                            orderType: OrderType.BRACKET,
+                            target: address(this),
+                            txData: ""0x"",
+                            pendingOrderIdx: i,
+                            orderId: order.orderId,
+                            tokenIn: order.tokenIn,
+                            tokenOut: order.tokenOut,
+                            slippage: takeProfit
+                                ? order.takeProfitSlippage
+                                : order.stopSlippage, //bips based on take profit or stop fill
+                            amountIn: order.amountIn,
+                            exchangeRate: exchangeRate
+                        })
+                    )
+                );
+            }
+        }
+    }
+
+    ///@notice recipient of swap should be this contract,
+    ///as we need to account for tokens received.
+    ///This contract will then forward the tokens to the user
+    /// target refers to some contract where when we send @param performData,
+    ///that contract will exchange our tokenIn for tokenOut with at least minAmountReceived
+    /// pendingOrderIdx is the index of the pending order we are executing,
+    ///this pending order is removed from the array via array mutation
+    function performUpkeep(
+        bytes calldata performData
+    ) external override nonReentrant {
+        MasterUpkeepData memory data = abi.decode(
+            performData,
+            (MasterUpkeepData)
+        );
+        Order memory order = orders[pendingOrderIds[data.pendingOrderIdx]];
+
+        require(
+            order.orderId == pendingOrderIds[data.pendingOrderIdx],
+            ""Order Fill Mismatch""
+        );
+
+        //deduce if we are filling stop or take profit
+        (bool inRange, bool takeProfit, ) = checkInRange(order);
+        require(inRange, ""order ! in range"");
+
+        //deduce bips
+        uint16 bips;
+        takeProfit ? bips = order.takeProfitSlippage : bips = order
+            .stopSlippage;
+
+        (uint256 swapAmountOut, uint256 tokenInRefund) = execute(
+            data.target,
+            data.txData,
+            order.amountIn,
+            order.tokenIn,
+            order.tokenOut,
+            bips
+        );
+
+        //handle accounting
+        //remove from pending array
+        pendingOrderIds = ArrayMutation.removeFromArray(
+            data.pendingOrderIdx,
+            pendingOrderIds
+        );
+
+        //handle fee
+        (uint256 feeAmount, uint256 adjustedAmount) = applyFee(
+            swapAmountOut,
+            order.feeBips
+        );
+
+        if (feeAmount != 0) {
+            order.tokenOut.safeTransfer(address(MASTER), feeAmount);
+        }
+
+        //send tokenOut to recipient
+        order.tokenOut.safeTransfer(order.recipient, adjustedAmount);
+
+        //refund any unspent tokenIn
+        //this should generally be 0 when using exact input for swaps, which is recommended
+        if (tokenInRefund != 0) {
+            order.tokenIn.safeTransfer(order.recipient, tokenInRefund);
+        }
+
+        //emit
+        emit OrderProcessed(order.orderId);
+    }
+
+    function fillStopLimitOrder(
+        bytes calldata swapPayload,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 existingFeeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        require(
+            msg.sender == address(MASTER.STOP_LIMIT_CONTRACT()),
+            ""Only Stop Limit""
+        );
+        _initializeOrder(
+            swapPayload,
+            takeProfit,
+            stopPrice,
+            amountIn,
+            existingOrderId,
+            tokenIn,
+            tokenOut,
+            recipient,
+            existingFeeBips,
+            takeProfitSlippage,
+            stopSlippage,
+            permit,
+            permitPayload
+        );
+    }
+
+    ///@notice see @IBracket
+    function createOrder(
+        bytes calldata swapPayload,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        _initializeOrder(
+            swapPayload,
+            takeProfit,
+            stopPrice,
+            amountIn,
+            0, //no existing order id
+            tokenIn,
+            tokenOut,
+            recipient,
+            feeBips,
+            takeProfitSlippage,
+            stopSlippage,
+            permit,
+            permitPayload
+        );
+    }
+
+    ///@notice see @IBracket
+    function modifyOrder(
+        uint96 orderId,
+        uint256 _takeProfit,
+        uint256 _stopPrice,
+        uint256 amountInDelta,
+        IERC20 _tokenOut,
+        address _recipient,
+        uint16 _takeProfitSlippage,
+        uint16 _stopSlippage,
+        bool permit,
+        bool increasePosition,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        //get order
+        Order memory order = orders[orderId];
+
+        //only order owner
+        require(msg.sender == order.recipient, ""only order owner"");
+
+        //deduce any amountIn changes
+        uint256 newAmountIn = order.amountIn;
+        if (amountInDelta != 0) {
+            if (increasePosition) {
+                newAmountIn += amountInDelta;
+                //take funds via permit2
+                if (permit) {
+                    handlePermit(
+                        order.recipient,
+                        permitPayload,
+                        uint160(amountInDelta),
+                        address(order.tokenIn)
+                    );
+                } else {
+                    //legacy transfer, assume prior approval
+                    order.tokenIn.safeTransferFrom(
+                        order.recipient,
+                        address(this),
+                        amountInDelta
+                    );
+                }
+            } else {
+                //ensure delta is valid
+                require(amountInDelta < order.amountIn, ""invalid delta"");
+
+                //set new amountIn for accounting
+                newAmountIn -= amountInDelta;
+
+                //check min order size for new amount
+                MASTER.checkMinOrderSize(order.tokenIn, newAmountIn);
+
+                //refund position partially
+                order.tokenIn.safeTransfer(order.recipient, amountInDelta);
+            }
+        }
+
+        //check for oracles
+        if (_tokenOut != order.tokenOut) {
+            require(
+                address(MASTER.oracles(_tokenOut)) != address(0x0),
+                ""Oracle !exist""
+            );
+        }
+
+        //construct new order
+        Order memory newOrder = Order({
+            orderId: orderId,
+            takeProfit: _takeProfit,
+            stopPrice: _stopPrice,
+            amountIn: newAmountIn,
+            tokenIn: order.tokenIn,
+            tokenOut: _tokenOut,
+            feeBips: order.feeBips,
+            takeProfitSlippage: _takeProfitSlippage,
+            stopSlippage: _stopSlippage,
+            recipient: _recipient,
+            direction: MASTER.getExchangeRate(order.tokenIn, _tokenOut) >
+                _takeProfit
+        });
+
+        //store new order
+        orders[orderId] = newOrder;
+    }
+
+    ///@notice allow administrator to cancel any order
+    ///@notice once cancelled, any funds assocaiated with the order are returned to the order recipient
+    ///@notice only pending orders can be cancelled
+    function adminCancelOrder(uint96 orderId) external onlyOwner {
+        Order memory order = orders[orderId];
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    ///@notice only the order recipient can cancel their order
+    ///@notice only pending orders can be cancelled
+    function cancelOrder(uint96 orderId) external {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.recipient, ""Only Order Owner"");
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    function procureTokens(
+        IERC20 token,
+        uint256 amount,
+        address owner,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        if (permit) {
+            IAutomation.Permit2Payload memory payload = abi.decode(
+                permitPayload,
+                (IAutomation.Permit2Payload)
+            );
+
+            permit2.permit(owner, payload.permitSingle, payload.signature);
+            permit2.transferFrom(
+                owner,
+                address(this),
+                uint160(amount),
+                address(token)
+            );
+        } else {
+            token.safeTransferFrom(owner, address(this), amount);
+        }
+    }
+
+    function _initializeOrder(
+        bytes calldata swapPayload,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        //determine if we are doing a swap first
+        if (swapPayload.length != 0) {
+            SwapParams memory swapParams = abi.decode(
+                swapPayload,
+                (SwapParams)
+            );
+            //procure swap token in
+            procureTokens(
+                swapParams.swapTokenIn,
+                swapParams.swapAmountIn,
+                msg.sender,
+                permit,
+                permitPayload
+            );
+
+            _createOrderWithSwap(
+                swapParams,
+                takeProfit,
+                stopPrice,
+                existingOrderId,
+                tokenIn,
+                tokenOut,
+                recipient,
+                feeBips,
+                takeProfitSlippage,
+                stopSlippage
+            );
+        } else {
+            //no swap
+            procureTokens(tokenIn, amountIn, msg.sender, permit, permitPayload);
+
+            _createOrder(
+                takeProfit,
+                stopPrice,
+                amountIn,
+                existingOrderId,
+                tokenIn,
+                tokenOut,
+                recipient,
+                feeBips,
+                takeProfitSlippage,
+                stopSlippage
+            );
+        }
+    }
+
+    function _createOrderWithSwap(
+        SwapParams memory swapParams,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage
+    ) internal {
+        require(swapParams.swapSlippage <= 10000, ""BIPS > 10k"");
+
+        //execute the swap
+        (uint256 swapAmountOut, uint256 tokenInRefund) = execute(
+            swapParams.swapTarget,
+            swapParams.txData,
+            swapParams.swapAmountIn,
+            swapParams.swapTokenIn,
+            tokenIn,
+            swapParams.swapSlippage
+        );
+
+        _createOrder(
+            takeProfit,
+            stopPrice,
+            swapAmountOut,
+            existingOrderId,
+            tokenIn,
+            tokenOut,
+            recipient,
+            feeBips,
+            takeProfitSlippage,
+            stopSlippage
+        );
+        //refund any unspent tokenIn
+        //this should generally be 0 when using exact input for swaps, which is recommended
+        if (tokenInRefund != 0) {
+            swapParams.swapTokenIn.safeTransfer(recipient, tokenInRefund);
+        }
+    }
+
+    function _createOrder(
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage
+    ) internal {
+        //verify both oracles exist, as we need both to calc the exchange rate
+        require(
+            address(MASTER.oracles(tokenIn)) != address(0x0) &&
+                address(MASTER.oracles(tokenIn)) != address(0x0),
+            ""Oracle !exist""
+        );
+        require(
+            pendingOrderIds.length < MASTER.maxPendingOrders(),
+            ""Max Order Count Reached""
+        );
+        require(
+            stopSlippage <= 10000 &&
+                takeProfitSlippage <= 10000 &&
+                feeBips <= 10000,
+            ""BIPS > 10k""
+        );
+
+        MASTER.checkMinOrderSize(tokenIn, amountIn);
+
+        //generate random but unique order id if there is not an existing orderId from a stop limit order
+        if (existingOrderId == 0) {
+            existingOrderId = MASTER.generateOrderId(msg.sender);
+        }
+
+        //construct order
+        orders[existingOrderId] = Order({
+            orderId: existingOrderId,
+            takeProfit: takeProfit,
+            stopPrice: stopPrice,
+            amountIn: amountIn,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            recipient: recipient,
+            takeProfitSlippage: takeProfitSlippage,
+            feeBips: feeBips,
+            stopSlippage: stopSlippage,
+            direction: MASTER.getExchangeRate(tokenIn, tokenOut) > takeProfit //exchangeRate in/out > takeProfit
+        });
+
+        //store pending order
+        pendingOrderIds.push(existingOrderId);
+
+        emit OrderCreated(existingOrderId);
+    }
+
+    function _cancelOrder(Order memory order) internal returns (bool) {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            if (pendingOrderIds[i] == order.orderId) {
+                //remove from pending array
+                pendingOrderIds = ArrayMutation.removeFromArray(
+                    i,
+                    pendingOrderIds
+                );
+
+                //refund tokenIn amountIn to recipient
+                order.tokenIn.safeTransfer(order.recipient, order.amountIn);
+
+                //emit event
+                emit OrderCancelled(order.orderId);
+
+                return true;
+            }
+        }
+        return false;
+    }
+
+    ///@notice execute swap transaction
+    ///@param target is the contract to which we are sending @param txData to perform the swap
+    ///@param tokenIn is the token to sell for @param tokenOut
+    ///@param bips ensures that we received at least the minimum amount of @param tokenOut after the swap
+    function execute(
+        address target,
+        bytes memory txData,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint16 bips
+    ) internal returns (uint256 swapAmountOut, uint256 tokenInRefund) {
+        //update accounting
+        uint256 initialTokenIn = tokenIn.balanceOf(address(this));
+        uint256 initialTokenOut = tokenOut.balanceOf(address(this));
+
+        //approve
+        tokenIn.safeApprove(target, amountIn);
+
+        //perform the call
+        (bool success, bytes memory result) = target.call(txData);
+
+        if (success) {
+            uint256 finalTokenIn = tokenIn.balanceOf(address(this));
+            require(finalTokenIn >= initialTokenIn - amountIn, ""over spend"");
+            uint256 finalTokenOut = tokenOut.balanceOf(address(this));
+
+            //if success, we expect tokenIn balance to decrease by amountIn
+            //and tokenOut balance to increase by at least minAmountReceived
+            require(
+                finalTokenOut - initialTokenOut >
+                    MASTER.getMinAmountReceived(
+                        amountIn,
+                        tokenIn,
+                        tokenOut,
+                        bips
+                    ),
+                ""Too Little Received""
+            );
+
+            swapAmountOut = finalTokenOut - initialTokenOut;
+            tokenInRefund = amountIn - (initialTokenIn - finalTokenIn);
+        } else {
+            //force revert
+            revert TransactionFailed(result);
+        }
+    }
+
+    ///@notice handle signature and acquisition of asset with permit2
+    function handlePermit(
+        address owner,
+        bytes calldata permitPayload,
+        uint160 amount,
+        address token
+    ) internal {
+        Permit2Payload memory payload = abi.decode(
+            permitPayload,
+            (Permit2Payload)
+        );
+
+        permit2.permit(owner, payload.permitSingle, payload.signature);
+        permit2.transferFrom(owner, address(this), amount, token);
+    }
+    ///@notice determine @param order order is fillable
+    ///
+    function checkInRange(
+        Order memory order
+    )
+        internal
+        view
+        returns (bool inRange, bool takeProfit, uint256 exchangeRate)
+    {
+        exchangeRate = MASTER.getExchangeRate(order.tokenIn, order.tokenOut);
+        if (order.direction) {
+            //check for take profit price
+            if (exchangeRate <= order.takeProfit) {
+                return (true, true, exchangeRate);
+            }
+            //check for stop price
+            if (exchangeRate >= order.stopPrice) {
+                return (true, false, exchangeRate);
+            }
+        } else {
+            //check for take profit price
+            if (exchangeRate >= order.takeProfit) {
+                return (true, true, exchangeRate);
+            }
+            //check for stop price
+            if (exchangeRate <= order.stopPrice) {
+                return (true, false, exchangeRate);
+            }
+        }
+    }
+
+    ///@notice apply the protocol fee to @param amount
+    ///@notice fee is in the form of tokenOut after a successful performUpkeep
+    function applyFee(
+        uint256 amount,
+        uint16 feeBips
+    ) internal pure returns (uint256 feeAmount, uint256 adjustedAmount) {
+        if (feeBips != 0) {
+            //determine adjusted amount and fee amount
+            adjustedAmount = (amount * (10000 - feeBips)) / 10000;
+            feeAmount = amount - adjustedAmount;
+        } else {
+            return (0, amount);
+        }
+    }
+}","[H-1] Unsafe Type Casting Leads to Fund Loss Unsafe downcasting from `uint256` to `uint160` for token amounts allows an attacker to create an order with a large value while only paying a small, wrapped-around amount. They can then modify or cancel this order to drain funds from the contract.  [H-4] Modifying a Canceled Order Allows Double Withdrawal The `modifyOrder` function does not check if an order is already canceled. An attacker can cancel an order to get a full refund, then call `modifyOrder` on the same canceled order to trigger a second refund, allowing them to withdraw tokens twice.  [H-5] Excessive Approval Allows Bracket Contract to Drain StopLimit Contract When a `StopLimit` order is triggered, it gives the `Bracket` contract a nearly unlimited (`type(uint256).max`) approval to spend the `StopLimit` contract's tokens. An attacker can exploit this by creating a malicious order on the
+`Bracket` contract and, during `performUpkeep`, providing `txData` that uses the excessive approval to call `transferFrom` and pull all of the `StopLimit` contract's tokens into the `Bracket` contract, which are then sent to the attacker  [H-6] Unrevoked Approvals Can Be Used to Steal Funds The `execute` function approves a target for the full `amountIn` but fails to revoke unused approval. A malicious target can use a small portion and later use the lingering approval to steal funds from subsequent user deposits.  [H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens The `createOrder` and `modifyOrder` functions use a user-specified `recipient` as the `from` address in `safeTransferFrom`. An attacker can specify a victim's address and steal their tokens if the victim has a pre-existing approval for the contract.  [M-1] Bracket and StopLimit contracts are vulnerable to DoS attacks.  Orders created with USDT as `tokenIn` and `address(0)` as the `recipient` cannot be canceled because the USDT contract reverts on transfers to the zero address. This allows an attacker to fill the order queue with un-cancelable orders, causing a DoS.  [M-3] Order will be executed with wrong slippage if by the time of execution, price crosses take profit If the market price crosses an order's `takeProfit` threshold during the creation transaction, the order's `direction` is set incorrectly. This can cause the order to be executed later as a stop-loss, applying the wrong, potentially much larger, slippage.  [M-4] User can brick the `Bracket` contract by inputing malicious `txData` The use of an old OpenZeppelin version with a strict `safeApprove` allows an attacker to brick swapping for a specific token. By crafting a `txData` that leaves 1 wei of allowance, they can make all subsequent approval attempts for that token revert.  [M-7] Malicious User can Poison Bracket.sol with Blacklisted Accounts An attacker can create an order with a blacklisted address as the recipient (for tokens like USDC). The order cannot be canceled because the refund transfer will fail, allowing an attacker to fill the pending order queue with un-cancellable orders, causing a DoS.  [M-8] Create order can be DOSed as there is no compulsory fee collected during the creation/cancellation of orders The protocol does not charge fees for creating or canceling orders. This allows an attacker to spam the pending order array with a large number of junk orders at low cost, leading to a Denial of Service when iterating through the array.  [M-9] StopLimit order cannot be filled under certain condition An order that meets the minimum size requirement upon creation can become un-fillable if the token's value drops. When the `StopLimit` order triggers, the new `Bracket` order it creates may fail the same minimum size check, causing the fill to revert.",5,6,4225,630,"pragma solidity ^0.8.20;
+
+import ""./IAutomation.sol"";
+import ""../libraries/ArrayMutation.sol"";
+import ""../interfaces/uniswapV3/UniswapV3Pool.sol"";
+import ""../interfaces/uniswapV3/IPermit2.sol"";
+import ""../interfaces/uniswapV3/ISwapRouter02.sol"";
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../interfaces/openzeppelin/ReentrancyGuard.sol"";
+
+
+
+
+
+
+contract Bracket is Ownable, IBracket, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IAutomationMaster public immutable MASTER;
+    IPermit2 public immutable permit2;
+
+    uint96[] public pendingOrderIds;
+
+    mapping(uint96 => Order) public orders;
+
+    constructor(IAutomationMaster _master, IPermit2 _permit2) {
+        MASTER = _master;
+        permit2 = _permit2;
+    }
+
+    function getPendingOrders() external view returns (uint96[] memory) {
+        return pendingOrderIds;
+    }
+
+    
+    function checkUpkeep(
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            Order memory order = orders[pendingOrderIds[i]];
+            (
+                bool inRange,
+                bool takeProfit,
+                uint256 exchangeRate
+            ) = checkInRange(order);
+            if (inRange) {
+                return (
+                    true,
+                    abi.encode(
+                        MasterUpkeepData({
+                            orderType: OrderType.BRACKET,
+                            target: address(this),
+                            txData: ""0x"",
+                            pendingOrderIdx: i,
+                            orderId: order.orderId,
+                            tokenIn: order.tokenIn,
+                            tokenOut: order.tokenOut,
+                            slippage: takeProfit
+                                ? order.takeProfitSlippage
+                                : order.stopSlippage, 
+                            amountIn: order.amountIn,
+                            exchangeRate: exchangeRate
+                        })
+                    )
+                );
+            }
+        }
+    }
+
+    
+    
+    
+    
+    
+    
+    
+    function performUpkeep(
+        bytes calldata performData
+    ) external override nonReentrant {
+        MasterUpkeepData memory data = abi.decode(
+            performData,
+            (MasterUpkeepData)
+        );
+        Order memory order = orders[pendingOrderIds[data.pendingOrderIdx]];
+
+        require(
+            order.orderId == pendingOrderIds[data.pendingOrderIdx],
+            ""Order Fill Mismatch""
+        );
+
+        
+        (bool inRange, bool takeProfit, ) = checkInRange(order);
+        require(inRange, ""order ! in range"");
+
+        
+        uint16 bips;
+        takeProfit ? bips = order.takeProfitSlippage : bips = order
+            .stopSlippage;
+
+        (uint256 swapAmountOut, uint256 tokenInRefund) = execute(
+            data.target,
+            data.txData,
+            order.amountIn,
+            order.tokenIn,
+            order.tokenOut,
+            bips
+        );
+
+        
+        
+        pendingOrderIds = ArrayMutation.removeFromArray(
+            data.pendingOrderIdx,
+            pendingOrderIds
+        );
+
+        
+        (uint256 feeAmount, uint256 adjustedAmount) = applyFee(
+            swapAmountOut,
+            order.feeBips
+        );
+
+        if (feeAmount != 0) {
+            order.tokenOut.safeTransfer(address(MASTER), feeAmount);
+        }
+
+        
+        order.tokenOut.safeTransfer(order.recipient, adjustedAmount);
+
+        
+        
+        if (tokenInRefund != 0) {
+            order.tokenIn.safeTransfer(order.recipient, tokenInRefund);
+        }
+
+        
+        emit OrderProcessed(order.orderId);
+    }
+
+    function fillStopLimitOrder(
+        bytes calldata swapPayload,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 existingFeeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        require(
+            msg.sender == address(MASTER.STOP_LIMIT_CONTRACT()),
+            ""Only Stop Limit""
+        );
+        _initializeOrder(
+            swapPayload,
+            takeProfit,
+            stopPrice,
+            amountIn,
+            existingOrderId,
+            tokenIn,
+            tokenOut,
+            recipient,
+            existingFeeBips,
+            takeProfitSlippage,
+            stopSlippage,
+            permit,
+            permitPayload
+        );
+    }
+
+    
+    function createOrder(
+        bytes calldata swapPayload,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        _initializeOrder(
+            swapPayload,
+            takeProfit,
+            stopPrice,
+            amountIn,
+            0, 
+            tokenIn,
+            tokenOut,
+            recipient,
+            feeBips,
+            takeProfitSlippage,
+            stopSlippage,
+            permit,
+            permitPayload
+        );
+    }
+
+    
+    function modifyOrder(
+        uint96 orderId,
+        uint256 _takeProfit,
+        uint256 _stopPrice,
+        uint256 amountInDelta,
+        IERC20 _tokenOut,
+        address _recipient,
+        uint16 _takeProfitSlippage,
+        uint16 _stopSlippage,
+        bool permit,
+        bool increasePosition,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        
+        Order memory order = orders[orderId];
+
+        
+        require(msg.sender == order.recipient, ""only order owner"");
+
+        
+        uint256 newAmountIn = order.amountIn;
+        if (amountInDelta != 0) {
+            if (increasePosition) {
+                newAmountIn += amountInDelta;
+                
+                if (permit) {
+                    handlePermit(
+                        order.recipient,
+                        permitPayload,
+                        uint160(amountInDelta),
+                        address(order.tokenIn)
+                    );
+                } else {
+                    
+                    order.tokenIn.safeTransferFrom(
+                        order.recipient,
+                        address(this),
+                        amountInDelta
+                    );
+                }
+            } else {
+                
+                require(amountInDelta < order.amountIn, ""invalid delta"");
+
+                
+                newAmountIn -= amountInDelta;
+
+                
+                MASTER.checkMinOrderSize(order.tokenIn, newAmountIn);
+
+                
+                order.tokenIn.safeTransfer(order.recipient, amountInDelta);
+            }
+        }
+
+        
+        if (_tokenOut != order.tokenOut) {
+            require(
+                address(MASTER.oracles(_tokenOut)) != address(0x0),
+                ""Oracle !exist""
+            );
+        }
+
+        
+        Order memory newOrder = Order({
+            orderId: orderId,
+            takeProfit: _takeProfit,
+            stopPrice: _stopPrice,
+            amountIn: newAmountIn,
+            tokenIn: order.tokenIn,
+            tokenOut: _tokenOut,
+            feeBips: order.feeBips,
+            takeProfitSlippage: _takeProfitSlippage,
+            stopSlippage: _stopSlippage,
+            recipient: _recipient,
+            direction: MASTER.getExchangeRate(order.tokenIn, _tokenOut) >
+                _takeProfit
+        });
+
+        
+        orders[orderId] = newOrder;
+    }
+
+    
+    
+    
+    function adminCancelOrder(uint96 orderId) external onlyOwner {
+        Order memory order = orders[orderId];
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    
+    
+    function cancelOrder(uint96 orderId) external {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.recipient, ""Only Order Owner"");
+        require(_cancelOrder(order), ""Order not active"");
+    }
+
+    function procureTokens(
+        IERC20 token,
+        uint256 amount,
+        address owner,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        if (permit) {
+            IAutomation.Permit2Payload memory payload = abi.decode(
+                permitPayload,
+                (IAutomation.Permit2Payload)
+            );
+
+            permit2.permit(owner, payload.permitSingle, payload.signature);
+            permit2.transferFrom(
+                owner,
+                address(this),
+                uint160(amount),
+                address(token)
+            );
+        } else {
+            token.safeTransferFrom(owner, address(this), amount);
+        }
+    }
+
+    function _initializeOrder(
+        bytes calldata swapPayload,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        bool permit,
+        bytes calldata permitPayload
+    ) internal {
+        
+        if (swapPayload.length != 0) {
+            SwapParams memory swapParams = abi.decode(
+                swapPayload,
+                (SwapParams)
+            );
+            
+            procureTokens(
+                swapParams.swapTokenIn,
+                swapParams.swapAmountIn,
+                msg.sender,
+                permit,
+                permitPayload
+            );
+
+            _createOrderWithSwap(
+                swapParams,
+                takeProfit,
+                stopPrice,
+                existingOrderId,
+                tokenIn,
+                tokenOut,
+                recipient,
+                feeBips,
+                takeProfitSlippage,
+                stopSlippage
+            );
+        } else {
+            
+            procureTokens(tokenIn, amountIn, msg.sender, permit, permitPayload);
+
+            _createOrder(
+                takeProfit,
+                stopPrice,
+                amountIn,
+                existingOrderId,
+                tokenIn,
+                tokenOut,
+                recipient,
+                feeBips,
+                takeProfitSlippage,
+                stopSlippage
+            );
+        }
+    }
+
+    function _createOrderWithSwap(
+        SwapParams memory swapParams,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage
+    ) internal {
+        require(swapParams.swapSlippage <= 10000, ""BIPS > 10k"");
+
+        
+        (uint256 swapAmountOut, uint256 tokenInRefund) = execute(
+            swapParams.swapTarget,
+            swapParams.txData,
+            swapParams.swapAmountIn,
+            swapParams.swapTokenIn,
+            tokenIn,
+            swapParams.swapSlippage
+        );
+
+        _createOrder(
+            takeProfit,
+            stopPrice,
+            swapAmountOut,
+            existingOrderId,
+            tokenIn,
+            tokenOut,
+            recipient,
+            feeBips,
+            takeProfitSlippage,
+            stopSlippage
+        );
+        
+        
+        if (tokenInRefund != 0) {
+            swapParams.swapTokenIn.safeTransfer(recipient, tokenInRefund);
+        }
+    }
+
+    function _createOrder(
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        uint96 existingOrderId,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage
+    ) internal {
+        
+        require(
+            address(MASTER.oracles(tokenIn)) != address(0x0) &&
+                address(MASTER.oracles(tokenIn)) != address(0x0),
+            ""Oracle !exist""
+        );
+        require(
+            pendingOrderIds.length < MASTER.maxPendingOrders(),
+            ""Max Order Count Reached""
+        );
+        require(
+            stopSlippage <= 10000 &&
+                takeProfitSlippage <= 10000 &&
+                feeBips <= 10000,
+            ""BIPS > 10k""
+        );
+
+        MASTER.checkMinOrderSize(tokenIn, amountIn);
+
+        
+        if (existingOrderId == 0) {
+            existingOrderId = MASTER.generateOrderId(msg.sender);
+        }
+
+        
+        orders[existingOrderId] = Order({
+            orderId: existingOrderId,
+            takeProfit: takeProfit,
+            stopPrice: stopPrice,
+            amountIn: amountIn,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            recipient: recipient,
+            takeProfitSlippage: takeProfitSlippage,
+            feeBips: feeBips,
+            stopSlippage: stopSlippage,
+            direction: MASTER.getExchangeRate(tokenIn, tokenOut) > takeProfit 
+        });
+
+        
+        pendingOrderIds.push(existingOrderId);
+
+        emit OrderCreated(existingOrderId);
+    }
+
+    function _cancelOrder(Order memory order) internal returns (bool) {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            if (pendingOrderIds[i] == order.orderId) {
+                
+                pendingOrderIds = ArrayMutation.removeFromArray(
+                    i,
+                    pendingOrderIds
+                );
+
+                
+                order.tokenIn.safeTransfer(order.recipient, order.amountIn);
+
+                
+                emit OrderCancelled(order.orderId);
+
+                return true;
+            }
+        }
+        return false;
+    }
+
+    
+    
+    
+    
+    function execute(
+        address target,
+        bytes memory txData,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint16 bips
+    ) internal returns (uint256 swapAmountOut, uint256 tokenInRefund) {
+        
+        uint256 initialTokenIn = tokenIn.balanceOf(address(this));
+        uint256 initialTokenOut = tokenOut.balanceOf(address(this));
+
+        
+        tokenIn.safeApprove(target, amountIn);
+
+        
+        (bool success, bytes memory result) = target.call(txData);
+
+        if (success) {
+            uint256 finalTokenIn = tokenIn.balanceOf(address(this));
+            require(finalTokenIn >= initialTokenIn - amountIn, ""over spend"");
+            uint256 finalTokenOut = tokenOut.balanceOf(address(this));
+
+            
+            
+            require(
+                finalTokenOut - initialTokenOut >
+                    MASTER.getMinAmountReceived(
+                        amountIn,
+                        tokenIn,
+                        tokenOut,
+                        bips
+                    ),
+                ""Too Little Received""
+            );
+
+            swapAmountOut = finalTokenOut - initialTokenOut;
+            tokenInRefund = amountIn - (initialTokenIn - finalTokenIn);
+        } else {
+            
+            revert TransactionFailed(result);
+        }
+    }
+
+    
+    function handlePermit(
+        address owner,
+        bytes calldata permitPayload,
+        uint160 amount,
+        address token
+    ) internal {
+        Permit2Payload memory payload = abi.decode(
+            permitPayload,
+            (Permit2Payload)
+        );
+
+        permit2.permit(owner, payload.permitSingle, payload.signature);
+        permit2.transferFrom(owner, address(this), amount, token);
+    }
+    
+    
+    function checkInRange(
+        Order memory order
+    )
+        internal
+        view
+        returns (bool inRange, bool takeProfit, uint256 exchangeRate)
+    {
+        exchangeRate = MASTER.getExchangeRate(order.tokenIn, order.tokenOut);
+        if (order.direction) {
+            
+            if (exchangeRate <= order.takeProfit) {
+                return (true, true, exchangeRate);
+            }
+            
+            if (exchangeRate >= order.stopPrice) {
+                return (true, false, exchangeRate);
+            }
+        } else {
+            
+            if (exchangeRate >= order.takeProfit) {
+                return (true, true, exchangeRate);
+            }
+            
+            if (exchangeRate <= order.stopPrice) {
+                return (true, false, exchangeRate);
+            }
+        }
+    }
+
+    
+    
+    function applyFee(
+        uint256 amount,
+        uint16 feeBips
+    ) internal pure returns (uint256 feeAmount, uint256 adjustedAmount) {
+        if (feeBips != 0) {
+            
+            adjustedAmount = (amount * (10000 - feeBips)) / 10000;
+            feeAmount = amount - adjustedAmount;
+        } else {
+            return (0, amount);
+        }
+    }
+}",3403,5,6,11,"Here is a list of vulnerabilities in the provided Solidity smart contract:
+
+### 1. **Lack of Input Validation**
+   - Many public and external functions do not validate input parameters (e.g., `_initializeOrder`, `modifyOrder`, and `createOrder`).
+   - Parameters like `takeProfitSlippage`, `stopSlippage`, and `feeBips` assume a valid range, but inadequate checks may enable invalid or unsafe configurations.
+
+### 2. **Reentrancy Risks**
+   - Proper checks and the use of `nonReentrant` are present, but external calls (e.g., `safeTransfer`, `safeApprove`, and `call`) can still be vulnerable if third-party contracts (such as token contracts) have malicious behavior or poorly handled reentrancy protections.
+
+### 3. **Unchecked External Calls**
+   - `execute()` uses `target.call(txData)` to call external contracts without verifying the nature of the target or validating calldata.
+   - This allows arbitrary executions if the `target` is not carefully controlled, potentially leading to attacks.
+
+### 4. **Over-Approval of Tokens**
+   - The `safeApprove` function is called within `execute()` with the full `amountIn`. Repeated calls to this function without resetting to zero can result in approving more tokens than expected.
+
+### 5. **Oracle Dependency**
+   - Multiple functions rely on `MASTER.getExchangeRate()`. If the oracle data is tampered with, outdated, or manipulated by an attacker, it can lead to inaccurate execution outcomes.
+
+### 6. **Lack of Validation for Oracle Dependency**
+   - The contract does not validate the trustworthiness or accuracy of `MASTER.oracles()` when fetching token exchange rates.
+
+### 7. **Token Refund Logic**
+   - In `execute()`, `tokenInRefund` logic can be abused if unexpected token behavior (such as reentrancy within token contracts or altered balances) occurs.
+
+### 8. **Limited Admin Control**
+   - The owner can call `adminCancelOrder`, but no additional role-based access control exists. Functions such as `_cancelOrder` give the owner more control than intended without granular restrictions.
+
+### 9. **Unchecked Removal of Pending Orders**
+   - The `ArrayMutation.removeFromArray()` function is called directly without safeguards against invalid indexes, which could cause unexpected issues like skipped or incorrect index removals.
+
+### 10. **Permit Logic Risks**
+   - The `handlePermit()` function decodes external user-provided `permitPayload` and invokes transfers. This payload could contain malicious data if improperly verified or authenticated.
+
+### 11. **No Gas Limit for External Calls**
+   - External calls via `target.call(txData)` in `execute()` do not have an upper gas limit, allowing malicious external contracts to execute costly computations.
+
+### 12. **Missing Event for Critical State Changes**
+   - While there are some events (e.g., `OrderCreated` and `OrderCancelled`), other functions that involve critical actions, like token transfers or swaps (e.g., `execute()`), do not emit events to provide transparency.
+
+### 13. **No Emergency Stop Mechanism**
+   - The contract lacks a circuit breaker to pause in case of a vulnerability, malfunction, or attack.
+
+### 14. **Lack of Validation on Existing Order IDs**
+   - In functions like `_initializeOrder` and `_createOrder`, `existingOrderId` is either re-used or set to 0 without ensuring it doesn't conflict with pending orders.
+
+### 15. **Permit2 Integration Risks**
+   - `permit2.permit()` and `permit2.transferFrom()` are not validated for successful execution, potentially causing silent failures.
+
+### 16. **Potential Integer Arithmetic Issues**
+   - Although Solidity 0.8.x includes checked arithmetic, careful consideration should still be taken where values like `newAmountIn` involve recalculations and edge cases.
+
+### 17. **Improper Handling of Reverted `call`**
+   - In `execute()`, a reverted external call leads to `TransactionFailed(result)` being thrown, but the `result` decoding relies on assumptions about data formats, which could result in missing details.
+
+### 18. **Exposure of Internal Logic**
+   - Functions like `_cancelOrder`, `_createOrder`, and `_initializeOrder` are marked as `internal` but expose substantial control that could be misused if the contract allows delegate calls or is extended by untrusted child contracts.
+
+### 19. **Lack of Gas Optimization**
+   - Repeated use of storage elements (e.g., `orders[existingOrderId]`, `pendingOrderIds`) across multiple locations without caching increases gas costs unnecessarily.
+
+### 20. **Immutable Variables Reliance**
+   - Although `MASTER` and `permit2` are declared as `immutable`, relying fully on external contracts without offering the ability to upgrade or validate their behavior poses risks in cases where those dependencies fail or are compromised.
+
+### Recommendation Summary
+This contract contains potentially exploitable issues around validation, unchecked external calls, oracle dependencies, token approval, and insufficient event logging. Safeguards such as role-based control mechanisms, proper validation, gas optimization, and emergency controls are strongly recommended to improve overall contract security.","---
+
+### **[H-1] Unsafe Type Casting Leads to Fund Loss**
+
+**Report Description**:  
+Unsafe downcasting from `uint256` to `uint160` for token amounts allows an attacker to create an order with a large value while only paying a small, wrapped-around amount. They can then modify or cancel this order to drain funds from the contract.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the issue of unsafe type casting or its potential impact. Solidity best practices dictate avoiding unsafe downcasting unless explicitly validated to prevent overflow or truncation issues. This is a critical gap in the response list.
+
+---
+
+### **[H-4] Modifying a Canceled Order Allows Double Withdrawal**
+
+**Report Description**:  
+The `modifyOrder` function does not check if an order is already canceled. An attacker can cancel an order to get a full refund, then call `modifyOrder` on the same canceled order to trigger a second refund, allowing them to withdraw tokens twice.
+
+**Match in Response List**:  
+Matches partially with **""Lack of Validation on Existing Order IDs""**.
+
+**Validation**:  
+**Partially Correct.** The response identifies a related issue with the lack of validation on existing order IDs but does not explicitly address the specific vulnerability of modifying canceled orders. Solidity best practices require state validation checks to prevent re-entrance or double-spending scenarios.
+
+---
+
+### **[H-5] Excessive Approval Allows Bracket Contract to Drain StopLimit Contract**
+
+**Report Description**:  
+When a `StopLimit` order is triggered, it gives the `Bracket` contract a nearly unlimited (`type(uint256).max`) approval to spend the `StopLimit` contract's tokens. An attacker can exploit this by creating a malicious order on the `Bracket` contract and, during `performUpkeep`, providing `txData` that uses the excessive approval to call `transferFrom` and pull all of the `StopLimit` contract's tokens into the `Bracket` contract, which are then sent to the attacker.
+
+**Match in Response List**:  
+Matches with **""Over-Approval of Tokens""**.
+
+**Validation**:  
+**Correct.** The response accurately identifies the issue of over-approval of tokens and its associated risks. It aligns with Solidity best practices, which recommend resetting approvals to zero before re-approving to prevent excessive token allowances.
+
+---
+
+### **[H-6] Unrevoked Approvals Can Be Used to Steal Funds**
+
+**Report Description**:  
+The `execute` function approves a target for the full `amountIn` but fails to revoke unused approval. A malicious target can use a small portion and later use the lingering approval to steal funds from subsequent user deposits.
+
+**Match in Response List**:  
+Matches with **""Over-Approval of Tokens""**.
+
+**Validation**:  
+**Correct.** The response addresses the issue of lingering approvals and the associated risks. Solidity best practices recommend revoking unused approvals immediately after use to prevent unauthorized token transfers.
+
+---
+
+### **[H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens**
+
+**Report Description**:  
+The `createOrder` and `modifyOrder` functions use a user-specified `recipient` as the `from` address in `safeTransferFrom`. An attacker can specify a victim's address and steal their tokens if the victim has a pre-existing approval for the contract.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the misuse of `safeTransferFrom` or the risks of allowing user-specified `recipient` addresses. Solidity best practices require strict validation of user inputs, especially for sensitive operations like token transfers.
+
+---
+
+### **[M-1] Bracket and StopLimit Contracts Are Vulnerable to DoS Attacks**
+
+**Report Description**:  
+Orders created with USDT as `tokenIn` and `address(0)` as the `recipient` cannot be canceled because the USDT contract reverts on transfers to the zero address. This allows an attacker to fill the order queue with un-cancelable orders, causing a DoS.
+
+**Match in Response List**:  
+Matches partially with **""Lack of Input Validation""**.
+
+**Validation**:  
+**Partially Correct.** The response identifies the lack of input validation but does not explicitly address the specific issue of DoS caused by un-cancelable orders. Solidity best practices recommend validating all user inputs to prevent invalid or malicious configurations.
+
+---
+
+### **[M-3] Order Will Be Executed with Wrong Slippage**
+
+**Report Description**:  
+If the market price crosses an order's `takeProfit` threshold during the creation transaction, the order's `direction` is set incorrectly. This can cause the order to be executed later as a stop-loss, applying the wrong, potentially much larger, slippage.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the issue of incorrect slippage calculations or the risks of misconfigured order directions. Solidity best practices require robust validation of order parameters to ensure accurate execution.
+
+---
+
+### **[M-4] User Can Brick the `Bracket` Contract by Inputting Malicious `txData`**
+
+**Report Description**:  
+The use of an old OpenZeppelin version with a strict `safeApprove` allows an attacker to brick swapping for a specific token. By crafting a `txData` that leaves 1 wei of allowance, they can make all subsequent approval attempts for that token revert.
+
+**Match in Response List**:  
+Matches partially with **""Permit2 Integration Risks""**.
+
+**Validation**:  
+**Partially Correct.** The response identifies risks associated with `permit2` but does not explicitly address the issue of bricking the contract with malicious `txData`. Solidity best practices recommend using the latest library versions and validating external data to prevent such attacks.
+
+---
+
+### **[M-7] Malicious User Can Poison Bracket.sol with Blacklisted Accounts**
+
+**Report Description**:  
+An attacker can create an order with a blacklisted address as the recipient (for tokens like USDC). The order cannot be canceled because the refund transfer will fail, allowing an attacker to fill the pending order queue with un-cancelable orders, causing a DoS.
+
+**Match in Response List**:  
+Matches partially with **""Lack of Input Validation""**.
+
+**Validation**:  
+**Partially Correct.** The response identifies the lack of input validation but does not explicitly address the specific issue of blacklisted accounts causing a DoS. Solidity best practices recommend validating recipient addresses to prevent such scenarios.
+
+---
+
+### **[M-8] Create Order Can Be DoSed Due to Lack of Fees**
+
+**Report Description**:  
+The protocol does not charge fees for creating or canceling orders. This allows an attacker to spam the pending order array with a large number of junk orders at low cost, leading to a Denial of Service when iterating through the array.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the issue of DoS caused by the lack of fees. Solidity best practices recommend implementing economic disincentives, such as fees, to prevent spamming attacks.
+
+---
+
+### **[M-9] StopLimit Order Cannot Be Filled Under Certain Conditions**
+
+**Report Description**:  
+An order that meets the minimum size requirement upon creation can become un-fillable if the token's value drops. When the `StopLimit` order triggers, the new `Bracket` order it creates may fail the same minimum size check, causing the fill to revert.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the issue of un-fillable orders due to changing token values. Solidity best practices recommend dynamic validation of order parameters to account for market fluctuations.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[H-5] Excessive Approval Allows Bracket Contract to Drain StopLimit Contract**  
+- **[H-6] Unrevoked Approvals Can Be Used to Steal Funds**
+
+**Partially Correct Matches**:  
+- **[H-4] Modifying a Canceled Order Allows Double Withdrawal**  
+- **[M-1] Bracket and StopLimit Contracts Are Vulnerable to DoS Attacks**  
+- **[M-4] User Can Brick the `Bracket` Contract by Inputting Malicious `txData`**  
+- **[M-7] Malicious User Can Poison Bracket.sol with Blacklisted Accounts**
+
+**Missed Issues from Issue Report**:  
+- **[H-1] Unsafe Type Casting Leads to Fund Loss**  
+- **[H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens**  
+- **[M-3] Order Will Be Executed with Wrong Slippage**  
+- **[M-8] Create Order Can Be DoSed Due to Lack of Fees**  
+- **[M-9] StopLimit Order Cannot Be Filled Under Certain Conditions**
+
+---"
+StopLimit.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import ""./IAutomation.sol"";
+import ""../libraries/ArrayMutation.sol"";
+import ""../interfaces/uniswapV3/IPermit2.sol"";
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../interfaces/openzeppelin/ReentrancyGuard.sol"";
+
+///@notice This contract owns and handles all logic associated with STOP_LIMIT orders
+///STOP_LIMIT orders create a new Bracket order order with the same order ID once filled
+contract StopLimit is Ownable, IStopLimit, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IAutomationMaster public immutable MASTER;
+    IBracket public immutable BRACKET_CONTRACT;
+    IPermit2 public immutable permit2;
+
+    uint96[] public pendingOrderIds;
+
+    mapping(uint96 => Order) public orders;
+
+    constructor(
+        IAutomationMaster _master,
+        IBracket _bracket,
+        IPermit2 _permit2
+    ) {
+        MASTER = _master;
+        BRACKET_CONTRACT = _bracket;
+        permit2 = _permit2;
+    }
+
+    function getPendingOrders() external view returns (uint96[] memory) {
+        return pendingOrderIds;
+    }
+
+    ///@notice this should never be called inside of a write function due to high gas usage
+    function checkUpkeep(
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            Order memory order = orders[pendingOrderIds[i]];
+            (bool inRange, uint256 exchangeRate) = checkInRange(order);
+            if (inRange) {
+                return (
+                    true,
+                    abi.encode(
+                        MasterUpkeepData({
+                            orderType: OrderType.STOP_LIMIT,
+                            target: address(this),
+                            txData: order.swapOnFill
+                                ? abi.encodePacked(true)
+                                : abi.encodePacked(false), //specify if swapOnFill is true
+                            pendingOrderIdx: i,
+                            orderId: order.orderId,
+                            tokenIn: order.tokenIn,
+                            tokenOut: order.tokenOut,
+                            slippage: order.swapSlippage,
+                            amountIn: order.amountIn,
+                            exchangeRate: exchangeRate
+                        })
+                    )
+                );
+            }
+        }
+    }
+
+    function performUpkeep(
+        bytes calldata performData
+    ) external override nonReentrant {
+        MasterUpkeepData memory data = abi.decode(
+            performData,
+            (MasterUpkeepData)
+        );
+        Order memory order = orders[pendingOrderIds[data.pendingOrderIdx]];
+
+        require(
+            order.orderId == pendingOrderIds[data.pendingOrderIdx],
+            ""Order Fill Mismatch""
+        );
+
+        //confirm order is in range to prevent improper fill
+        (bool inRange, ) = checkInRange(order);
+        require(inRange, ""order ! in range"");
+
+        //remove from pending array
+        pendingOrderIds = ArrayMutation.removeFromArray(
+            data.pendingOrderIdx,
+            pendingOrderIds
+        );
+
+        //approve
+        updateApproval(
+            address(BRACKET_CONTRACT),
+            order.tokenIn,
+            order.amountIn
+        );
+
+        bytes memory swapPayload;
+        IERC20 tokenIn = order.tokenIn;
+        IERC20 tokenOut = order.tokenOut;
+        if (order.swapOnFill) {
+            //for swap on fill, we expect to be paid out in the same asset we provided
+            //so the resulting order tokenIn and tokenOut are inverted relative to our original swap limit order
+            SwapParams memory params = SwapParams({
+                swapTokenIn: order.tokenIn, //asset provided
+                swapAmountIn: order.amountIn,
+                swapTarget: data.target,
+                swapSlippage: order.swapSlippage,
+                txData: data.txData
+            });
+            swapPayload = abi.encode(params);
+
+            tokenIn = order.tokenOut;
+            tokenOut = order.tokenIn;
+        }
+
+        //create bracket order
+        BRACKET_CONTRACT.fillStopLimitOrder(
+            swapPayload,
+            order.takeProfit,
+            order.stopPrice,
+            order.amountIn,
+            order.orderId,
+            tokenIn,
+            tokenOut,
+            order.recipient,
+            order.feeBips,
+            order.takeProfitSlippage,
+            order.stopSlippage,
+            false, //permit
+            ""0x"" //permitPayload
+        );
+
+        emit OrderProcessed(order.orderId);
+    }
+
+    ///@notice see @IStopLimit
+    function createOrder(
+        uint256 stopLimitPrice,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        uint16 swapSlippage,
+        bool swapOnFill,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        if (permit) {
+            handlePermit(
+                recipient,
+                permitPayload,
+                uint160(amountIn),
+                address(tokenIn)
+            );
+        } else {
+            //take asset, assume prior approval
+            tokenIn.safeTransferFrom(recipient, address(this), amountIn);
+        }
+
+        _createOrder(
+            stopLimitPrice,
+            takeProfit,
+            stopPrice,
+            amountIn,
+            tokenIn,
+            tokenOut,
+            recipient,
+            feeBips,
+            takeProfitSlippage,
+            stopSlippage,
+            swapSlippage,
+            swapOnFill
+        );
+    }
+
+    ///@notice see @IStopLimit
+    function modifyOrder(
+        uint96 orderId,
+        uint256 _stopLimitPrice,
+        uint256 _takeProfit,
+        uint256 _stopPrice,
+        uint256 _amountInDelta,
+        IERC20 _tokenOut,
+        address _recipient,
+        uint16 _takeProfitSlippage,
+        uint16 _stopSlippage,
+        uint16 _swapSlippage,
+        bool _swapOnFill,
+        bool permit,
+        bool increasePosition,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        //get existing order
+        Order memory order = orders[orderId];
+        //only order owner
+        require(msg.sender == order.recipient, ""only order owner"");
+        //deduce any amountIn changes
+        uint256 newAmountIn = order.amountIn;
+        if (_amountInDelta != 0) {
+            if (increasePosition) {
+                newAmountIn += _amountInDelta;
+                //take funds via permit2
+                if (permit) {
+                    handlePermit(
+                        order.recipient,
+                        permitPayload,
+                        uint160(_amountInDelta),
+                        address(order.tokenIn)
+                    );
+                } else {
+                    //legacy transfer, assume prior approval
+                    order.tokenIn.safeTransferFrom(
+                        order.recipient,
+                        address(this),
+                        _amountInDelta
+                    );
+                }
+            } else {
+                //ensure delta is valid
+                require(_amountInDelta < order.amountIn, ""invalid delta"");
+
+                //set new amountIn for accounting
+                newAmountIn -= _amountInDelta;
+
+                //check min order size for new amount
+                MASTER.checkMinOrderSize(order.tokenIn, newAmountIn);
+
+                //refund position partially
+                order.tokenIn.safeTransfer(order.recipient, _amountInDelta);
+
+                //check slippage
+                require(
+                    _takeProfitSlippage <= 10000 &&
+                        _stopSlippage <= 10000 &&
+                        _swapSlippage <= 10000,
+                    ""BIPS > 10k""
+                );
+            }
+        }
+
+        //check for oracles
+        if (_tokenOut != order.tokenOut) {
+            require(
+                address(MASTER.oracles(_tokenOut)) != address(0x0),
+                ""Oracle !exist""
+            );
+        }
+
+        //construct order
+        Order memory newOrder = Order({
+            orderId: orderId,
+            stopLimitPrice: _stopLimitPrice,
+            takeProfit: _takeProfit,
+            stopPrice: _stopPrice,
+            amountIn: newAmountIn,
+            tokenIn: order.tokenIn,
+            tokenOut: _tokenOut,
+            feeBips: order.feeBips,
+            takeProfitSlippage: _takeProfitSlippage,
+            stopSlippage: _stopSlippage,
+            swapSlippage: _swapSlippage,
+            recipient: _recipient,
+            direction: MASTER.getExchangeRate(order.tokenIn, _tokenOut) >
+                _stopLimitPrice,
+            swapOnFill: _swapOnFill
+        });
+
+        //store new order
+        orders[orderId] = newOrder;
+    }
+
+    ///@notice contract owner can cancel any order
+    ///@notice cancelled orders refund the order recipient
+    function adminCancelOrder(uint96 orderId) external onlyOwner {
+        _cancelOrder(orderId);
+    }
+
+    ///@notice only the order recipient can cancel their order
+    ///@notice only pending orders can be cancelled
+    function cancelOrder(uint96 orderId) external {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.recipient, ""Only Order Owner"");
+        require(_cancelOrder(orderId), ""Order not active"");
+    }
+
+    function _createOrder(
+        uint256 stopLimitPrice,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        uint16 swapSlippage,
+        bool swapOnFill
+    ) internal {
+        //verify both oracles exist, as we need both to calc the exchange rate
+        require(
+            address(MASTER.oracles(tokenIn)) != address(0x0) &&
+                address(MASTER.oracles(tokenOut)) != address(0x0),
+            ""Oracle !exist""
+        );
+        require(
+            pendingOrderIds.length < MASTER.maxPendingOrders(),
+            ""Max Order Count Reached""
+        );
+        require(
+            takeProfitSlippage <= 10000 &&
+                stopSlippage <= 10000 &&
+                swapSlippage <= 10000 &&
+                feeBips <= 10000,
+            ""BIPS > 10k""
+        );
+
+        MASTER.checkMinOrderSize(tokenIn, amountIn);
+
+        uint96 orderId = MASTER.generateOrderId(msg.sender);
+
+        orders[orderId] = Order({
+            orderId: orderId,
+            stopLimitPrice: stopLimitPrice,
+            stopPrice: stopPrice,
+            takeProfit: takeProfit,
+            amountIn: amountIn,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            takeProfitSlippage: takeProfitSlippage,
+            feeBips: feeBips,
+            stopSlippage: stopSlippage,
+            swapSlippage: swapSlippage,
+            recipient: recipient,
+            direction: MASTER.getExchangeRate(tokenIn, tokenOut) >
+                stopLimitPrice, //compare to stop price for this order's direction
+            swapOnFill: swapOnFill
+        });
+        pendingOrderIds.push(uint96(orderId));
+        //emit
+        emit OrderCreated(orderId);
+    }
+
+    function _cancelOrder(uint96 orderId) internal returns (bool) {
+        Order memory order = orders[orderId];
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            if (pendingOrderIds[i] == orderId) {
+                //remove from pending array
+                pendingOrderIds = ArrayMutation.removeFromArray(
+                    i,
+                    pendingOrderIds
+                );
+                order.tokenIn.safeTransfer(order.recipient, order.amountIn);
+
+                //emit event
+                emit OrderCancelled(orderId);
+
+                //short circuit loop
+                return true;
+            }
+        }
+        return false;
+    }
+
+    ///@notice handle signature and acquisition of asset with permit2
+    function handlePermit(
+        address owner,
+        bytes calldata permitPayload,
+        uint160 amount,
+        address token
+    ) internal {
+        Permit2Payload memory payload = abi.decode(
+            permitPayload,
+            (Permit2Payload)
+        );
+
+        permit2.permit(owner, payload.permitSingle, payload.signature);
+        permit2.transferFrom(owner, address(this), amount, token);
+    }
+
+    ///@notice if current approval is insufficient, approve max
+    ///@notice oz safeIncreaseAllowance controls for tokens that require allowance to be reset to 0 before increasing again
+    function updateApproval(
+        address spender,
+        IERC20 token,
+        uint256 amount
+    ) internal {
+        // get current allowance
+        uint256 currentAllowance = token.allowance(address(this), spender);
+        if (currentAllowance < amount) {
+            // amount is a delta, so need to pass max - current to avoid overflow
+            token.safeIncreaseAllowance(
+                spender,
+                type(uint256).max - currentAllowance
+            );
+        }
+    }
+
+    ///@notice check if the order is fillable
+    function checkInRange(
+        Order memory order
+    ) internal view returns (bool inRange, uint256 exchangeRate) {
+        exchangeRate = MASTER.getExchangeRate(order.tokenIn, order.tokenOut);
+        if (order.direction) {
+            if (exchangeRate <= order.stopLimitPrice) {
+                inRange = true;
+            }
+        } else {
+            if (exchangeRate >= order.stopLimitPrice) {
+                inRange = true;
+            }
+        }
+    }
+}","[H-1] Unsafe Type Casting Leads to Fund Loss Unsafe downcasting from `uint256` to `uint160` for token amounts allows an attacker to create an order with a large value while only paying a small, wrapped-around amount. They can then modify or cancel this order to drain funds from the contract.  [H-4] Modifying a Canceled Order Allows Double Withdrawal The `modifyOrder` function does not check if an order is already canceled. An attacker can cancel an order to get a full refund, then call `modifyOrder` on the same canceled order to trigger a second refund, allowing them to withdraw tokens twice.  [H-5] Excessive Approval Allows Bracket Contract to Drain StopLimit Contract When a `StopLimit` order is triggered, it gives the `Bracket` contract a nearly unlimited (`type(uint256).max`) approval to spend the `StopLimit` contract's tokens. An attacker can exploit this by creating a malicious order on the
+`Bracket` contract and, during `performUpkeep`, providing `txData` that uses the excessive approval to call `transferFrom` and pull all of the `StopLimit` contract's tokens into the `Bracket` contract, which are then sent to the attacker.  [H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens The `createOrder` and `modifyOrder` functions use a user-specified `recipient` as the `from` address in `safeTransferFrom`. An attacker can specify a victim's address and steal their tokens if the victim has a pre-existing approval for the contract.  [M-1] Bracket and StopLimit contracts are vulnerable to DoS attacks.  Orders created with USDT as `tokenIn` and `address(0)` as the `recipient` cannot be canceled because the USDT contract reverts on transfers to the zero address. This allows an attacker to fill the order queue with un-cancelable orders, causing a DoS.  [M-8] Create order can be DOSed as there is no compulsory fee collected during the creation/cancellation of orders The protocol does not charge fees for creating or canceling orders. This allows an attacker to spam the pending order array with a large number of junk orders at low cost, leading to a Denial of Service when iterating through the array.  [M-9] StopLimit order cannot be filled under certain condition An order that meets the minimum size requirement upon creation can become un-fillable if the token's value drops. When the `StopLimit` order triggers, the new `Bracket` order it creates may fail the same minimum size check, causing the fill to revert.",4,3,2884,428,"pragma solidity ^0.8.20;
+
+import ""./IAutomation.sol"";
+import ""../libraries/ArrayMutation.sol"";
+import ""../interfaces/uniswapV3/IPermit2.sol"";
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../interfaces/openzeppelin/ReentrancyGuard.sol"";
+
+
+
+contract StopLimit is Ownable, IStopLimit, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IAutomationMaster public immutable MASTER;
+    IBracket public immutable BRACKET_CONTRACT;
+    IPermit2 public immutable permit2;
+
+    uint96[] public pendingOrderIds;
+
+    mapping(uint96 => Order) public orders;
+
+    constructor(
+        IAutomationMaster _master,
+        IBracket _bracket,
+        IPermit2 _permit2
+    ) {
+        MASTER = _master;
+        BRACKET_CONTRACT = _bracket;
+        permit2 = _permit2;
+    }
+
+    function getPendingOrders() external view returns (uint96[] memory) {
+        return pendingOrderIds;
+    }
+
+    
+    function checkUpkeep(
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            Order memory order = orders[pendingOrderIds[i]];
+            (bool inRange, uint256 exchangeRate) = checkInRange(order);
+            if (inRange) {
+                return (
+                    true,
+                    abi.encode(
+                        MasterUpkeepData({
+                            orderType: OrderType.STOP_LIMIT,
+                            target: address(this),
+                            txData: order.swapOnFill
+                                ? abi.encodePacked(true)
+                                : abi.encodePacked(false), 
+                            pendingOrderIdx: i,
+                            orderId: order.orderId,
+                            tokenIn: order.tokenIn,
+                            tokenOut: order.tokenOut,
+                            slippage: order.swapSlippage,
+                            amountIn: order.amountIn,
+                            exchangeRate: exchangeRate
+                        })
+                    )
+                );
+            }
+        }
+    }
+
+    function performUpkeep(
+        bytes calldata performData
+    ) external override nonReentrant {
+        MasterUpkeepData memory data = abi.decode(
+            performData,
+            (MasterUpkeepData)
+        );
+        Order memory order = orders[pendingOrderIds[data.pendingOrderIdx]];
+
+        require(
+            order.orderId == pendingOrderIds[data.pendingOrderIdx],
+            ""Order Fill Mismatch""
+        );
+
+        
+        (bool inRange, ) = checkInRange(order);
+        require(inRange, ""order ! in range"");
+
+        
+        pendingOrderIds = ArrayMutation.removeFromArray(
+            data.pendingOrderIdx,
+            pendingOrderIds
+        );
+
+        
+        updateApproval(
+            address(BRACKET_CONTRACT),
+            order.tokenIn,
+            order.amountIn
+        );
+
+        bytes memory swapPayload;
+        IERC20 tokenIn = order.tokenIn;
+        IERC20 tokenOut = order.tokenOut;
+        if (order.swapOnFill) {
+            
+            
+            SwapParams memory params = SwapParams({
+                swapTokenIn: order.tokenIn, 
+                swapAmountIn: order.amountIn,
+                swapTarget: data.target,
+                swapSlippage: order.swapSlippage,
+                txData: data.txData
+            });
+            swapPayload = abi.encode(params);
+
+            tokenIn = order.tokenOut;
+            tokenOut = order.tokenIn;
+        }
+
+        
+        BRACKET_CONTRACT.fillStopLimitOrder(
+            swapPayload,
+            order.takeProfit,
+            order.stopPrice,
+            order.amountIn,
+            order.orderId,
+            tokenIn,
+            tokenOut,
+            order.recipient,
+            order.feeBips,
+            order.takeProfitSlippage,
+            order.stopSlippage,
+            false, 
+            ""0x"" 
+        );
+
+        emit OrderProcessed(order.orderId);
+    }
+
+    
+    function createOrder(
+        uint256 stopLimitPrice,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        uint16 swapSlippage,
+        bool swapOnFill,
+        bool permit,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        if (permit) {
+            handlePermit(
+                recipient,
+                permitPayload,
+                uint160(amountIn),
+                address(tokenIn)
+            );
+        } else {
+            
+            tokenIn.safeTransferFrom(recipient, address(this), amountIn);
+        }
+
+        _createOrder(
+            stopLimitPrice,
+            takeProfit,
+            stopPrice,
+            amountIn,
+            tokenIn,
+            tokenOut,
+            recipient,
+            feeBips,
+            takeProfitSlippage,
+            stopSlippage,
+            swapSlippage,
+            swapOnFill
+        );
+    }
+
+    
+    function modifyOrder(
+        uint96 orderId,
+        uint256 _stopLimitPrice,
+        uint256 _takeProfit,
+        uint256 _stopPrice,
+        uint256 _amountInDelta,
+        IERC20 _tokenOut,
+        address _recipient,
+        uint16 _takeProfitSlippage,
+        uint16 _stopSlippage,
+        uint16 _swapSlippage,
+        bool _swapOnFill,
+        bool permit,
+        bool increasePosition,
+        bytes calldata permitPayload
+    ) external override nonReentrant {
+        
+        Order memory order = orders[orderId];
+        
+        require(msg.sender == order.recipient, ""only order owner"");
+        
+        uint256 newAmountIn = order.amountIn;
+        if (_amountInDelta != 0) {
+            if (increasePosition) {
+                newAmountIn += _amountInDelta;
+                
+                if (permit) {
+                    handlePermit(
+                        order.recipient,
+                        permitPayload,
+                        uint160(_amountInDelta),
+                        address(order.tokenIn)
+                    );
+                } else {
+                    
+                    order.tokenIn.safeTransferFrom(
+                        order.recipient,
+                        address(this),
+                        _amountInDelta
+                    );
+                }
+            } else {
+                
+                require(_amountInDelta < order.amountIn, ""invalid delta"");
+
+                
+                newAmountIn -= _amountInDelta;
+
+                
+                MASTER.checkMinOrderSize(order.tokenIn, newAmountIn);
+
+                
+                order.tokenIn.safeTransfer(order.recipient, _amountInDelta);
+
+                
+                require(
+                    _takeProfitSlippage <= 10000 &&
+                        _stopSlippage <= 10000 &&
+                        _swapSlippage <= 10000,
+                    ""BIPS > 10k""
+                );
+            }
+        }
+
+        
+        if (_tokenOut != order.tokenOut) {
+            require(
+                address(MASTER.oracles(_tokenOut)) != address(0x0),
+                ""Oracle !exist""
+            );
+        }
+
+        
+        Order memory newOrder = Order({
+            orderId: orderId,
+            stopLimitPrice: _stopLimitPrice,
+            takeProfit: _takeProfit,
+            stopPrice: _stopPrice,
+            amountIn: newAmountIn,
+            tokenIn: order.tokenIn,
+            tokenOut: _tokenOut,
+            feeBips: order.feeBips,
+            takeProfitSlippage: _takeProfitSlippage,
+            stopSlippage: _stopSlippage,
+            swapSlippage: _swapSlippage,
+            recipient: _recipient,
+            direction: MASTER.getExchangeRate(order.tokenIn, _tokenOut) >
+                _stopLimitPrice,
+            swapOnFill: _swapOnFill
+        });
+
+        
+        orders[orderId] = newOrder;
+    }
+
+    
+    
+    function adminCancelOrder(uint96 orderId) external onlyOwner {
+        _cancelOrder(orderId);
+    }
+
+    
+    
+    function cancelOrder(uint96 orderId) external {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.recipient, ""Only Order Owner"");
+        require(_cancelOrder(orderId), ""Order not active"");
+    }
+
+    function _createOrder(
+        uint256 stopLimitPrice,
+        uint256 takeProfit,
+        uint256 stopPrice,
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        address recipient,
+        uint16 feeBips,
+        uint16 takeProfitSlippage,
+        uint16 stopSlippage,
+        uint16 swapSlippage,
+        bool swapOnFill
+    ) internal {
+        
+        require(
+            address(MASTER.oracles(tokenIn)) != address(0x0) &&
+                address(MASTER.oracles(tokenOut)) != address(0x0),
+            ""Oracle !exist""
+        );
+        require(
+            pendingOrderIds.length < MASTER.maxPendingOrders(),
+            ""Max Order Count Reached""
+        );
+        require(
+            takeProfitSlippage <= 10000 &&
+                stopSlippage <= 10000 &&
+                swapSlippage <= 10000 &&
+                feeBips <= 10000,
+            ""BIPS > 10k""
+        );
+
+        MASTER.checkMinOrderSize(tokenIn, amountIn);
+
+        uint96 orderId = MASTER.generateOrderId(msg.sender);
+
+        orders[orderId] = Order({
+            orderId: orderId,
+            stopLimitPrice: stopLimitPrice,
+            stopPrice: stopPrice,
+            takeProfit: takeProfit,
+            amountIn: amountIn,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            takeProfitSlippage: takeProfitSlippage,
+            feeBips: feeBips,
+            stopSlippage: stopSlippage,
+            swapSlippage: swapSlippage,
+            recipient: recipient,
+            direction: MASTER.getExchangeRate(tokenIn, tokenOut) >
+                stopLimitPrice, 
+            swapOnFill: swapOnFill
+        });
+        pendingOrderIds.push(uint96(orderId));
+        
+        emit OrderCreated(orderId);
+    }
+
+    function _cancelOrder(uint96 orderId) internal returns (bool) {
+        Order memory order = orders[orderId];
+        for (uint96 i = 0; i < pendingOrderIds.length; i++) {
+            if (pendingOrderIds[i] == orderId) {
+                
+                pendingOrderIds = ArrayMutation.removeFromArray(
+                    i,
+                    pendingOrderIds
+                );
+                order.tokenIn.safeTransfer(order.recipient, order.amountIn);
+
+                
+                emit OrderCancelled(orderId);
+
+                
+                return true;
+            }
+        }
+        return false;
+    }
+
+    
+    function handlePermit(
+        address owner,
+        bytes calldata permitPayload,
+        uint160 amount,
+        address token
+    ) internal {
+        Permit2Payload memory payload = abi.decode(
+            permitPayload,
+            (Permit2Payload)
+        );
+
+        permit2.permit(owner, payload.permitSingle, payload.signature);
+        permit2.transferFrom(owner, address(this), amount, token);
+    }
+
+    
+    
+    function updateApproval(
+        address spender,
+        IERC20 token,
+        uint256 amount
+    ) internal {
+        
+        uint256 currentAllowance = token.allowance(address(this), spender);
+        if (currentAllowance < amount) {
+            
+            token.safeIncreaseAllowance(
+                spender,
+                type(uint256).max - currentAllowance
+            );
+        }
+    }
+
+    
+    function checkInRange(
+        Order memory order
+    ) internal view returns (bool inRange, uint256 exchangeRate) {
+        exchangeRate = MASTER.getExchangeRate(order.tokenIn, order.tokenOut);
+        if (order.direction) {
+            if (exchangeRate <= order.stopLimitPrice) {
+                inRange = true;
+            }
+        } else {
+            if (exchangeRate >= order.stopLimitPrice) {
+                inRange = true;
+            }
+        }
+    }
+}",2463,4,3,7,"The provided Solidity smart contract exhibits several potential vulnerabilities:
+
+1. **Reentrancy Risks**: 
+   - Even though the `performUpkeep`, `createOrder`, `modifyOrder`, and `cancelOrder` functions use `nonReentrant` modifiers, reentrancy risk might still exist in internal calls, e.g., `_cancelOrder` and interactions with external contracts, like `BRACKET_CONTRACT` and `permit2`.
+
+2. **Unchecked External Call Risks**:
+   - Calls to external contracts (`BRACKET_CONTRACT.fillStopLimitOrder`, `permit2.permit`, and `permit2.transferFrom`) are not properly checked for reversion, which can lead to unexpected consequences if those contracts misbehave.
+
+3. **Insufficient Approval Reset**:
+   - The `updateApproval` function never decreases allowances, which can cause issues in cases where a token is malicious or exploits allowance-related bugs (e.g., ERC20's double-spend vulnerability).
+
+4. **Lack of Rate-Limiting**:
+   - No mechanisms to prevent spamming or flooding functions like `createOrder` or `modifyOrder`. Malicious actors can potentially abuse these to cause denial-of-service (DOS) attacks by filling storage or gas-limit-bound processing of `pendingOrderIds`.
+
+5. **Oracle Manipulation Risk**:
+   - Reliance on exchange rates (`MASTER.getExchangeRate`) without adequate safeguards leaves the contract vulnerable to price manipulation, e.g., by an exploitable oracle or flash loan attacks.
+
+6. **Gas Consumption and DOS Risks**:
+   - In functions like `checkUpkeep` and `_cancelOrder`, the loop running on `pendingOrderIds` can become expensive or hit gas limits if the array becomes too large.
+   - Failure to properly limit or manage `pendingOrderIds` array size could cause `checkUpkeep` or `_cancelOrder` to fail.
+
+7. **Arithmetic Overflow/Underflow Risks**:
+   - Although Solidity 0.8+ has built-in overflow/underflow checks, unchecked `+=` and `-=` in `modifyOrder` could potentially lead to unexpected rollover behavior before these checks trigger.
+
+8. **Unchecked Token Transfers**:
+   - Usage of `token.safeTransfer` and `token.safeTransferFrom` with third-party tokens might fail unexpectedly if tokens deviate from the ERC20 standard, leading to potential fund losses.
+
+9. **Incorrect Order Direction Logic**:
+   - The direction (`order.direction`) logic depends solely on the initial rate comparison (`MASTER.getExchangeRate`) and `stopLimitPrice`. Fluctuations in rates over time may cause unintended behavior without revalidation.
+
+10. **Admin Cancelation Risks**:
+    - `adminCancelOrder` (accessible only by the contract owner) can cancel any order, posing a centralization risk that could be abused if the contract owner becomes malicious or compromised.
+
+11. **Permit2 Safety Assumptions**:
+    - Functions like `handlePermit` assume correctness of data passed to `permit2`. A poorly designed or maliciously implemented `permit2` contract could lead to unauthorized token transfers.
+
+12. **Emit OrderProcessed Function Outside Modifier**:
+    - Important events like `emit OrderProcessed` rely on internal state changes done before emitting the event, which might expose the system to out-of-sync event tracking in case of intervening reentrancy.
+
+13. **No Access Control for Critical Values**:
+    - Critical parameters like `MASTER`, `BRACKET_CONTRACT`, and `permit2` are set only once during deployment and cannot be updated. If any of these dependencies become compromised, the platform cannot recover.
+
+14. **Batched Transactions Exploitation**:
+    - Lack of atomic multi-call prevention means attackers may exploit batched transactions to stitch malicious behavior across functions, e.g., `modifyOrder` followed by `performUpkeep`.
+
+15. **Permit Input Validations**:
+    - The `permitPayload` in the `createOrder` and `modifyOrder` functions is not thoroughly validated, which can lead to errors or exploitation if improperly formatted.
+
+By addressing these vulnerabilities (e.g., tighter validations, proper loop management, improved access control, and dependency audits), the security of the contract could be significantly strengthened.","---
+
+### **[H-1] Unsafe Type Casting Leads to Fund Loss**
+
+**Report Description**:  
+Unsafe downcasting from `uint256` to `uint160` for token amounts allows an attacker to create an order with a large value while only paying a small, wrapped-around amount. They can then modify or cancel this order to drain funds from the contract.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of unsafe type casting or its potential impact. This is a critical vulnerability that should be explicitly identified and mitigated, as improper type casting can lead to severe financial losses. Solidity best practices recommend avoiding unsafe downcasting unless explicitly validated.
+
+---
+
+### **[H-4] Modifying a Canceled Order Allows Double Withdrawal**
+
+**Report Description**:  
+The `modifyOrder` function does not check if an order is already canceled. An attacker can cancel an order to get a full refund, then call `modifyOrder` on the same canceled order to trigger a second refund, allowing them to withdraw tokens twice.
+
+**Match in Response List**:  
+Matches with **""Batched Transactions Exploitation""**.
+
+**Validation**:  
+**Partially Correct**. While the response mentions the risk of exploiting batched transactions, it does not specifically address the issue of modifying canceled orders or the lack of a check for canceled status in `modifyOrder`. The response should explicitly highlight the need for state validation to prevent double withdrawals. Solidity best practices dictate that state transitions should be carefully validated to avoid such vulnerabilities.
+
+---
+
+### **[H-5] Excessive Approval Allows Bracket Contract to Drain StopLimit Contract**
+
+**Report Description**:  
+When a `StopLimit` order is triggered, it gives the `Bracket` contract a nearly unlimited (`type(uint256).max`) approval to spend the `StopLimit` contract's tokens. An attacker can exploit this by creating a malicious order on the `Bracket` contract and, during `performUpkeep`, providing `txData` that uses the excessive approval to call `transferFrom` and pull all of the `StopLimit` contract's tokens into the `Bracket` contract, which are then sent to the attacker.
+
+**Match in Response List**:  
+Matches with **""Insufficient Approval Reset""**.
+
+**Validation**:  
+**Correct**. The response correctly identifies the issue of excessive approvals and the associated risks. It highlights the need to reset or limit approvals to prevent malicious exploitation. This aligns with Solidity best practices, which recommend minimizing token approvals and resetting them to zero before granting new approvals.
+
+---
+
+### **[H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens**
+
+**Report Description**:  
+The `createOrder` and `modifyOrder` functions use a user-specified `recipient` as the `from` address in `safeTransferFrom`. An attacker can specify a victim's address and steal their tokens if the victim has a pre-existing approval for the contract.
+
+**Match in Response List**:  
+Matches with **""Unchecked Token Transfers""**.
+
+**Validation**:  
+**Partially Correct**. While the response mentions the risks of unchecked token transfers, it does not specifically address the issue of using a user-specified `recipient` in `safeTransferFrom`. The response should explicitly highlight the need for validation of user-specified addresses to prevent unauthorized token transfers. Solidity best practices recommend strict validation of user inputs to avoid such vulnerabilities.
+
+---
+
+### **[M-1] Bracket and StopLimit Contracts Are Vulnerable to DoS Attacks**
+
+**Report Description**:  
+Orders created with USDT as `tokenIn` and `address(0)` as the `recipient` cannot be canceled because the USDT contract reverts on transfers to the zero address. This allows an attacker to fill the order queue with un-cancelable orders, causing a DoS.
+
+**Match in Response List**:  
+Matches with **""Gas Consumption and DOS Risks""**.
+
+**Validation**:  
+**Partially Correct**. The response identifies general DoS risks related to gas consumption and large arrays but does not specifically address the issue of un-cancelable orders caused by the use of `address(0)` as the recipient. The response should explicitly recommend validating recipient addresses to prevent such scenarios. Solidity best practices emphasize the importance of input validation to avoid DoS vulnerabilities.
+
+---
+
+### **[M-8] Create Order Can Be DOSed as There Is No Compulsory Fee Collected During the Creation/Cancellation of Orders**
+
+**Report Description**:  
+The protocol does not charge fees for creating or canceling orders. This allows an attacker to spam the pending order array with a large number of junk orders at low cost, leading to a Denial of Service when iterating through the array.
+
+**Match in Response List**:  
+Matches with **""Lack of Rate-Limiting""**.
+
+**Validation**:  
+**Correct**. The response accurately identifies the lack of rate-limiting as a potential vulnerability and suggests the need for mechanisms to prevent spamming or flooding. This aligns with Solidity best practices, which recommend implementing rate-limiting or fee mechanisms to deter abuse.
+
+---
+
+### **[M-9] StopLimit Order Cannot Be Filled Under Certain Conditions**
+
+**Report Description**:  
+An order that meets the minimum size requirement upon creation can become un-fillable if the token's value drops. When the `StopLimit` order triggers, the new `Bracket` order it creates may fail the same minimum size check, causing the fill to revert.
+
+**Match in Response List**:  
+No match found.
+
+**Validation**:  
+**Incorrect**. The response list does not address the issue of orders becoming un-fillable due to token value fluctuations. This is a critical vulnerability that should be explicitly identified and mitigated. Solidity best practices recommend revalidating conditions before executing critical operations to ensure they remain valid.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[H-5] Excessive Approval Allows Bracket Contract to Drain StopLimit Contract**  
+- **[M-8] Create Order Can Be DOSed as There Is No Compulsory Fee Collected During the Creation/Cancellation of Orders**
+
+**Partially Correct Matches**:  
+- **[H-4] Modifying a Canceled Order Allows Double Withdrawal**  
+- **[H-8] Insecure Use of safeTransferFrom Allows Theft of User Tokens**  
+- **[M-1] Bracket and StopLimit Contracts Are Vulnerable to DoS Attacks**
+
+**Missed Issues from Issue Report**:  
+- **[H-1] Unsafe Type Casting Leads to Fund Loss**  
+- **[M-9] StopLimit Order Cannot Be Filled Under Certain Conditions**
+
+---"
+AutomationMaster.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import ""./IAutomation.sol"";
+import ""../libraries/ArrayMutation.sol"";
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/ERC20.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../oracle/IPythRelay.sol"";
+
+///@notice This contract owns and handles all of the settings and accounting logic for automated swaps
+///@notice This contract should not hold any user funds, only collected fees
+contract AutomationMaster is IAutomationMaster, Ownable {
+    using SafeERC20 for IERC20;
+
+    ///@notice maximum pending orders that may exist at a time, limiting the compute requriement for checkUpkeep
+    uint16 public maxPendingOrders;
+
+    ///@notice minumum USD value required to create a new order, in 1e8 terms
+    uint256 public minOrderSize;
+
+    ///sub keeper contracts
+    IStopLimit public STOP_LIMIT_CONTRACT;
+    IBracket public BRACKET_CONTRACT;
+
+    ///each token must have a registered oracle in order to be tradable
+    mapping(IERC20 => IPythRelay) public oracles;
+    mapping(IERC20 => bytes32) public pythIds;
+
+    ///@notice register Stop Limit and Bracket order contracts
+    function registerSubKeepers(
+        IStopLimit stopLimitContract,
+        IBracket bracketContract
+    ) external onlyOwner {
+        STOP_LIMIT_CONTRACT = stopLimitContract;
+        BRACKET_CONTRACT = bracketContract;
+    }
+
+    ///@notice Registered Oracles are expected to return the USD price in 1e8 terms
+    function registerOracle(
+        IERC20[] calldata _tokens,
+        IPythRelay[] calldata _oracles
+    ) external onlyOwner {
+        require(_tokens.length == _oracles.length, ""Array Length Mismatch"");
+        for (uint i = 0; i < _tokens.length; i++) {
+            oracles[_tokens[i]] = _oracles[i];
+        }
+    }
+
+    ///@notice set max pending orders, limiting checkUpkeep compute requirement
+    function setMaxPendingOrders(uint16 _max) external onlyOwner {
+        maxPendingOrders = _max;
+    }
+
+    ///@param usdValue must be in 1e8 terms
+    function setMinOrderSize(uint256 usdValue) external onlyOwner {
+        minOrderSize = usdValue;
+    }
+
+    ///@notice sweep the entire balance of @param token to the owner
+    ///@notice this contract should not hold funds other than collected fees,
+    ///which are forwarded here after each transaction
+    function sweep(IERC20 token) external onlyOwner {
+        token.safeTransfer(owner(), token.balanceOf(address(this)));
+    }
+
+    ///@notice Registered Oracles are expected to return the USD price in 1e8 terms
+    ///@return exchangeRate should always be in 1e8 terms
+    function getExchangeRate(
+        IERC20 tokenIn,
+        IERC20 tokenOut
+    ) external view override returns (uint256 exchangeRate) {
+        return _getExchangeRate(tokenIn, tokenOut);
+    }
+
+    function _getExchangeRate(
+        IERC20 tokenIn,
+        IERC20 tokenOut
+    ) internal view returns (uint256 exchangeRate) {
+        // Retrieve USD prices from oracles, scaled to 1e8
+        uint256 priceIn = oracles[tokenIn].currentValue();
+        uint256 priceOut = oracles[tokenOut].currentValue();
+
+        // Return the exchange rate in 1e8 terms
+        return (priceIn * 1e8) / priceOut;
+    }
+
+    ///@notice generate a random and unique order id
+    function generateOrderId(address sender) external view override returns (uint96) {
+        uint256 hashedValue = uint256(
+            keccak256(abi.encodePacked(sender, block.timestamp))
+        );
+        return uint96(hashedValue);
+    }
+
+    ///@notice compute minumum amount received
+    ///@return minAmountReceived is in @param tokenOut terms
+    ///@param slippageBips is in raw basis points
+    function getMinAmountReceived(
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint96 slippageBips
+    ) external view override returns (uint256 minAmountReceived) {
+        uint256 exchangeRate = _getExchangeRate(tokenIn, tokenOut);
+
+        // Adjust for decimal differences between tokens
+        uint256 adjustedAmountIn = adjustForDecimals(
+            amountIn,
+            tokenIn,
+            tokenOut
+        );
+
+        // Calculate the fair amount out without slippage
+        uint256 fairAmountOut = (adjustedAmountIn * exchangeRate) / 1e8;
+
+        // Apply slippage - 10000 bips is equivilant to 100% slippage
+        return (fairAmountOut * (10000 - slippageBips)) / 10000;
+    }
+
+    ///@notice account for token scale when computing token amounts based on slippage bips
+    function adjustForDecimals(
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut
+    ) internal view returns (uint256 adjustedAmountIn) {
+        uint8 decimalIn = ERC20(address(tokenIn)).decimals();
+        uint8 decimalOut = ERC20(address(tokenOut)).decimals();
+
+        if (decimalIn > decimalOut) {
+            // Reduce amountIn to match the lower decimals of tokenOut
+            return amountIn / (10 ** (decimalIn - decimalOut));
+        } else if (decimalIn < decimalOut) {
+            // Increase amountIn to match the higher decimals of tokenOut
+            return amountIn * (10 ** (decimalOut - decimalIn));
+        }
+        // If decimals are the same, no adjustment needed
+        return amountIn;
+    }
+
+    ///@notice determine if a new order meets the minimum order size requirement
+    ///Value of @param amountIn of @param tokenIn must meed the minimum USD value
+    function checkMinOrderSize(IERC20 tokenIn, uint256 amountIn) external view override {
+        uint256 currentPrice = oracles[tokenIn].currentValue();
+        uint256 usdValue = (currentPrice * amountIn) /
+            (10 ** ERC20(address(tokenIn)).decimals());
+
+        require(usdValue > minOrderSize, ""order too small"");
+    }
+
+    ///@notice check upkeep on all order types
+    function checkUpkeep(
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        //check stop limit order
+        (upkeepNeeded, performData) = STOP_LIMIT_CONTRACT.checkUpkeep(""0x"");
+        if (upkeepNeeded) {
+            return (true, performData);
+        }
+
+        //check bracket order
+        (upkeepNeeded, performData) = BRACKET_CONTRACT.checkUpkeep(""0x"");
+        if (upkeepNeeded) {
+            return (true, performData);
+        }
+    }
+
+    ///@notice perform upkeep on any order type
+    function performUpkeep(bytes calldata performData) external override {
+        //decode into masterUpkeepData
+        MasterUpkeepData memory data = abi.decode(
+            performData,
+            (MasterUpkeepData)
+        );
+
+        //if stop order, we directly pass the upkeep data to the stop order contract
+        if (data.orderType == OrderType.STOP_LIMIT) {
+            STOP_LIMIT_CONTRACT.performUpkeep(performData);
+        }
+
+        //if stop order, we directly pass the upkeep data to the stop order contract
+        if (data.orderType == OrderType.BRACKET) {
+            BRACKET_CONTRACT.performUpkeep(performData);
+        }
+    }
+}","[H-7] Order ID Collision Allows Double Refund and Fund Theft The `generateOrderId` function does not include the calling contract's address, allowing a user to create a `StopLimit` and `Bracket` order in the same block with the same ID. This collision allows the user to overwrite order data and then cancel the order twice for a double refund.  [M-9] StopLimit order cannot be filled under certain condition An order that meets the minimum size requirement upon creation can become un-fillable if the token's value drops. When the `StopLimit` order triggers, the new `Bracket` order it creates may fail the same minimum size check, causing the fill to revert.",1,1,1670,192,"pragma solidity ^0.8.19;
+
+import ""./IAutomation.sol"";
+import ""../libraries/ArrayMutation.sol"";
+import ""../interfaces/openzeppelin/Ownable.sol"";
+import ""../interfaces/openzeppelin/ERC20.sol"";
+import ""../interfaces/openzeppelin/IERC20.sol"";
+import ""../interfaces/openzeppelin/SafeERC20.sol"";
+import ""../oracle/IPythRelay.sol"";
+
+
+
+contract AutomationMaster is IAutomationMaster, Ownable {
+    using SafeERC20 for IERC20;
+
+    
+    uint16 public maxPendingOrders;
+
+    
+    uint256 public minOrderSize;
+
+    
+    IStopLimit public STOP_LIMIT_CONTRACT;
+    IBracket public BRACKET_CONTRACT;
+
+    
+    mapping(IERC20 => IPythRelay) public oracles;
+    mapping(IERC20 => bytes32) public pythIds;
+
+    
+    function registerSubKeepers(
+        IStopLimit stopLimitContract,
+        IBracket bracketContract
+    ) external onlyOwner {
+        STOP_LIMIT_CONTRACT = stopLimitContract;
+        BRACKET_CONTRACT = bracketContract;
+    }
+
+    
+    function registerOracle(
+        IERC20[] calldata _tokens,
+        IPythRelay[] calldata _oracles
+    ) external onlyOwner {
+        require(_tokens.length == _oracles.length, ""Array Length Mismatch"");
+        for (uint i = 0; i < _tokens.length; i++) {
+            oracles[_tokens[i]] = _oracles[i];
+        }
+    }
+
+    
+    function setMaxPendingOrders(uint16 _max) external onlyOwner {
+        maxPendingOrders = _max;
+    }
+
+    
+    function setMinOrderSize(uint256 usdValue) external onlyOwner {
+        minOrderSize = usdValue;
+    }
+
+    
+    
+    
+    function sweep(IERC20 token) external onlyOwner {
+        token.safeTransfer(owner(), token.balanceOf(address(this)));
+    }
+
+    
+    
+    function getExchangeRate(
+        IERC20 tokenIn,
+        IERC20 tokenOut
+    ) external view override returns (uint256 exchangeRate) {
+        return _getExchangeRate(tokenIn, tokenOut);
+    }
+
+    function _getExchangeRate(
+        IERC20 tokenIn,
+        IERC20 tokenOut
+    ) internal view returns (uint256 exchangeRate) {
+        
+        uint256 priceIn = oracles[tokenIn].currentValue();
+        uint256 priceOut = oracles[tokenOut].currentValue();
+
+        
+        return (priceIn * 1e8) / priceOut;
+    }
+
+    
+    function generateOrderId(address sender) external view override returns (uint96) {
+        uint256 hashedValue = uint256(
+            keccak256(abi.encodePacked(sender, block.timestamp))
+        );
+        return uint96(hashedValue);
+    }
+
+    
+    
+    
+    function getMinAmountReceived(
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut,
+        uint96 slippageBips
+    ) external view override returns (uint256 minAmountReceived) {
+        uint256 exchangeRate = _getExchangeRate(tokenIn, tokenOut);
+
+        
+        uint256 adjustedAmountIn = adjustForDecimals(
+            amountIn,
+            tokenIn,
+            tokenOut
+        );
+
+        
+        uint256 fairAmountOut = (adjustedAmountIn * exchangeRate) / 1e8;
+
+        
+        return (fairAmountOut * (10000 - slippageBips)) / 10000;
+    }
+
+    
+    function adjustForDecimals(
+        uint256 amountIn,
+        IERC20 tokenIn,
+        IERC20 tokenOut
+    ) internal view returns (uint256 adjustedAmountIn) {
+        uint8 decimalIn = ERC20(address(tokenIn)).decimals();
+        uint8 decimalOut = ERC20(address(tokenOut)).decimals();
+
+        if (decimalIn > decimalOut) {
+            
+            return amountIn / (10 ** (decimalIn - decimalOut));
+        } else if (decimalIn < decimalOut) {
+            
+            return amountIn * (10 ** (decimalOut - decimalIn));
+        }
+        
+        return amountIn;
+    }
+
+    
+    
+    function checkMinOrderSize(IERC20 tokenIn, uint256 amountIn) external view override {
+        uint256 currentPrice = oracles[tokenIn].currentValue();
+        uint256 usdValue = (currentPrice * amountIn) /
+            (10 ** ERC20(address(tokenIn)).decimals());
+
+        require(usdValue > minOrderSize, ""order too small"");
+    }
+
+    
+    function checkUpkeep(
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        
+        (upkeepNeeded, performData) = STOP_LIMIT_CONTRACT.checkUpkeep(""0x"");
+        if (upkeepNeeded) {
+            return (true, performData);
+        }
+
+        
+        (upkeepNeeded, performData) = BRACKET_CONTRACT.checkUpkeep(""0x"");
+        if (upkeepNeeded) {
+            return (true, performData);
+        }
+    }
+
+    
+    function performUpkeep(bytes calldata performData) external override {
+        
+        MasterUpkeepData memory data = abi.decode(
+            performData,
+            (MasterUpkeepData)
+        );
+
+        
+        if (data.orderType == OrderType.STOP_LIMIT) {
+            STOP_LIMIT_CONTRACT.performUpkeep(performData);
+        }
+
+        
+        if (data.orderType == OrderType.BRACKET) {
+            BRACKET_CONTRACT.performUpkeep(performData);
+        }
+    }
+}",1141,1,1,2,"The Solidity smart contract provided has the following vulnerabilities and issues:
+
+---
+
+1. **Lack of Input Validation**, multiple functions:
+   - `registerOracle` and `registerSubKeepers`: These functions lack extensive validation against invalid inputs or misconfigurations. For example, ensuring `stopLimitContract` or `bracketContract` is not `address(0)` and verifying the every `_oracle` address in `registerOracle` is legitimate.
+   - Anticipating data-point VALIDITY layers isn't embedded..  
+  
+
+","---
+
+### **[H-7] Order ID Collision Allows Double Refund and Fund Theft**
+
+**Report Description**:  
+The `generateOrderId` function does not include the calling contract's address, which allows a user to create both a `StopLimit` and a `Bracket` order in the same block with the same ID. This ID collision enables the user to overwrite order data and subsequently cancel the order twice, resulting in a double refund. This vulnerability could lead to fund theft and disrupt the integrity of the system.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the issue of order ID collisions or the associated risks of double refunds and fund theft. The provided responses focus on input validation for unrelated functions (`registerOracle` and `registerSubKeepers`) and do not mention the `generateOrderId` function or the need to include unique identifiers (e.g., the calling contract's address) to prevent ID collisions. This is a critical oversight, as the issue directly impacts the security and functionality of the contract.
+
+---
+
+### **[M-9] StopLimit Order Cannot Be Filled Under Certain Conditions**
+
+**Report Description**:  
+An order that meets the minimum size requirement upon creation can become unfillable if the token's value drops. When the `StopLimit` order triggers, the new `Bracket` order it creates may fail the same minimum size check, causing the fill to revert. This issue can lead to user frustration and operational inefficiencies, as valid orders may become unfillable due to external market conditions.
+
+**Match in Response List**:  
+**No match found.**
+
+**Validation**:  
+**Incorrect.** The response list does not address the issue of `StopLimit` orders becoming unfillable due to token value fluctuations. The responses focus on input validation for unrelated functions and do not mention the need for dynamic checks or adjustments to account for changing token values. This is a significant gap, as the issue directly affects the usability and reliability of the contract.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- *None*
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- **[H-7] Order ID Collision Allows Double Refund and Fund Theft**  
+- **[M-9] StopLimit Order Cannot Be Filled Under Certain Conditions**
+
+---
+
+### **Recommendations for Improvement**
+
+1. **Address Order ID Collisions**:  
+   - Include the calling contract's address in the `generateOrderId` function to ensure unique order IDs across different contracts. This will prevent ID collisions and eliminate the risk of double refunds.
+
+2. **Handle Token Value Fluctuations**:  
+   - Implement dynamic checks or adjustments to ensure that `StopLimit` and `Bracket` orders remain valid even if token values change. For example, allow for a buffer or tolerance in the minimum size requirement to account for market volatility.
+
+3. **Expand Response Coverage**:  
+   - Ensure that the response list comprehensively addresses all reported issues, including those related to order management and market conditions. This will improve the overall security and functionality of the contract.
+
+---"
+PythOracle.sol,"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.9;
+
+import ""../IPythRelay.sol"";
+import ""../../interfaces/pyth/IPyth.sol"";
+
+
+contract PythOracle is IPythRelay {
+    IPyth public immutable pythOracle;
+    bytes32 public immutable tokenId;
+    uint256 public immutable noOlderThan;
+    address public immutable underlying;
+
+    constructor(
+        IPyth _pythOraclContract,
+        bytes32 _tokenId,
+        uint256 _noOlderThan,
+        address _underlying
+    ) {
+        pythOracle = _pythOraclContract;
+        tokenId = _tokenId;
+        noOlderThan = _noOlderThan;
+        underlying = _underlying;
+    }
+
+    function currentValue() external view override returns (uint256) {
+        IPyth.Price memory price = pythOracle.getPriceUnsafe(tokenId);
+        require(
+            price.publishTime < block.timestamp - noOlderThan,
+            ""Stale Price""
+        );
+        return uint256(uint64(price.price));
+    }
+
+    function updatePrice(
+        bytes[] calldata priceUpdate
+    ) external payable override returns (uint256 updatedPrice) {
+        // Submit a priceUpdate to the Pyth contract to update the on-chain price.
+        // Updating the price requires paying the fee returned by getUpdateFee.
+        // WARNING: These lines are required to ensure the getPriceNoOlderThan call below succeeds. If you remove them, transactions may fail with ""0x19abf40e"" error.
+        uint fee = pythOracle.getUpdateFee(priceUpdate);
+        pythOracle.updatePriceFeeds{value: fee}(priceUpdate);
+
+        IPyth.Price memory price = pythOracle.getPriceNoOlderThan(
+            tokenId,
+            uint256(uint64(noOlderThan))
+        );
+        updatedPrice = uint256(uint64(price.price));
+    }
+
+    function getUpdateFee(bytes[] calldata priceUpdate) external view override returns (uint fee){
+        return pythOracle.getUpdateFee(priceUpdate);
+    }
+}","[M-2] Incorrect Freshness Logic Validation in PythOracle breaking the entire mechanism for triggering orders An incorrect comparison (`<` instead of `>=`) in the price feed's freshness check causes all oracle prices to be considered stale, preventing any time-sensitive orders from ever being executed.",0,1,422,54,"pragma solidity ^0.8.9;
+
+import ""../IPythRelay.sol"";
+import ""../../interfaces/pyth/IPyth.sol"";
+
+
+contract PythOracle is IPythRelay {
+    IPyth public immutable pythOracle;
+    bytes32 public immutable tokenId;
+    uint256 public immutable noOlderThan;
+    address public immutable underlying;
+
+    constructor(
+        IPyth _pythOraclContract,
+        bytes32 _tokenId,
+        uint256 _noOlderThan,
+        address _underlying
+    ) {
+        pythOracle = _pythOraclContract;
+        tokenId = _tokenId;
+        noOlderThan = _noOlderThan;
+        underlying = _underlying;
+    }
+
+    function currentValue() external view override returns (uint256) {
+        IPyth.Price memory price = pythOracle.getPriceUnsafe(tokenId);
+        require(
+            price.publishTime < block.timestamp - noOlderThan,
+            ""Stale Price""
+        );
+        return uint256(uint64(price.price));
+    }
+
+    function updatePrice(
+        bytes[] calldata priceUpdate
+    ) external payable override returns (uint256 updatedPrice) {
+        
+        
+        
+        uint fee = pythOracle.getUpdateFee(priceUpdate);
+        pythOracle.updatePriceFeeds{value: fee}(priceUpdate);
+
+        IPyth.Price memory price = pythOracle.getPriceNoOlderThan(
+            tokenId,
+            uint256(uint64(noOlderThan))
+        );
+        updatedPrice = uint256(uint64(price.price));
+    }
+
+    function getUpdateFee(bytes[] calldata priceUpdate) external view override returns (uint fee){
+        return pythOracle.getUpdateFee(priceUpdate);
+    }
+}",343,0,1,1,"The following are vulnerabilities and issues in the provided Solidity contract:
+
+1. **Reentrancy Risk in `updatePrice`:**
+   - The function allows Ether to be sent (`payable`) and interacts with an external contract (`pythOracle`) using untrusted data (`priceUpdate`). If the external contract has malicious behavior or improper handling, it might lead to reentrancy attacks. This can further compromise the state or Ether balance during the execution.
+
+2. **Stale Price Validation Logic in `currentValue`:**
+   - The `require` condition incorrectly checks for stale prices. The condition `price.publishTime < block.timestamp - noOlderThan` is inverted. It should be `price.publishTime >= block.timestamp - noOlderThan` to ensure the price is not too old.
+
+3. **Unchecked Return Values from `pythOracle`:**
+   - The contract assumes `pythOracle.getPriceUnsafe`, `pythOracle.getPriceNoOlderThan`, and `pythOracle.updatePriceFeeds` behave as expected without errors. If the `pythOracle` implementation is flawed, it could provide invalid or malicious data, compromising the contract.
+
+4. **Possible Overflow in `noOlderThan`:**
+   - The `noOlderThan` value is cast from `uint256` to `uint64` in `getPriceNoOlderThan`. If `noOlderThan` exceeds the maximum value of `uint64`, it will cause an implicit data loss, which could lead to unintended behavior.
+
+5. **Hardcoded `uint64` Cast for Price Data:**
+   - The price values (`price.price`) are cast to `uint64` before converting to `uint256`. If the price exceeds the maximum value of `uint64`, it can result in truncation or incorrect results.
+
+6. **Misaligned Immutable Variables with Constructor Parameters:**
+   - The constructor sets critical variables such as `pythOracle`, `tokenId`, `noOlderThan`, and `underlying` without performing sanity checks (e.g., checking for zero address or invalid values), which may lead to deployment with invalid or incorrect configurations.
+
+7. **Fee Mismatch in `updatePrice`:**
+   - The contract calculates a fee using `pythOracle.getUpdateFee(priceUpdate)` but does not validate whether enough Ether is sent by the caller (`msg.value`) to cover the fee. This could result in underfunded calls or unexpected behavior.
+
+8. **Lack of Access Control:**
+   - Any external address can call `updatePrice` and manipulate the price feed updates. This system lacks access control to restrict who can trigger price updates, leaving the contract open to abuse or unexpected usage.
+
+9. **External Dependency Risk:**
+   - The contract depends entirely on the external `pythOracle`, which could introduce vulnerabilities if the external contract behaves unexpectedly, is upgraded with malicious logic, or becomes non-functional.
+
+10. **Lack of Event Emissions:**
+    - The contract does not emit events for significant actions such as updates to the price (`updatePrice`). This lack of logging hampers traceability and monitoring in production.
+
+11. **Gas Inefficiency in `getUpdateFee`:**
+    - The function receives and returns the fee directly through a single delegate call to `pythOracle.getUpdateFee`. While functional, this adds unnecessary overhead and can be optimized.
+
+### Summary
+The contract requires:
+- Fixing the stale price validation logic.
+- Adding reentrancy protection.
+- Validating constructor inputs.
+- Introducing access controls for critical functions.
+- Performing proper checks for type conversions and external calls.
+- Emitting events for state-changing functions.","---
+
+### **[M-2] Incorrect Freshness Logic Validation in PythOracle breaking the entire mechanism for triggering orders**
+
+**Report Description**:  
+The issue arises from an incorrect comparison in the price feed's freshness check. Specifically, the condition uses `<` instead of `>=`, causing all oracle prices to be considered stale. This results in the inability to execute any time-sensitive orders, effectively breaking the mechanism for triggering orders. The impact is critical as it disrupts the core functionality of the contract.
+
+---
+
+**Match in Response List**:  
+Matches with **""Stale Price Validation Logic in `currentValue`""**.
+
+---
+
+**Validation**:  
+**Correct**.  
+The response accurately identifies the issue with the stale price validation logic. It correctly points out that the condition `price.publishTime < block.timestamp - noOlderThan` is inverted and should be `price.publishTime >= block.timestamp - noOlderThan`. This aligns with the issue described in the report, where the incorrect comparison logic causes all prices to be considered stale. The response also highlights the specific location of the issue (`currentValue` function), which is consistent with the report's focus on the freshness check.
+
+---
+
+### **Summary of Matches and Gaps**
+
+**Correct Matches**:  
+- **[M-2] Incorrect Freshness Logic Validation in PythOracle breaking the entire mechanism for triggering orders**
+
+**Partially Correct Matches**:  
+- *None*
+
+**Missed Issues from Issue Report**:  
+- *None*
+
+--- 
+
+### **Conclusion**  
+The response list sufficiently addresses the issue described in the report. The match is accurate, and the response provides a clear explanation of the problem, its location, and the necessary correction. No additional gaps or discrepancies were identified."
+,,,16,16,0,0,,0,0,0,0,,
