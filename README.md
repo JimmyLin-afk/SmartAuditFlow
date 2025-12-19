@@ -4,6 +4,23 @@
 <img align="right" width="120"  src="./media/front_view.png"> 
 </p>
 
+## 📚 Citation
+
+If you use SmartAuditFlow in your research, please cite:
+
+```
+@article{10.1145/3785364,
+author = {Wei, Zhiyuan and Sun, Jing and Hou, Zhe and Zhang, Zijian and Zhao, Zixiao and Li, Chunmiao and Wan, Mingchao and Dong, Jin},
+title = {SmartAuditFlow: A Dynamic Plan-Execute Framework for Advanced Smart Contract Security Analysis},
+year = {2025},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+issn = {1049-331X},
+url = {https://doi.org/10.1145/3785364},
+doi = {10.1145/3785364}
+}
+```
+
 **SmartAuditFlow** is a dynamic and adaptive framework for automated smart contract auditing, leveraging Large Language Models (LLMs) and workflow-driven strategies to deliver reliable, precise, and scalable security analysis.
 
 <details open>
@@ -89,18 +106,3 @@ pip install -r requirements.txt
   <img src="./media/show3.png" alt="Auditing Findings" height="335">
 </div>
 
-## 📚 Citation
-
-If you use SmartAuditFlow in your research, please cite:
-
-```
-@misc{wei2025adaptiveplanexecuteframeworksmart,
-      title={Adaptive Plan-Execute Framework for Smart Contract Security Auditing}, 
-      author={Zhiyuan Wei and Jing Sun and Zijian Zhang and Zhe Hou and Zixiao Zhao},
-      year={2025},
-      eprint={2505.15242},
-      archivePrefix={arXiv},
-      primaryClass={cs.CR},
-      url={https://arxiv.org/abs/2505.15242}, 
-}
-```
